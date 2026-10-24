@@ -108,7 +108,7 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *e) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-// One preference line ("name value;") from Rome II's preferences.script.txt, or "?" when absent.
+// One preference line ("name value;") from Rome 2's preferences.script.txt, or "?" when absent.
 static void pref(const char *text, const char *name, char *out, int cap) {
     snprintf(out, cap, "?");
     for (const char *s = text; (s = strstr(s, name)) != NULL; s++) {
@@ -129,7 +129,7 @@ void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const cha
     wcscpy(dir, log_path);
     wchar_t *sl = wcsrchr(dir, L'\\');
     if (sl) *sl = 0;
-    log("Rome II CPU Performance Fix %s loaded into %ls", MOD_VERSION, exe);
+    log("Rome 2 CPU Performance Fix %s loaded into %ls", MOD_VERSION, exe);
     if (!empire) {
         log("empire.retail.dll is not loaded and Windows could not be asked to report when it loads - nothing "
             "patched in this process");

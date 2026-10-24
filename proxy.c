@@ -1,4 +1,4 @@
-// dinput8.dll proxy for Total War: ROME II (empire.retail.dll of 2026-09-17).
+// dinput8.dll proxy for Total War: ROME 2 (empire.retail.dll of 2026-09-17).
 // empire.retail.dll imports DINPUT8.dll, so this loads before the game's own startup code runs.
 // It installs the fixes that profiling showed matter (see AGENT_LOG.md) and forwards the real
 // DirectInput exports to the system dinput8.dll. Log: rome2fix.log next to this DLL.

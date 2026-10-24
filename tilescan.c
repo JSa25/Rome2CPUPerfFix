@@ -1,4 +1,4 @@
-// Faster tile-feedback scan for Total War: ROME II (empire.retail.dll, build of 2026-09-17).
+// Faster tile-feedback scan for Total War: ROME 2 (empire.retail.dll, build of 2026-09-17).
 // Every frame the main thread reads back a screen-sized GPU buffer of 32-bit tile requests
 // (12-bit x, 12-bit y, layer byte; layer 0 = none) in +0x1594020 and, pixel by pixel, does a
 // saturating (0xFFFE) increment of that tile's 16-bit counter, appending the counter's address to

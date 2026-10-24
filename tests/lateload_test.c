@@ -54,7 +54,7 @@ int main(int argc, char **argv) {
     fputs(g_log, stdout);
     CHECK(has("was loaded before empire.retail.dll"));
     CHECK(has("empire.retail.dll is loading now - installing the fixes"));
-    CHECK(has("Rome II CPU Performance Fix v"));
+    CHECK(has("Rome 2 CPU Performance Fix v"));
     CHECK(has("tile feedback scan replaced"));
     CHECK(has("x87 fix: 1196 of 1196"));
     CHECK(has("draw-list sort replaced") && has("render-list sort (+0x44/+0x40) replaced"));

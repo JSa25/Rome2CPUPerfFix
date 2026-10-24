@@ -1,9 +1,11 @@
-# Rome II CPU Performance Fix
+# Rome 2 CPU Performance Fix
 
-Source code for the Total War: ROME II CPU performance mod: a `dinput8.dll` that the game loads at
+Source code for the Total War: ROME 2 CPU performance mod: a `dinput8.dll` that the game loads at
 startup and that patches the engine in memory. No game files are changed.
 
-Download the ready-made DLL: (links added on release)
+Download the ready-made DLL:
+- Steam Workshop: https://steamcommunity.com/sharedfiles/filedetails/?id=3826423359 (after subscribing, run `install.bat` in the mod's folder)
+- or build it yourself (below), or take it from the latest run under **Actions**
 
 Created with the help of AI (Claude by Anthropic). Tested in game by JGdaCaesar.
 
@@ -14,9 +16,9 @@ Created with the help of AI (Claude by Anthropic). Tested in game by JGdaCaesar.
 | `proxy.c` | Entry point (`DllMain`, or a DLL load notification when something loaded `dinput8.dll` before the game DLL), dinput8 forwarding, `rome2fix.log`, off switches |
 | `tilescan.c` | The campaign/battle tile-feedback scan: every frame the main thread counts a screen-sized GPU readback of texture-tile requests pixel by pixel. Runs of identical entries are now counted in one step, with the same counters and the same request list in the same order. Its entry hook is also the per-frame callback for the x87 safety check |
 | `x87fix.c` | About 1,200 x87 float-to-integer conversions that switch the FPU rounding mode (`fstcw`/`fldcw`/`fistp`) replaced by `fisttp` / SSE4.1 `roundss` (from the Attila mod, unchanged: it finds the blocks by pattern) |
-| `sortfix.c` | Two render-list sorts (by +0x6C/+0x68 and +0x44/+0x40): key extraction plus radix sort, same order as the game's sorts (from the Attila mod, with Rome II's addresses and keys) |
+| `sortfix.c` | Two render-list sorts (by +0x6C/+0x68 and +0x44/+0x40): key extraction plus radix sort, same order as the game's sorts (from the Attila mod, with Rome 2's addresses and keys) |
 | `diag.c` | Diagnostics in `rome2fix.log`: mod version, game build, system, settings, other hook DLLs, and crash records (a vectored exception handler that only logs and never handles the exception) |
-| `update.c` | Self-update from the Steam Workshop copy (off until the Workshop item exists) |
+| `update.c` | Self-update from the Steam Workshop copy (item 3826423359): a newer version there replaces the DLL in the game folder for the next start; never downgrades, no network |
 | `version.h` | Mod version |
 | `dinput8.def` | The exports a `dinput8.dll` must have |
 
@@ -40,6 +42,16 @@ The DLL lands in `build\dinput8.dll`. The build is reproducible: with the same l
 you should get exactly the same file as the released one. Compare the SHA-256
 (`certutil -hashfile build\dinput8.dll SHA256`) with the one given for each release. Always build it
 under the name `dinput8.dll`: the name is stored inside the file.
+
+### Automated builds
+
+Every commit is also built on GitHub's own machines by
+[.github/workflows/build.yml](.github/workflows/build.yml), with the compiler downloaded from its
+official release (checksum pinned). The run then compares the SHA-256 of that DLL with
+[dinput8.dll.sha256](dinput8.dll.sha256), the hash of the DLL released on the Steam Workshop, and
+fails if they differ. Open the latest run under **Actions**: its summary shows both hashes, and the
+DLL itself can be downloaded there. Builds also carry a signed build attestation
+(`gh attestation verify dinput8.dll -R JSa25/Rome2CPUPerfFix`).
 
 ## Tests
 

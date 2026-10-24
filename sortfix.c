@@ -1,8 +1,8 @@
-// Ported from the Attila mod's sortfix.c (same code, Rome II addresses and keys). Faster replacements for two
-// render-list sorts. Rome II +0x14A8370 (= Attila FUN_117ad5d0, identical but for 5 call-target bytes) and +0x14A7930
+// Ported from the Attila mod's sortfix.c (same code, Rome 2 addresses and keys). Faster replacements for two
+// render-list sorts. Rome 2 +0x14A8370 (= Attila FUN_117ad5d0, identical but for 5 call-target bytes) and +0x14A7930
 // (= Attila FUN_117acb50 with other key offsets) are std::sort (introsort) instantiations over pointers to render
 // items, ordered ascending by two unsigned keys read through the pointers: +0x6C then +0x68 (the draw list) and +0x44
-// then +0x40. In Rome II they run on the main thread (battle 2.2%, campaign ~1% of it). Every comparison reads both keys through the pointers, so in big battles they miss the cache constantly, and
+// then +0x40. In Rome 2 they run on the main thread (battle 2.2%, campaign ~1% of it). Every comparison reads both keys through the pointers, so in big battles they miss the cache constantly, and
 // the main thread waits for them. This reads each item's keys once into a compact array, radix-sorts that (stable:
 // equal keys keep their input order; the originals left their order unspecified) and writes the pointers back.
 #include <windows.h>
@@ -19,7 +19,7 @@ static __thread unsigned t_cap;
 typedef void(__cdecl *sort_fn)(void **, void **, int, void *);
 
 static struct sort_site {
-    DWORD rva, fnv;            // FNV-1a of the whole 630-byte function in the 2026-09-17 Rome II build (no relocations)
+    DWORD rva, fnv;            // FNV-1a of the whole 630-byte function in the 2026-09-17 Rome 2 build (no relocations)
     unsigned hi, lo;           // key offsets: compared as (hi, lo)
     const char *name;
     unsigned char tramp[16];   // the overwritten prologue + jmp back: the original sort
@@ -100,7 +100,7 @@ static unsigned char g_sort_orig[2][5], g_sort_new[2][5];
 static HMODULE g_sort_m;
 static int g_sort_n;
 
-// A/B test switch (main thread, frame start: the sorts only run on the main thread in Rome II).
+// A/B test switch (main thread, frame start: the sorts only run on the main thread in Rome 2).
 void sortfix_enable(int on) {
     for (int i = 0; i < 2 && g_sort_n == 2; i++) {
         unsigned char *site = (unsigned char *)g_sort_m + g_sorts[i].rva;
