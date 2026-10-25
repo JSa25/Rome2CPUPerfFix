@@ -16,10 +16,16 @@ void x87fix_frame(void);                                                        
 int install_sortfix(HMODULE m, void (*log)(const char *fmt, ...));                     // sortfix.c (from the Attila mod)
 void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const char *fmt, ...));  // diag.c
 void update_check(HMODULE self, void (*log)(const char *fmt, ...));                             // update.c
+int install_fileio(HMODULE m, void (*log)(const char *fmt, ...));                              // fileio.c
+int install_strfix(HMODULE m, void (*log)(const char *fmt, ...));                              // strfix.c
+int install_attrcache(HMODULE m, int verify, void (*log)(const char *fmt, ...));               // attrcache.c
 #ifdef PROFILING
 void sortfix_enable(int on);                                                           // sortfix.c
 int install_probes(HMODULE m, const wchar_t *list, const wchar_t *out, void (*log)(const char *fmt, ...));  // probes.c
 void probes_frame(void);                                                               // probes.c
+int install_viewtouch(HMODULE m, const wchar_t *cfg, void (*log)(const char *fmt, ...));  // viewtouch.c
+int install_attrprobe(HMODULE m, void (*log)(const char *fmt, ...));                      // attrprobe.c
+int install_heapfix(HMODULE m, void (*log)(const char *fmt, ...));                        // heapfix.c
 extern void (*g_ab_flip)(int on);                                                      // tilescan.c
 extern const char *g_ab_name;
 static int g_probes_on;
@@ -102,6 +108,11 @@ static void install_all(HMODULE m) {
     wchar_t *name = wcsrchr(g_log_path, L'\\') - g_log_path + f + 1;
     wcscpy(f, g_log_path);
 #define PRESENT(n) (wcscpy(name, n), GetFileAttributesW(f) != INVALID_FILE_ATTRIBUTES)
+#ifdef PROFILING
+    // Heap test (opt-in, heapfix_on.txt): must go in before the game's first allocation, which is still to come here.
+    // mimalloc frees a thread's state when the thread ends, so thread notifications stay on while it is installed.
+    if (!(PRESENT(L"heapfix_on.txt") && install_heapfix(m, wlog) > 0)) DisableThreadLibraryCalls(g_self);
+#endif
     int tile_mode = PRESENT(L"tilescan_off.txt") ? 0 : 1, fpslog = 0;
 #ifdef PROFILING
     if (tile_mode && PRESENT(L"tilescan_ab.txt")) tile_mode = 2;
@@ -115,6 +126,23 @@ static void install_all(HMODULE m) {
     else
         g_x87_on = install_x87fix(m, wlog) > 0;
     g_frame_check = frame_checks;
+    if (PRESENT(L"fileio_off.txt"))
+        wlog("fileio_off.txt found - file I/O fix not installed");
+    else
+        install_fileio(m, wlog);
+    if (PRESENT(L"strfix_off.txt"))
+        wlog("strfix_off.txt found - string functions not replaced");
+    else
+        install_strfix(m, wlog);
+    if (PRESENT(L"attrcache_off.txt"))
+        wlog("attrcache_off.txt found - attribute cache not installed");
+    else {
+        int verify = 0;
+#ifdef PROFILING
+        verify = PRESENT(L"attrcache_verify.txt");  // answer from Windows, count where the cache would differ
+#endif
+        install_attrcache(m, verify, wlog);
+    }
     if (PRESENT(L"sortfix_off.txt"))
         wlog("sortfix_off.txt found - render-list sorts not replaced");
 #ifdef PROFILING
@@ -135,6 +163,10 @@ static void install_all(HMODULE m) {
                  t.wHour, t.wMinute, t.wSecond);
         g_probes_on = install_probes(m, list, out, wlog) > 0;
     }
+    // viewtouch.txt: loading experiment on the page touch after each file view is mapped (viewtouch.c)
+    if (PRESENT(L"viewtouch.txt")) install_viewtouch(m, f, wlog);
+    // attrprobe.txt: count and time the game's GetFileAttributesW calls (attrprobe.c)
+    if (PRESENT(L"attrprobe.txt")) install_attrprobe(m, wlog);
 #else
     else
         install_sortfix(m, wlog);
@@ -166,7 +198,9 @@ static int wait_for_game(void) {
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
     (void)r;
     if (reason != DLL_PROCESS_ATTACH) return TRUE;
-    DisableThreadLibraryCalls(h);
+#ifndef PROFILING
+    DisableThreadLibraryCalls(h);  // profiling builds decide in install_all (the heap test needs thread notifications)
+#endif
     g_self = h;
     DWORD n = GetModuleFileNameW(h, g_log_path, MAX_PATH);
     wchar_t *sl = wcsrchr(g_log_path, L'\\');

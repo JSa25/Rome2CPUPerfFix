@@ -9,6 +9,12 @@ Download the ready-made DLL:
 
 Created with the help of AI (Claude by Anthropic). Tested in game by JGdaCaesar.
 
+The mod does not appear in the game launcher's mod list: it is a DLL in the game folder, not a `.pack` mod. It is
+active whenever `dinput8.dll` is in the game folder; `rome2fix.log` shows what it did.
+
+Version 1.1 adds faster loading (a Divide et Impera save: 38 s with 1.0, 20 s with 1.1 on the test PC; see the
+player README for all measurements).
+
 ## What each file does
 
 | File | Fix |
@@ -17,6 +23,9 @@ Created with the help of AI (Claude by Anthropic). Tested in game by JGdaCaesar.
 | `tilescan.c` | The campaign/battle tile-feedback scan: every frame the main thread counts a screen-sized GPU readback of texture-tile requests pixel by pixel. Runs of identical entries are now counted in one step, with the same counters and the same request list in the same order. Its entry hook is also the per-frame callback for the x87 safety check |
 | `x87fix.c` | About 1,200 x87 float-to-integer conversions that switch the FPU rounding mode (`fstcw`/`fldcw`/`fistp`) replaced by `fisttp` / SSE4.1 `roundss` (from the Attila mod, unchanged: it finds the blocks by pattern) |
 | `sortfix.c` | Two render-list sorts (by +0x6C/+0x68 and +0x44/+0x40): key extraction plus radix sort, same order as the game's sorts (from the Attila mod, with Rome 2's addresses and keys) |
+| `attrcache.c` | Loading: a cache of missing folders behind the game's `GetFileAttributesW` import. Before using a packed file the game checks every search root (Data, each Workshop mod, language folders) for a loose copy, millions of failed checks per load with big mod lists. A failed check records the first missing name below the deepest existing folder; later checks under it get Windows' own answer (`ERROR_FILE_NOT_FOUND` / `ERROR_PATH_NOT_FOUND`) without asking. That folder and every folder above it are watched for created/renamed/deleted names and polled on every call; any change clears the cache. Unusual path forms (`/`, `.`, `..`, device names, ...) go straight to Windows |
+| `fileio.c` | Loading: `.pack` files opened without `FILE_FLAG_NO_BUFFERING` (so Windows caches them), and small reads of read-only files in the game's user folder (the unpacked save) served from a 64 KB buffer with the exact file position kept; writes to the same file drop the buffer |
+| `strfix.c` | Loading: the game's string equality, compare and assign helpers and a pair-table search, rewritten with 16-byte compares and `memcpy` (same results, byte-for-byte checked sites) |
 | `diag.c` | Diagnostics in `rome2fix.log`: mod version, game build, system, settings, other hook DLLs, and crash records (a vectored exception handler that only logs and never handles the exception) |
 | `update.c` | Self-update from the Steam Workshop copy (item 3826423359): a newer version there replaces the DLL in the game folder for the next start; never downgrades, no network |
 | `version.h` | Mod version |
@@ -57,7 +66,11 @@ DLL itself can be downloaded there. Builds also carry a signed build attestation
 
 The tests run the game's own code next to the replacements and check the results are identical:
 the tile scan on 3,000 random buffers (11.6 million entries), every x87 block on 2,740 edge-case and
-random inputs (3.3 million runs), both sorts on 110 lists of up to 30,000 items. `diag_test` checks
+random inputs (3.3 million runs), both sorts on 110 lists of up to 30,000 items, the string helpers on 400,000
+random cases. `fileio_test` compares 300,000 random reads and seeks with plain Windows calls, and `attrcache_test`
+compares 450,000 random file checks with plain Windows (attributes and error codes) while files and folders are
+created, renamed and deleted between checks; with the folder watches switched off the same test finds thousands
+of differences, so it would catch a stale cache. `diag_test` checks
 the crash records on deliberate faults, `selfupd_test` the update rules on throwaway files, and
 `lateload_test` loads the built DLL before the game DLL (as an overlay can) and checks every fix
 still installs from Windows' load notification. They read your copy of the game's
