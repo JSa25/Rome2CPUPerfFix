@@ -78,7 +78,7 @@ CapFrameX. Same save and camera view on the campaign map, same big battle.
 Loading a Divide et Impera save (13 Workshop mods), stopwatch, same save:
     version 1.0 (no loading fixes):   38 s
     version 1.1:                      20 s   (-47%)
-  Loading with a normal mod list, first load after starting the game: 18 -> 11 s.
+  Loading without mods, first load after starting the game: 18 -> 9 s.
 
 The slowest frames in battles improve even more than the average, so big
 battles feel smoother, not just faster. The campaign run was short, so its 0.1%
