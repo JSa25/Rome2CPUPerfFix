@@ -1,4 +1,4 @@
-# Uploads a new version of the Nexus Mods file (mod 43, file 96) from a build made on GitHub's own machine.
+# Uploads a new version of the Nexus Mods file (mod page 43, API file ID 8232588) from a build made on GitHub's own machine.
 # Run it by hand: Actions -> "Upload to Nexus Mods" -> Run workflow, with a changelog line.
 # It builds dinput8.dll, refuses to continue unless the SHA-256 equals dinput8.dll.sha256 (the released DLL), zips it
 # with the player README and adds it to the Nexus file as a new version (the old one goes to Old Files).
@@ -56,8 +56,8 @@ jobs:
         uses: Nexus-Mods/upload-action@v1.0.0-beta.10
         with:
           api_key: ${{ secrets.NEXUSMODS_API_KEY }}
-          mod_id: 43
-          file_id: 96
+          mod_id: 12416750452779  # "Unique Mod ID" (Advanced panel); the page number is 43
+          file_id: 8232588  # "API File ID" (Advanced panel), not the 96 in page links
           filename: Rome2CPUPerfFix.zip
           version: ${{ steps.pkg.outputs.version }}
           display_name: Rome 2 CPU Performance Fix
