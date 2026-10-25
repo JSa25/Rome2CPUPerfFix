@@ -62,6 +62,10 @@ fails if they differ. Open the latest run under **Actions**: its summary shows b
 DLL itself can be downloaded there. Builds also carry a signed build attestation
 (`gh attestation verify dinput8.dll -R JSa25/Rome2CPUPerfFix`).
 
+The Nexus Mods file is uploaded by [.github/workflows/nexus.yml](.github/workflows/nexus.yml) (started by hand):
+it builds the DLL the same way, stops unless the hash matches the released one, zips it with
+`Rome2CPUPerfFix_README.txt` and adds it to the Nexus file as a new version.
+
 ## Tests
 
 The tests run the game's own code next to the replacements and check the results are identical:

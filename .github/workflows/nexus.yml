@@ -1,0 +1,67 @@
+# Uploads a new version of the Nexus Mods file (mod 43, file 96) from a build made on GitHub's own machine.
+# Run it by hand: Actions -> "Upload to Nexus Mods" -> Run workflow, with a changelog line.
+# It builds dinput8.dll, refuses to continue unless the SHA-256 equals dinput8.dll.sha256 (the released DLL), zips it
+# with the player README and adds it to the Nexus file as a new version (the old one goes to Old Files).
+# Needs the repository secret NEXUSMODS_API_KEY (your Nexus API key, Settings -> Secrets and variables -> Actions).
+name: Upload to Nexus Mods
+
+on:
+  workflow_dispatch:
+    inputs:
+      changelog:
+        description: "Changelog for this version (shown on Nexus)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  nexus:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the compiler (llvm-mingw 20261006)
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/llvm-mingw-20261006-ucrt-x86_64.zip'
+          $sha = '317492c456aa27ee607a5919f1d2d38dcdc1112516a24d0bf4b00d078f52d17a'
+          Invoke-WebRequest $url -OutFile llvm.zip
+          $got = (Get-FileHash llvm.zip -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $sha) { throw "llvm.zip: checksum $got does not match $sha" }
+          Expand-Archive llvm.zip "$env:RUNNER_TEMP\llvm"
+          Add-Content $env:GITHUB_PATH "$env:RUNNER_TEMP\llvm\llvm-mingw-20261006-ucrt-x86_64\bin"
+
+      - name: Build
+        shell: cmd
+        run: build.bat
+
+      - name: Check against the released DLL, read the version, zip
+        id: pkg
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash build\dinput8.dll -Algorithm SHA256).Hash.ToLower()
+          $want = (Get-Content dinput8.dll.sha256 -Raw).Trim().Split()[0].ToLower()
+          if ($h -ne $want) { throw "the build ($h) does not reproduce the released DLL ($want)" }
+          $ver = [regex]::Match((Get-Content version.h -Raw), 'MOD_VERSION_STR "([^"]+)"').Groups[1].Value
+          if (-not $ver) { throw "no version in version.h" }
+          New-Item -ItemType Directory pkg\Rome2CPUPerfFix | Out-Null
+          Copy-Item build\dinput8.dll, Rome2CPUPerfFix_README.txt pkg\Rome2CPUPerfFix\
+          Compress-Archive pkg\Rome2CPUPerfFix Rome2CPUPerfFix.zip
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          "sha=$h" >> $env:GITHUB_OUTPUT
+          "### Nexus upload`nVersion $ver, dinput8.dll SHA-256 ``$h``" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload to Nexus Mods
+        uses: Nexus-Mods/upload-action@v1.0.0-beta.10
+        with:
+          api_key: ${{ secrets.NEXUSMODS_API_KEY }}
+          mod_id: 43
+          file_id: 96
+          filename: Rome2CPUPerfFix.zip
+          version: ${{ steps.pkg.outputs.version }}
+          display_name: Rome 2 CPU Performance Fix
+          description: "dinput8.dll + README. Copy dinput8.dll next to Rome2.exe (replace the old one). SHA-256 of dinput8.dll: ${{ steps.pkg.outputs.sha }}"
+          changelog: ${{ inputs.changelog }}
+          archive_existing_version: true
+          update_mod_version: true
