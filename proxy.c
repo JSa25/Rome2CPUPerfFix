@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include "version.h"
 
 int install_tilescan(HMODULE m, int mode, int fpslog, void (*log)(const char *fmt, ...));  // tilescan.c
 extern void (*g_frame_check)(void);                                                    // tilescan.c
@@ -43,6 +44,17 @@ static void frame_checks(void) {
 }
 
 static wchar_t g_log_path[MAX_PATH];
+
+// One line per game start that stands out in the log: version and date.
+static void log_header(void) {
+    FILE *f = _wfopen(g_log_path, L"a");
+    if (!f) return;
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    fprintf(f, "\n======== Rome 2 CPU Performance Fix v%s - game started %04d-%02d-%02d %02d:%02d ========\n",
+            MOD_VERSION_STR, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute);
+    fclose(f);
+}
 
 static void wlog(const char *fmt, ...) {
     FILE *f = _wfopen(g_log_path, L"a");
@@ -99,8 +111,28 @@ HRESULT WINAPI stub_DllUnregisterServer(void) {
     return f ? f() : E_FAIL;
 }
 
+// The plain-language summary after the install lines (those stay as the details for bug reports).
+enum { FIX_SWITCHED_OFF = -1, FIX_INACTIVE = 0, FIX_ON = 1, FIX_PARTLY = 2 };
+static const char *const g_fix_names[6] = {"FPS: tile feedback scan", "FPS: x87 rounding", "FPS: render-list sorts",
+                                           "Loading: file reading", "Loading: string functions", "Loading: missing-file cache"};
+
+static void log_status(const int st[6]) {
+    int on = 0;
+    for (int i = 0; i < 6; i++) on += st[i] == FIX_ON;
+    if (on == 6)
+        wlog("STATUS: all 6 fixes are on");
+    else
+        wlog("STATUS: %d of 6 fixes are on", on);
+    for (int i = 0; i < 6; i++)
+        wlog("  %-4s %s%s", st[i] == FIX_ON ? "on" : st[i] == FIX_PARTLY ? "part" : "OFF", g_fix_names[i],
+             st[i] == FIX_SWITCHED_OFF ? " (switched off by its _off.txt file in the game folder)"
+             : st[i] == FIX_PARTLY ? " (only part of it fits this game version)"
+             : st[i] == FIX_INACTIVE ? " (does not fit this game version, so it stays off; details above)" : "");
+}
+
 // Installs everything into the game DLL m (mapped and relocated, its own startup code not run yet).
 static void install_all(HMODULE m) {
+    int st[6] = {0};
     diag_startup(m, g_log_path, wlog);  // version, process, game build, system, settings; crash records
     update_check(g_self, wlog);         // a newer Workshop copy replaces this DLL for the next launch
     // Off switches: empty files in the game folder.
@@ -119,34 +151,46 @@ static void install_all(HMODULE m) {
     fpslog = PRESENT(L"fps_log.txt");
 #endif
     // The entry hook of the tile scan is also the per-frame callback the x87 fix needs for its safety check.
-    if (!install_tilescan(m, tile_mode, fpslog, wlog))
+    int ts = install_tilescan(m, tile_mode, fpslog, wlog);
+    st[0] = !ts ? FIX_INACTIVE : tile_mode ? FIX_ON : FIX_SWITCHED_OFF;
+    if (!ts)
         wlog("x87 fix not installed (needs the frame hook)");
-    else if (PRESENT(L"x87fix_off.txt"))
+    else if (PRESENT(L"x87fix_off.txt")) {
         wlog("x87fix_off.txt found - x87 rounding fix not installed");
-    else
-        g_x87_on = install_x87fix(m, wlog) > 0;
+        st[1] = FIX_SWITCHED_OFF;
+    } else
+        st[1] = (g_x87_on = install_x87fix(m, wlog) > 0);
     g_frame_check = frame_checks;
-    if (PRESENT(L"fileio_off.txt"))
+    if (PRESENT(L"fileio_off.txt")) {
         wlog("fileio_off.txt found - file I/O fix not installed");
-    else
-        install_fileio(m, wlog);
-    if (PRESENT(L"strfix_off.txt"))
+        st[3] = FIX_SWITCHED_OFF;
+    } else
+        st[3] = install_fileio(m, wlog) > 0;
+    if (PRESENT(L"strfix_off.txt")) {
         wlog("strfix_off.txt found - string functions not replaced");
-    else
-        install_strfix(m, wlog);
-    if (PRESENT(L"attrcache_off.txt"))
+        st[4] = FIX_SWITCHED_OFF;
+    } else
+        st[4] = install_strfix(m, wlog) > 0;
+    if (PRESENT(L"attrcache_off.txt")) {
         wlog("attrcache_off.txt found - attribute cache not installed");
-    else {
+        st[5] = FIX_SWITCHED_OFF;
+    } else {
         int verify = 0;
 #ifdef PROFILING
         verify = PRESENT(L"attrcache_verify.txt");  // answer from Windows, count where the cache would differ
 #endif
-        install_attrcache(m, verify, wlog);
+        st[5] = install_attrcache(m, verify, wlog) > 0;
     }
-    if (PRESENT(L"sortfix_off.txt"))
+    int sorts = 0;
+    if (PRESENT(L"sortfix_off.txt")) {
         wlog("sortfix_off.txt found - render-list sorts not replaced");
+        st[2] = FIX_SWITCHED_OFF;
+    } else
+        sorts = install_sortfix(m, wlog);
+    if (st[2] != FIX_SWITCHED_OFF) st[2] = sorts == 2 ? FIX_ON : sorts ? FIX_PARTLY : FIX_INACTIVE;
+    log_status(st);
 #ifdef PROFILING
-    else if (install_sortfix(m, wlog) == 2 && PRESENT(L"sortfix_ab.txt")) {
+    if (sorts == 2 && PRESENT(L"sortfix_ab.txt")) {
         // A/B: the sorts flip on/off every 10 s at frame start, fps logged per window.
         g_ab_name = "sortfix";
         g_ab_flip = sortfix_enable;
@@ -167,9 +211,6 @@ static void install_all(HMODULE m) {
     if (PRESENT(L"viewtouch.txt")) install_viewtouch(m, f, wlog);
     // attrprobe.txt: count and time the game's GetFileAttributesW calls (attrprobe.c)
     if (PRESENT(L"attrprobe.txt")) install_attrprobe(m, wlog);
-#else
-    else
-        install_sortfix(m, wlog);
 #endif
 }
 
@@ -206,6 +247,7 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
     wchar_t *sl = wcsrchr(g_log_path, L'\\');
     if (n == 0 || n >= MAX_PATH || !sl || sl - g_log_path > MAX_PATH - 20) return TRUE;  // no log path: do nothing
     wcscpy(sl + 1, L"rome2fix.log");
+    log_header();
     HMODULE m = GetModuleHandleW(L"empire.retail.dll");
     if (m)
         install_all(m);

@@ -9,10 +9,12 @@ Created with the help of AI.
 
 Source code: https://github.com/JSa25/Rome2CPUPerfFix
 
-Game version: the current Steam build of Rome 2 (Emperor Edition, empire.retail.dll
-of September 2026). Every patch first checks the exact game bytes it replaces. If
-they don't match (a different game version or another engine mod), that patch
-turns itself off and the game runs unmodified.
+Game versions: the normal Steam version of Rome 2 (Emperor Edition, September
+2026) and, since 1.2, the "pantheon" beta (October 2026). Every patch first checks
+the exact game bytes it replaces. If they don't match (another game version or
+another engine mod), that patch turns itself off and the game runs unmodified.
+The first lines of rome2fix.log say which game version you have and whether it is
+supported.
 
 NOTE: this mod does not show up in the game launcher's mod list. It is a DLL in
 the game folder, not a .pack mod, so the launcher doesn't know about it. It is
@@ -49,7 +51,9 @@ Loading (new in 1.1):
   from a buffer.
 - .pack files: the game opened its .pack files in a way that skips the Windows
   file cache, so every game start read them from disk again. They now go through
-  the cache, so the second start in a session loads from memory.
+  the cache, so the second start in a session loads from memory. (The
+  pantheon beta no longer opens them that way, so there this part has nothing
+  to do.)
 - String comparisons used while loading game data are about 5 times faster.
 
 Every code patch produces the same results as the original code. They were
@@ -102,8 +106,9 @@ Install
 -------
 1. Copy dinput8.dll into the game folder, next to Rome2.exe, for example:
    ...\steamapps\common\Total War Rome II\
-2. Start the game. A rome2fix.log file appears in the same folder and lists
-   which fixes are active, plus your game build, system and settings.
+2. Start the game. A rome2fix.log file appears in the same folder. Each game
+   start begins with a "====" line; a few lines below it, STATUS says which
+   fixes are on (and why one is off, if any).
 
 Uninstall: delete dinput8.dll (and rome2fix.log).
 
@@ -126,17 +131,20 @@ fix (useful if you suspect one of them), then restart the game:
   fileio_off.txt       save and .pack file reading (loading)
   strfix_off.txt       string comparisons (loading)
 
-rome2fix.log shows what was installed or skipped.
+The STATUS lines in rome2fix.log show which fixes are on.
 
 
 Reporting a problem
 -------------------
 If the mod doesn't seem to work, or the game crashes, please send rome2fix.log
-from the game folder (it's a small text file). It shows:
+from the game folder (it's a small text file). Send the block from the last "====" line down. It shows:
 - whether the game loaded the mod at all, and from which folder
+- your game version and whether it is supported, and a STATUS summary of
+  which fixes are on
 - your game build, Windows version, CPU, RAM and your graphics/thread settings
 - other DLLs in the game folder that hook the game (ReShade, DXVK, other mods)
-- for a crash: where it happened (EXCEPTION lines), so it can be traced
+- for a crash: where it happened (EXCEPTION lines, with a plain line saying
+  whether it was in the game's own code or in this mod), so it can be traced
 The log only records; it never changes how the game handles a crash. It shows
 your Windows user name in folder paths, so blank that out before posting it
 publicly if you like.
@@ -162,6 +170,11 @@ Compatibility and notes
 
 Changelog
 ---------
+Version 1.2: works on the "pantheon" beta too (all fixes). Easier to read
+           rome2fix.log: a line per game start, the game version in plain
+           words, a STATUS summary, plainer crash lines, less repetition.
+           SHA-256 of dinput8.dll:
+           0492d17646cff3428408a9920fe1425db10bc718dd842763234c7b23ec758626
 Version 1.1: faster loading: loose-file check cache, buffered save reading,
            .pack files through the Windows file cache, faster string
            comparisons. DEI save load 38 -> 20 s on the test PC.

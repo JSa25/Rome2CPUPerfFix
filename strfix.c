@@ -10,10 +10,7 @@
 #include <windows.h>
 #include <string.h>
 #include <emmintrin.h>
-
-#define RVA_EQUAL   0xF41F0
-#define RVA_COMPARE 0xF9AC0
-#define RVA_ASSIGN  0xF0380
+#include "builds.h"
 
 typedef struct { unsigned len, cap; char *p; } gstr;
 
@@ -70,7 +67,6 @@ void __thiscall str_assign(gstr *s, const char *b, const char *e) {
 // +0x7E61B0: find in an array of 28-byte {gstr a, gstr b, flag} entries the first with b == k2 and a == k1 (two
 // string keys passed by value, destroyed by the callee). The game calls the equality function twice per entry;
 // in a DEI load this search was ~5.5% of the main thread. Same order, same result, lengths checked inline.
-#define RVA_PAIRFIND 0x7E61B0
 #define PF_FREE      0x43  // offset of the call rel32 to the string destructor (thiscall) inside it
 static void(__thiscall *g_str_free)(gstr *);
 
@@ -91,15 +87,20 @@ const char *__cdecl pair_find(const char *first, const char *last, gstr k1, gstr
     return e;
 }
 
-// shortcut: the sites are checked by FNV-1a of their bytes with address bytes zeroed (set in the table
-// below from the 2026-09-17 build); a new game build means re-reading them in Ghidra.
+// shortcut: the sites are checked by FNV-1a of their bytes with address bytes zeroed (per build in the table
+// below); a new game build means finding them again (tools/match_attila.py with MATCH_SRC/MATCH_DST).
 struct str_site { DWORD rva, len, fnv; const char *name; void *repl; };
 #define NSITES 4
-static struct str_site g_str[NSITES] = {
-    {RVA_EQUAL, 53, 0x01A19E9Au, "string equality", (void *)str_equal},
-    {RVA_COMPARE, 164, 0xB302A678u, "string compare", (void *)str_compare},
-    {RVA_ASSIGN, 111, 0x16DC4500u, "string assign", (void *)str_assign},
-    {RVA_PAIRFIND, 85, 0xBC18112Fu, "string pair search", (void *)pair_find},
+static struct str_site g_str[NSITES] = {  // rva/fnv: the build found by strfix_find (default: the first one)
+    {0xF41F0, 53, 0x01A19E9Au, "string equality", (void *)str_equal},
+    {0xF9AC0, 164, 0xB302A678u, "string compare", (void *)str_compare},
+    {0xF0380, 111, 0x16DC4500u, "string assign", (void *)str_assign},
+    {0x7E61B0, 85, 0xBC18112Fu, "string pair search", (void *)pair_find},
+};
+// {rva, fnv} of equality, compare, assign, pair search per known build (pair search differs only in call targets)
+static const DWORD g_str_builds[NBUILDS][NSITES][2] = {
+    {{0xF41F0, 0x01A19E9Au}, {0xF9AC0, 0xB302A678u}, {0xF0380, 0x16DC4500u}, {0x7E61B0, 0xBC18112Fu}},
+    {{0xF2250, 0x01A19E9Au}, {0xF6A10, 0xB302A678u}, {0xEF270, 0x16DC4500u}, {0x7E09C0, 0xF7CF331Fu}},
 };
 
 static DWORD fnv_masked(const unsigned char *b, DWORD n, DWORD skip1, DWORD skip2, DWORD skip3) {
@@ -123,21 +124,39 @@ DWORD str_site_hash(const unsigned char *site, int i) {
 
 static int site_ok(const unsigned char *site, int i) { return str_site_hash(site, i) == g_str[i].fnv; }
 
+// Points the sites at the known build whose four sites all match at m (left as they are when none does).
+void strfix_find(HMODULE m) {
+    for (int b = 0; b < NBUILDS; b++) {
+        int i = 0;
+        for (; i < NSITES; i++) {
+            const DWORD *e = g_str_builds[b][i];
+            if (!in_image(m, e[0], g_str[i].len) || str_site_hash((unsigned char *)m + e[0], i) != e[1]) break;
+        }
+        if (i < NSITES) continue;
+        for (i = 0; i < NSITES; i++) {
+            g_str[i].rva = g_str_builds[b][i][0];
+            g_str[i].fnv = g_str_builds[b][i][1];
+        }
+        return;
+    }
+}
+
 static unsigned char g_str_orig[NSITES][5];
 
 // All or none (each one alone would be correct, but one log line and one switch keep it simple).
 int install_strfix(HMODULE m, void (*log)(const char *fmt, ...)) {
+    strfix_find(m);
     for (int i = 0; i < NSITES; i++) {
         if (!site_ok((unsigned char *)m + g_str[i].rva, i)) {
             log("%s at +0x%X does not match this game version - string fix not installed", g_str[i].name, g_str[i].rva);
             return 0;
         }
     }
-    unsigned char *as = (unsigned char *)m + RVA_ASSIGN;
+    unsigned char *as = (unsigned char *)m + g_str[2].rva;
     g_empty = *(char **)(as + AS_EMPTY);
     g_alloc = (char *(__cdecl *)(unsigned, unsigned))(as + AS_CALL + 4 + *(LONG *)(as + AS_CALL));
     g_term = *(const char **)(as + AS_TERM);
-    unsigned char *pf = (unsigned char *)m + RVA_PAIRFIND;
+    unsigned char *pf = (unsigned char *)m + g_str[3].rva;
     g_str_free = (void(__thiscall *)(gstr *))(pf + PF_FREE + 4 + *(LONG *)(pf + PF_FREE));
     for (int i = 0; i < NSITES; i++) {
         unsigned char *site = (unsigned char *)m + g_str[i].rva;

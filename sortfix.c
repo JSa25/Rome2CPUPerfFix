@@ -7,8 +7,8 @@
 // equal keys keep their input order; the originals left their order unspecified) and writes the pointers back.
 #include <windows.h>
 #include <string.h>
+#include "builds.h"
 
-#define RVA_DRAWSORT 0x14A8370  // VA 0x114A8370 at the preferred base 0x10000000
 #define DRAWSORT_LEN 630
 
 struct kp { unsigned long long key; void *p; };
@@ -19,13 +19,14 @@ static __thread unsigned t_cap;
 typedef void(__cdecl *sort_fn)(void **, void **, int, void *);
 
 static struct sort_site {
-    DWORD rva, fnv;            // FNV-1a of the whole 630-byte function in the 2026-09-17 Rome 2 build (no relocations)
+    DWORD rva, fnv;            // the build found by sortfix_find (FNV-1a of the whole 630-byte function, no relocations)
     unsigned hi, lo;           // key offsets: compared as (hi, lo)
     const char *name;
     unsigned char tramp[16];   // the overwritten prologue + jmp back: the original sort
+    DWORD builds[NBUILDS][2];  // {rva, fnv} per known build (the functions differ only in their call targets)
 } g_sorts[2] = {
-    {0x14A8370, 0x89B4A107u, 0x6C, 0x68, "draw-list sort", {0}},
-    {0x14A7930, 0xEE40594Fu, 0x44, 0x40, "render-list sort (+0x44/+0x40)", {0}},
+    {0x14A8370, 0x89B4A107u, 0x6C, 0x68, "draw-list sort", {0}, {{0x14A8370, 0x89B4A107u}, {0x1481B70, 0xF11FB1D5u}}},
+    {0x14A7930, 0xEE40594Fu, 0x44, 0x40, "render-list sort (+0x44/+0x40)", {0}, {{0x14A7930, 0xEE40594Fu}, {0x1481130, 0xDB6F7BCCu}}},
 };
 
 static unsigned long long key_at(const void *p, const struct sort_site *s) {
@@ -96,6 +97,19 @@ static DWORD fnv1a(const unsigned char *b, DWORD n) {
     return h;
 }
 
+// Points each sort at the known build whose bytes match at m (left as it is when none does).
+void sortfix_find(HMODULE m) {
+    for (int i = 0; i < 2; i++)
+        for (int b = 0; b < NBUILDS; b++) {
+            const DWORD *e = g_sorts[i].builds[b];
+            if (in_image(m, e[0], DRAWSORT_LEN) && fnv1a((unsigned char *)m + e[0], DRAWSORT_LEN) == e[1]) {
+                g_sorts[i].rva = e[0];
+                g_sorts[i].fnv = e[1];
+                break;
+            }
+        }
+}
+
 static unsigned char g_sort_orig[2][5], g_sort_new[2][5];
 static HMODULE g_sort_m;
 static int g_sort_n;
@@ -116,6 +130,7 @@ void sortfix_enable(int on) {
 int install_sortfix(HMODULE m, void (*log)(const char *fmt, ...)) {
     void *repl[2] = {(void *)draw_sort, (void *)list_sort};
     int n = 0;
+    sortfix_find(m);
     for (int i = 0; i < 2; i++) {
         struct sort_site *s = &g_sorts[i];
         unsigned char *site = (unsigned char *)m + s->rva;

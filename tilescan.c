@@ -1,6 +1,6 @@
-// Faster tile-feedback scan for Total War: ROME 2 (empire.retail.dll, build of 2026-09-17).
+// Faster tile-feedback scan for Total War: ROME 2 (empire.retail.dll, builds in builds.h).
 // Every frame the main thread reads back a screen-sized GPU buffer of 32-bit tile requests
-// (12-bit x, 12-bit y, layer byte; layer 0 = none) in +0x1594020 and, pixel by pixel, does a
+// (12-bit x, 12-bit y, layer byte; layer 0 = none) in +0x1594020 (pantheon +0x156DCF0) and, pixel by pixel, does a
 // saturating (0xFFFE) increment of that tile's 16-bit counter, appending the counter's address to
 // a list the first time it becomes 1. That loop was ~1/3 of the main thread's game code on the
 // campaign map and in battle. Neighbouring pixels nearly always request the same tile, so this
@@ -10,18 +10,24 @@
 #include <windows.h>
 #include <stdint.h>
 #include <string.h>
+#include "builds.h"
 
-#define RVA_LOOP_A 0x1594065u  // entry layout: x = (b2 & 0xF) << 8 | b0, y = (b2 & 0xF0) << 4 | b1
-#define RVA_LOOP_B 0x1594198u  // entry layout: x = (b0 & 0xF) << 8 | b2, y = (b0 & 0xF0) << 4 | b1
-#define LEN_A 0xD6u            // up to the tail at RVA_TAIL_A
+// Offsets from the function's entry (the same in every known build).
+#define OFF_LOOP_A 0x45u   // entry layout: x = (b2 & 0xF) << 8 | b0, y = (b2 & 0xF0) << 4 | b1
+#define OFF_LOOP_B 0x178u  // entry layout: x = (b0 & 0xF) << 8 | b2, y = (b0 & 0xF0) << 4 | b1
+#define LEN_A 0xD6u        // up to the tail at OFF_TAIL_A
 #define LEN_B 0xE3u
-#define RVA_TAIL_A 0x1594137u  // mov ebx,[esp+24h] then the original tail
-#define RVA_TAIL_B 0x1594277u
-#define RVA_PUSH 0xE89B0u      // the game's vector<u16*>::push_back (thiscall, 1 arg: pointer to value)
+#define OFF_TAIL_A 0x117u  // mov ebx,[esp+24h] then the original tail
+#define OFF_TAIL_B 0x257u
 #define LEN_PUSH 0x21u
-#define HASH_A 0xFE3AA4B9u
-#define HASH_B 0x2F13EBF9u
 #define HASH_PUSH 0xDF48CE41u
+
+// Per build: the function's entry, the game's vector<u16*>::push_back (thiscall, 1 arg: pointer to value), and the
+// hashes of the two loops (they differ between builds only in the rel32 of their call to push_back).
+static const struct ts_build { DWORD entry, push, hash_a, hash_b; } g_ts_builds[NBUILDS] = {
+    {0x1594020u, 0xE89B0u, 0xFE3AA4B9u, 0x2F13EBF9u},
+    {0x156DCF0u, 0xEAEF0u, 0x8E692C80u, 0xA3DF4B93u},
+};
 
 typedef struct { uint16_t *counts; uint32_t width, height, unused; } Layer;
 typedef struct { Layer *layers; uint32_t nlayers; uint32_t list[3]; } Grid;  // list = game vector at +8
@@ -29,7 +35,7 @@ typedef void(__thiscall *push_fn)(void *vec, uint16_t **value);
 
 static push_fn g_push;
 void *g_tail_a, *g_tail_b;  // read by the thunks
-static uint32_t g_ts_pixels, g_ts_runs, g_ts_calls;  // stats, main thread only
+static uint32_t g_ts_pixels __attribute__((unused)), g_ts_runs, g_ts_calls;  // stats (logged by the profiling build), main thread only
 static void (*g_log)(const char *fmt, ...);
 
 static uint32_t fnv1a(const unsigned char *p, size_t n) {
@@ -68,8 +74,10 @@ static void scan(Grid *g, const unsigned char *rowp, uint32_t cols, uint32_t row
     if (run && prev) { hit(g, prev, run, fmt_b); g_ts_runs++; }
     g_ts_pixels += rows * cols;
     if (++g_ts_calls % 4096 == 0) {  // roughly once a minute: shows how much the run-length trick saves
+#ifdef PROFILING  // measuring only: noise in the players' log
         g_log("tile feedback scan: %ux%u entries, %.1f entries per run over the last 4096 frames", cols, rows,
               g_ts_runs ? (double)g_ts_pixels / g_ts_runs : 0.0);
+#endif
         g_ts_pixels = g_ts_runs = 0;
     }
 }
@@ -97,10 +105,9 @@ void tilescan_thunk_a(void);
 void tilescan_thunk_b(void);
 void tilescan_thunk_entry(void);
 
-#define RVA_ENTRY 0x1594020u
 static const unsigned char ENTRY_BYTES[8] = {0x83, 0xEC, 0x10, 0x53, 0x8B, 0x5C, 0x24, 0x18};  // sub esp,10h; push ebx; mov ebx,[esp+18h]
 void *g_entry_back;
-static unsigned char *g_base, g_orig[2][5], g_new[2][5];
+static unsigned char *g_loop_a, *g_loop_b, g_orig[2][5], g_new[2][5];
 static int g_ab, g_on, g_fpslog;
 void (*g_frame_check)(void);  // per-frame callback on the main thread (x87fix_frame)
 void (*g_ab_flip)(int on);    // A/B test of another fix: flipped instead of the tile scan
@@ -112,11 +119,11 @@ static DWORD g_tid, g_t0, g_frames;
 // is inside the loops (install time, or at the function's entry on the thread that runs it).
 void tilescan_enable(int on) {
     DWORD old;
-    if (!VirtualProtect(g_base + RVA_LOOP_A, RVA_LOOP_B + 5 - RVA_LOOP_A, PAGE_EXECUTE_READWRITE, &old)) return;
-    memcpy(g_base + RVA_LOOP_A, on ? g_new[0] : g_orig[0], 5);
-    memcpy(g_base + RVA_LOOP_B, on ? g_new[1] : g_orig[1], 5);
-    VirtualProtect(g_base + RVA_LOOP_A, RVA_LOOP_B + 5 - RVA_LOOP_A, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), g_base + RVA_LOOP_A, RVA_LOOP_B + 5 - RVA_LOOP_A);
+    if (!VirtualProtect(g_loop_a, OFF_LOOP_B + 5 - OFF_LOOP_A, PAGE_EXECUTE_READWRITE, &old)) return;
+    memcpy(g_loop_a, on ? g_new[0] : g_orig[0], 5);
+    memcpy(g_loop_b, on ? g_new[1] : g_orig[1], 5);
+    VirtualProtect(g_loop_a, OFF_LOOP_B + 5 - OFF_LOOP_A, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), g_loop_a, OFF_LOOP_B + 5 - OFF_LOOP_A);
     g_on = on;
 }
 
@@ -149,49 +156,65 @@ void __cdecl tilescan_entry(void) {
 // Always installs the per-frame entry hook (frame counter, g_frame_check). mode 0: loops stay original,
 // 1: fix on, 2: flip the fix on and off every 10 s and log the frame rate of each window.
 // fpslog: log the frame rate every 10 s.
+// The known build whose bytes are all in place at m, or NULL.
+const struct ts_build *tilescan_find(HMODULE m) {
+    const unsigned char *base = (const unsigned char *)m;
+    static const unsigned char tail[4] = {0x8B, 0x5C, 0x24, 0x24};
+    for (int i = 0; i < NBUILDS; i++) {
+        const struct ts_build *b = &g_ts_builds[i];
+        const unsigned char *e = base + b->entry;
+        if (in_image(m, b->entry, OFF_TAIL_B + 4) && in_image(m, b->push, LEN_PUSH) &&
+            fnv1a(e + OFF_LOOP_A, LEN_A) == b->hash_a && fnv1a(e + OFF_LOOP_B, LEN_B) == b->hash_b &&
+            fnv1a(base + b->push, LEN_PUSH) == HASH_PUSH && !memcmp(e + OFF_TAIL_A, tail, 4) &&
+            !memcmp(e + OFF_TAIL_B, tail, 4) && !memcmp(e, ENTRY_BYTES, 8))
+            return b;
+    }
+    return NULL;
+}
+
 int install_tilescan(HMODULE m, int mode, int fpslog, void (*log)(const char *fmt, ...)) {
     int ab = mode == 2;
     unsigned char *base = (unsigned char *)m;
-    static const unsigned char tail[4] = {0x8B, 0x5C, 0x24, 0x24};
-    if (fnv1a(base + RVA_LOOP_A, LEN_A) != HASH_A || fnv1a(base + RVA_LOOP_B, LEN_B) != HASH_B ||
-        fnv1a(base + RVA_PUSH, LEN_PUSH) != HASH_PUSH || memcmp(base + RVA_TAIL_A, tail, 4) || memcmp(base + RVA_TAIL_B, tail, 4) ||
-        memcmp(base + RVA_ENTRY, ENTRY_BYTES, 8)) {
+    const struct ts_build *b = tilescan_find(m);
+    if (!b) {
         log("tile feedback scan: code does not match this game version - not patched");
         return 0;
     }
+    unsigned char *entry = base + b->entry;
     g_log = log;
-    g_base = base;
+    g_loop_a = entry + OFF_LOOP_A;
+    g_loop_b = entry + OFF_LOOP_B;
     g_ab = ab;
     g_fpslog = fpslog;
-    g_push = (push_fn)(base + RVA_PUSH);
-    g_tail_a = base + RVA_TAIL_A;
-    g_tail_b = base + RVA_TAIL_B;
-    g_entry_back = base + RVA_ENTRY + 8;
+    g_push = (push_fn)(base + b->push);
+    g_tail_a = entry + OFF_TAIL_A;
+    g_tail_b = entry + OFF_TAIL_B;
+    g_entry_back = entry + 8;
     void *to[2] = {(void *)tilescan_thunk_a, (void *)tilescan_thunk_b};
-    uint32_t rva[2] = {RVA_LOOP_A, RVA_LOOP_B};
+    unsigned char *loop[2] = {g_loop_a, g_loop_b};
     for (int i = 0; i < 2; i++) {
-        memcpy(g_orig[i], base + rva[i], 5);
+        memcpy(g_orig[i], loop[i], 5);
         g_new[i][0] = 0xE9;
-        int32_t rel = (int32_t)((unsigned char *)to[i] - (base + rva[i] + 5));
+        int32_t rel = (int32_t)((unsigned char *)to[i] - (loop[i] + 5));
         memcpy(g_new[i] + 1, &rel, 4);
     }
     DWORD old;
-    if (!VirtualProtect(base + RVA_ENTRY, 8, PAGE_EXECUTE_READWRITE, &old)) {
+    if (!VirtualProtect(entry, 8, PAGE_EXECUTE_READWRITE, &old)) {
         log("tile feedback scan: VirtualProtect failed (%lu) - not patched", GetLastError());
         return 0;
     }
     tilescan_enable(1);
     if (!g_on) {
-        VirtualProtect(base + RVA_ENTRY, 8, old, &old);
+        VirtualProtect(entry, 8, old, &old);
         log("tile feedback scan: VirtualProtect failed (%lu) - not patched", GetLastError());
         return 0;
     }
-    int32_t rel = (int32_t)((unsigned char *)tilescan_thunk_entry - (base + RVA_ENTRY + 5));
+    int32_t rel = (int32_t)((unsigned char *)tilescan_thunk_entry - (entry + 5));
     unsigned char jmp[8] = {0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90};
     memcpy(jmp + 1, &rel, 4);
-    memcpy(base + RVA_ENTRY, jmp, 8);
-    VirtualProtect(base + RVA_ENTRY, 8, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), base + RVA_ENTRY, 8);
+    memcpy(entry, jmp, 8);
+    VirtualProtect(entry, 8, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), entry, 8);
     if (!mode) tilescan_enable(0);
     log(ab ? "tile feedback scan replaced, A/B mode: fix flips on/off every 10 s, fps logged per window"
            : mode ? "tile feedback scan replaced (run-length counting)" : "tilescan_off.txt found - tile feedback scan left original (frame hook only)");

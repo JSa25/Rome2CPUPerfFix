@@ -42,14 +42,15 @@ int main(int argc, char **argv) {
     MultiByteToWideChar(CP_ACP, 0, argv[1], -1, w, MAX_PATH);
     HMODULE m = LoadLibraryExW(w, NULL, DONT_RESOLVE_DLL_REFERENCES);
     CHECK(m != NULL);
+    strfix_find(m);
     for (int i = 0; i < NSITES; i++) say("%s +0x%X hash 0x%08lX", g_str[i].name, g_str[i].rva, str_site_hash((unsigned char *)m + g_str[i].rva, i));
     for (int i = 0; i < NSITES; i++) CHECK(site_ok((unsigned char *)m + g_str[i].rva, i));
 
-    eq_fn oeq = (eq_fn)((char *)m + RVA_EQUAL);
-    cmp_fn ocmp = (cmp_fn)((char *)m + RVA_COMPARE);
+    eq_fn oeq = (eq_fn)((char *)m + g_str[0].rva);
+    cmp_fn ocmp = (cmp_fn)((char *)m + g_str[1].rva);
     // the original assign, relocated into this test
     unsigned char *code = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    memcpy(code, (char *)m + RVA_ASSIGN, 111);
+    memcpy(code, (char *)m + g_str[2].rva, 111);
     *(char **)(code + AS_EMPTY) = t_empty;
     *(LONG *)(code + AS_CALL) = (LONG)((unsigned char *)t_alloc - (code + AS_CALL + 4));
     *(char **)(code + AS_TERM) = &t_term;
@@ -99,7 +100,7 @@ int main(int argc, char **argv) {
     // pair search: the original from a copy, its equality calls aimed at the game's own equality, its two
     // destructor calls at a recorder (which keys get destroyed, in which order)
     unsigned char *pf = code + 512;
-    memcpy(pf, (char *)m + RVA_PAIRFIND, 85);
+    memcpy(pf, (char *)m + g_str[3].rva, 85);
     const int eq_calls[2] = {0x1A, 0x2C}, free_calls[2] = {0x43, 0x4C};
     for (int i = 0; i < 2; i++) *(LONG *)(pf + eq_calls[i]) = (LONG)((unsigned char *)oeq - (pf + eq_calls[i] + 4));
     for (int i = 0; i < 2; i++) *(LONG *)(pf + free_calls[i]) = (LONG)((unsigned char *)t_free - (pf + free_calls[i] + 4));

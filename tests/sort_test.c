@@ -37,6 +37,8 @@ int main(int argc, char **argv) {
     MultiByteToWideChar(CP_ACP, 0, argv[1], -1, w, MAX_PATH);
     HMODULE m = LoadLibraryExW(w, NULL, DONT_RESOLVE_DLL_REFERENCES);
     CHECK(m != NULL);
+    sortfix_find(m);
+    printf("sorts at +0x%lX / +0x%lX\n", g_sorts[0].rva, g_sorts[1].rva);
     sort_fn origs[2] = {(sort_fn)((char *)m + g_sorts[0].rva), (sort_fn)((char *)m + g_sorts[1].rva)};
     sort_fn mine[2] = {draw_sort, list_sort};
     sort_fn orig = origs[0];
@@ -90,7 +92,7 @@ int main(int argc, char **argv) {
     printf("20,000 items, second sort: game's %.0f us, new %.0f us (%.1fx)\n", u2[0], u2[1], u2[0] / u2[1]);
 
     CHECK(install_sortfix(m, say) == 2);
-    CHECK(((unsigned char *)m)[RVA_DRAWSORT] == 0xE9 && ((unsigned char *)m)[g_sorts[1].rva] == 0xE9);
+    CHECK(((unsigned char *)m)[g_sorts[0].rva] == 0xE9 && ((unsigned char *)m)[g_sorts[1].rva] == 0xE9);
     void **c = make(500, 10, 10);
     orig(c, c + 500, 500, NULL);  // now jumps to draw_sort through the patched entry
     for (unsigned i = 1; i < 500; i++) CHECK(key_of(c[i - 1]) <= key_of(c[i]));

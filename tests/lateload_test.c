@@ -186,20 +186,29 @@ int main(int argc, char **argv) {
     CHECK(has("empire.retail.dll is loading now - installing the fixes"));
     CHECK(has("Rome 2 CPU Performance Fix v"));
     CHECK(has("tile feedback scan replaced"));
-    CHECK(has("x87 fix: 1196 of 1196"));
+    CHECK(has("x87 fix: 1196 of 1196") || has("x87 fix: 1213 of 1213"));  // 2026-09-17 build / pantheon beta
     CHECK(has("draw-list sort replaced") && has("render-list sort (+0x44/+0x40) replaced"));
     CHECK(has("string fix installed"));
     CHECK(!has("does not match") && !has("skipped") && !has("not installed"));
 
     unsigned char *b = (unsigned char *)game, *lo = (unsigned char *)me;
     unsigned char *hi = lo + ((IMAGE_NT_HEADERS *)(lo + ((IMAGE_DOS_HEADER *)lo)->e_lfanew))->OptionalHeader.SizeOfImage;
-    const DWORD into_dll[] = {0x1594020, 0x1594065, 0x1594198, 0x14A8370, 0x14A7930, 0xF41F0, 0xF9AC0, 0xF0380, 0x7E61B0};  // tile scan (3), sorts (2), strings (4)
-    for (int i = 0; i < (int)(sizeof into_dll / sizeof *into_dll); i++) {
-        unsigned char *site = b + into_dll[i];
-        CHECK(site[0] == 0xE9 && target(site) >= lo && target(site) < hi);
+    // tile scan (3), sorts (2), strings (4), per known build (src/builds.h): one list must jump into our DLL
+    const DWORD into_dll[2][9] = {{0x1594020, 0x1594065, 0x1594198, 0x14A8370, 0x14A7930, 0xF41F0, 0xF9AC0, 0xF0380, 0x7E61B0},
+                                  {0x156DCF0, 0x156DD35, 0x156DE68, 0x1481B70, 0x1481130, 0xF2250, 0xF6A10, 0xEF270, 0x7E09C0}};
+    int found = -1;
+    for (int k = 0; k < 2 && found < 0; k++) {
+        int all = 1;
+        for (int i = 0; i < 9 && all; i++) {
+            unsigned char *site = b + into_dll[k][i];
+            all = site[0] == 0xE9 && target(site) >= lo && target(site) < hi;
+        }
+        if (all) found = k;
     }
-    printf("late install: game DLL relocated to %p, all fixes installed from the load notification\n", (void *)game);
+    CHECK(found >= 0);
+    printf("late install: game DLL relocated to %p, all fixes installed from the load notification (build %d)\n", (void *)game, found);
     CHECK(heap == has("game heap replaced"));
+    CHECK(!heap || found == 0);  // the heap test (profiling build only) knows the first build only
     if (heap) {
         const DWORD heap_rvas[] = {0x12CF80, 0x12C930, 0x12D260};  // dlmalloc, dlfree, dlrealloc
         for (int i = 0; i < 3; i++) CHECK(b[heap_rvas[i]] == 0xE9 && target(b + heap_rvas[i]) >= lo && target(b + heap_rvas[i]) < hi);

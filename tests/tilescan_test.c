@@ -1,4 +1,4 @@
-// Differential test: the game's own tile feedback scan (+0x1594020, run from the real
+// Differential test: the game's own tile feedback scan (+0x1594020 / pantheon +0x156DCF0, run from the real
 // empire.retail.dll mapped without imports) against the run-length replacement in tilescan.c.
 // In the mapping, the readback source call is redirected to a stub that hands out test buffers and
 // the tail (GPU/global bookkeeping) jumps straight to the epilogue; the per-pixel loops and the
@@ -13,6 +13,8 @@
 
 int install_tilescan(HMODULE m, int mode, int fpslog, void (*log)(const char *fmt, ...));
 void tilescan_enable(int on);
+struct ts_build { DWORD entry, push, hash_a, hash_b; };
+const struct ts_build *tilescan_find(HMODULE m);
 static void quiet(const char *fmt, ...) { (void)fmt; }
 
 typedef struct { uint16_t *counts; uint32_t width, height, unused; } Layer;
@@ -22,7 +24,7 @@ typedef void(__thiscall *scan_fn)(Grid *g, void *src, uint32_t arg2);
 static uint32_t *g_buf, g_cols, g_rows, g_pitch;
 static unsigned char *g_base;
 
-// stands in for +0x1594810 (thiscall, 4 stack args, returns the mapped buffer)
+// stands in for the readback source (+0x1594810 in the first build; thiscall, 4 stack args, returns the mapped buffer)
 static uint32_t *__thiscall src_stub(void *self, uint32_t *cols, uint32_t *rows, uint32_t *pitch, uint32_t arg2) {
     (void)self; (void)arg2;
     *cols = g_cols; *rows = g_rows; *pitch = g_pitch;
@@ -73,25 +75,28 @@ int main(int argc, char **argv) {
     MultiByteToWideChar(CP_ACP, 0, argv[1], -1, path, MAX_PATH);
     HMODULE m = LoadLibraryExW(path, NULL, DONT_RESOLVE_DLL_REFERENCES);
     CHECK(m != NULL);
-    g_base = (unsigned char *)m;
+    const struct ts_build *b = tilescan_find(m);
+    CHECK(b != NULL);
+    printf("tile scan function at +0x%lX\n", b->entry);
+    g_base = (unsigned char *)m + b->entry;  // offsets below are from the function entry
     DWORD old;
-    CHECK(VirtualProtect(g_base + 0xE8000, 0x1600000, PAGE_EXECUTE_READWRITE, &old));
-    put_rel(0x1594054, 0xE8, (void *)src_stub);  // loop A's source call
-    put_rel(0x1594187, 0xE8, (void *)src_stub);  // loop B's source call
-    put_rel(0x159413B, 0xE9, g_base + 0x15942B5);  // tails -> epilogue
-    put_rel(0x159427B, 0xE9, g_base + 0x15942B5);
-    scan_fn orig = (scan_fn)(g_base + 0x1594020);
+    CHECK(VirtualProtect((unsigned char *)m + 0xE8000, 0x1600000, PAGE_EXECUTE_READWRITE, &old));
+    put_rel(0x34, 0xE8, (void *)src_stub);  // loop A's source call
+    put_rel(0x167, 0xE8, (void *)src_stub);  // loop B's source call
+    put_rel(0x11B, 0xE9, g_base + 0x295);  // tails -> epilogue
+    put_rel(0x25B, 0xE9, g_base + 0x295);
+    scan_fn orig = (scan_fn)g_base;
 
     unsigned char orig_a[5], orig_b[5], new_a[5], new_b[5];
-    memcpy(orig_a, g_base + 0x1594065, 5); memcpy(orig_b, g_base + 0x1594198, 5);
+    memcpy(orig_a, g_base + 0x45, 5); memcpy(orig_b, g_base + 0x178, 5);
     CHECK(install_tilescan(m, 1, 0, quiet) == 1);  // also hooks the function entry: every call below goes through it
-    memcpy(new_a, g_base + 0x1594065, 5); memcpy(new_b, g_base + 0x1594198, 5);
-    CHECK(new_a[0] == 0xE9 && new_b[0] == 0xE9 && g_base[0x1594020] == 0xE9);
+    memcpy(new_a, g_base + 0x45, 5); memcpy(new_b, g_base + 0x178, 5);
+    CHECK(new_a[0] == 0xE9 && new_b[0] == 0xE9 && g_base[0] == 0xE9);
     CHECK(install_tilescan(m, 1, 0, quiet) == 0);  // patched code no longer matches: refuses
     tilescan_enable(0);  // the A/B switch restores the game's exact bytes...
-    CHECK(!memcmp(g_base + 0x1594065, orig_a, 5) && !memcmp(g_base + 0x1594198, orig_b, 5));
+    CHECK(!memcmp(g_base + 0x45, orig_a, 5) && !memcmp(g_base + 0x178, orig_b, 5));
     tilescan_enable(1);  // ...and puts the patch back
-    CHECK(!memcmp(g_base + 0x1594065, new_a, 5) && !memcmp(g_base + 0x1594198, new_b, 5));
+    CHECK(!memcmp(g_base + 0x45, new_a, 5) && !memcmp(g_base + 0x178, new_b, 5));
 
     unsigned char src[0x40] = {0};  // the readback object: byte +4 picks the layout (non-zero = A)
     long pushes = 0, pixels = 0;

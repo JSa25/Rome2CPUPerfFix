@@ -10,10 +10,11 @@ Download the ready-made DLL:
 Created with the help of AI (Claude by Anthropic). Tested in game by JGdaCaesar.
 
 The mod does not appear in the game launcher's mod list: it is a DLL in the game folder, not a `.pack` mod. It is
-active whenever `dinput8.dll` is in the game folder; `rome2fix.log` shows what it did.
+active whenever `dinput8.dll` is in the game folder; the STATUS lines in `rome2fix.log` show which fixes are on.
 
 Version 1.1 adds faster loading (a Divide et Impera save: 38 s with 1.0, 20 s with 1.1 on the test PC; see the
-player README for all measurements).
+player README for all measurements). Version 1.2 also supports the "pantheon" beta and makes `rome2fix.log`
+easier to read.
 
 ## What each file does
 
@@ -28,12 +29,14 @@ player README for all measurements).
 | `strfix.c` | Loading: the game's string equality, compare and assign helpers and a pair-table search, rewritten with 16-byte compares and `memcpy` (same results, byte-for-byte checked sites) |
 | `diag.c` | Diagnostics in `rome2fix.log`: mod version, game build, system, settings, other hook DLLs, and crash records (a vectored exception handler that only logs and never handles the exception) |
 | `update.c` | Self-update from the Steam Workshop copy (item 3826423359): a newer version there replaces the DLL in the game folder for the next start; never downgrades, no network |
+| `builds.h` | The game builds the fixes know (normal Steam version 2026-09-17, "pantheon" beta 2026-10-01); each fix keeps its addresses and byte hashes per build |
 | `version.h` | Mod version |
 | `dinput8.def` | The exports a `dinput8.dll` must have |
 
 Every patch first compares the game's bytes at its address with what it expects (with relocated
 addresses taken into account), and skips itself (and says so in `rome2fix.log`) if they differ.
-So on another game version it does nothing.
+So on a game version it doesn't know it does nothing. Each fix has a table of {address, hash} per known
+build (`builds.h`) and uses the entry whose bytes match.
 
 The developer build adds measuring tools (timing probes, A/B switches); they are not part of this
 source or of the released DLL.

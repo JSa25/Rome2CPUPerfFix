@@ -11,11 +11,12 @@
 #include <string.h>
 
 #include "version.h"
+#include "builds.h"
 #define MOD_VERSION "v" MOD_VERSION_STR
 #define MAX_RECORDS 8  // per session: the first ones are what matters, and a loop of faults must not flood the log
 
 static wchar_t g_dlog[MAX_PATH];
-static DWORD g_main_tid;
+static DWORD g_main_tid, g_self_base;
 static volatile LONG g_records, g_busy;
 static char g_buf[8192];  // the handler's only buffer: static, so a stack overflow record needs no stack
 
@@ -50,6 +51,13 @@ static int where(char *out, int cap, DWORD a) {
     return name ? snprintf(out, cap, "%s+0x%lX", name, a - base) : snprintf(out, cap, "%08lX", a);
 }
 
+// case-insensitive ASCII compare (the handler avoids CRT functions that may touch locale state)
+static int same_ascii(const char *a, const char *b) {
+    for (; *a && *b; a++, b++)
+        if ((*a | 0x20) != (*b | 0x20)) return 0;
+    return *a == *b;
+}
+
 static const char *code_name(DWORD c) {
     switch (c) {
     case EXCEPTION_ACCESS_VIOLATION: return "access violation";
@@ -76,9 +84,16 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *e) {
     DWORD tid = GetCurrentThreadId();
     p += snprintf(p, end - p, "[%02d:%02d:%02d.%03d] EXCEPTION %d: 0x%08lX %s at ", t.wHour, t.wMinute, t.wSecond,
                   t.wMilliseconds, (int)nrec, code, what);
-    p += where(p, end - p, (DWORD)(UINT_PTR)e->ExceptionRecord->ExceptionAddress);
+    DWORD at = (DWORD)(UINT_PTR)e->ExceptionRecord->ExceptionAddress, at_base = 0;
+    const char *at_name = image_of(at, &at_base);
+    p += where(p, end - p, at);
     p += snprintf(p, end - p, ", %s thread %lu (first chance: the game may still handle it)\n",
                   tid == g_main_tid ? "main" : "worker", tid);
+    // the same in plain words: whose code it happened in
+    int ours = at_base && at_base == g_self_base, game = at_name && same_ascii(at_name, "empire.retail.dll");
+    p += snprintf(p, end - p, "  -> %s%s. If the game closed or froze right now, this is why; if it kept running, it "
+                  "recovered.\n", ours ? "inside this mod (please report it)" : game ? "in the game's own code, not in this mod"
+                  : "not in this mod, in ", ours || game ? "" : at_name ? at_name : "code outside any DLL");
     if ((code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) &&
         e->ExceptionRecord->NumberParameters >= 2) {
         ULONG_PTR k = e->ExceptionRecord->ExceptionInformation[0];
@@ -123,6 +138,8 @@ static void pref(const char *text, const char *name, char *out, int cap) {
 
 void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const char *fmt, ...)) {
     g_main_tid = GetCurrentThreadId();
+    MEMORY_BASIC_INFORMATION mb;
+    if (VirtualQuery((void *)diag_startup, &mb, sizeof mb)) g_self_base = (DWORD)(UINT_PTR)mb.AllocationBase;
     wcscpy(g_dlog, log_path);
     wchar_t exe[MAX_PATH], dir[MAX_PATH];
     GetModuleFileNameW(NULL, exe, MAX_PATH);
@@ -141,6 +158,12 @@ void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const cha
     log("game: empire.retail.dll build %08lX, image %lu bytes, loaded at %p; Rome2.exe large-address-aware: %s",
         nt->FileHeader.TimeDateStamp, nt->OptionalHeader.SizeOfImage, (void *)empire,
         (xnt->FileHeader.Characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE) ? "yes" : "NO");
+    const char *bn = build_name(nt->FileHeader.TimeDateStamp);
+    if (bn)
+        log("Game version: %s - supported", bn);
+    else
+        log("Game version: unknown (build %08lX) - NOT supported yet: the FPS fixes switch themselves off, the game runs "
+            "as without the mod there. The loading fixes may still work.", nt->FileHeader.TimeDateStamp);
 
     OSVERSIONINFOW ov = {.dwOSVersionInfoSize = sizeof ov};
     LONG(WINAPI * rtl)(OSVERSIONINFOW *) = (void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion");
