@@ -168,8 +168,24 @@ Compatibility and notes
   driver takes to create textures while loading.
 
 
+DLSS add-on (separate download)
+-------------------------------
+Since 1.3 this DLL can run the separate add-on "Upscaling and Framegen for
+Rome II": NVIDIA DLSS Super Resolution and DLSS Frame Generation on NVIDIA RTX
+graphics cards. It does nothing unless that add-on's FrameBridge folder is in
+the game folder (its install.bat puts it there). The add-on's own README has
+the details; the engine fix keeps it up to date from the add-on's Workshop item.
+
+
 Changelog
 ---------
+Version 1.3: runs the separate DLSS add-on "Upscaling and Framegen for Rome II"
+           (does nothing without it) and copies the add-on's Workshop updates
+           in at game start. rome2fix.log keeps only the newest ~256 KB once
+           it passes 1 MB. The loose-file check cache also answers when the
+           game opens a file that is known to be missing.
+           SHA-256 of dinput8.dll:
+           a009e01fecddf2b648f81dde0f7236c707231ae1d03c3595ba072a4f5ffec28b
 Version 1.2: works on the "pantheon" beta too (all fixes). Easier to read
            rome2fix.log: a line per game start, the game version in plain
            words, a STATUS summary, plainer crash lines, less repetition.

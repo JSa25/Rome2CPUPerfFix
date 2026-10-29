@@ -1,7 +1,8 @@
 // Test for attrcache.c: every answer (attributes and last error) must equal plain GetFileAttributesW, also while
 // files and folders are created, renamed and deleted between queries. A temporary tree with 15 roots stands in for
 // the game's search roots. A second run with the watches ignored must find differences (proves the test can
-// catch a stale cache). Also times cached misses against Windows.
+// catch a stale cache). Every other query is a read-only open (CreateFileW, OPEN_EXISTING, the game's flags) instead
+// of a check: handle validity and last error must equal plain CreateFileW. Also times cached misses against Windows.
 #include "../attrcache.c"
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,10 +51,29 @@ static long run(int queries, int mutate_every) {
         wchar_t rel[MAX_PATH], p[MAX_PATH];
         rel_path(rel);
         full_path(p, rnd() % 15, rel);
-        SetLastError(1234);
-        DWORD a1 = ac_GetFileAttributesW(p), e1 = GetLastError();
-        SetLastError(1234);
-        DWORD a2 = GetFileAttributesW(p), e2 = GetLastError();
+        DWORD a1, e1, a2, e2;
+        if (rnd() % 2) {
+            SetLastError(1234);
+            a1 = ac_GetFileAttributesW(p), e1 = GetLastError();
+            SetLastError(1234);
+            a2 = GetFileAttributesW(p), e2 = GetLastError();
+        } else {  // the game's flag sets: buffered, unbuffered + overlapped + sequential, read-only attribute, and its
+                  // stat (attributes access, backup semantics: also opens folders)
+            static const DWORD fl[4] = {0x08000001, 0x68000001, 0x80, FILE_FLAG_BACKUP_SEMANTICS};
+            int k = rnd() % 4;
+            DWORD f = fl[k], sh = rnd() % 2 ? FILE_SHARE_READ : FILE_SHARE_READ | FILE_SHARE_WRITE;
+            DWORD acc = k == 3 ? FILE_READ_ATTRIBUTES : GENERIC_READ;
+            if (k == 3) sh = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+            SetLastError(1234);
+            HANDLE h1 = ac_CreateFileW(p, acc, sh, NULL, OPEN_EXISTING, f, NULL);
+            e1 = GetLastError();
+            if (h1 != INVALID_HANDLE_VALUE) CloseHandle(h1);
+            SetLastError(1234);
+            HANDLE h2 = CreateFileW(p, acc, sh, NULL, OPEN_EXISTING, f, NULL);
+            e2 = GetLastError();
+            if (h2 != INVALID_HANDLE_VALUE) CloseHandle(h2);
+            a1 = h1 == INVALID_HANDLE_VALUE, a2 = h2 == INVALID_HANDLE_VALUE;  // 1 = failed
+        }
         if (a1 != a2 || e1 != e2) {
             if (bad++ < 5) {
                 printf("  differs: %ls -> cache %08lX/%lu, Windows %08lX/%lu\n", p, a1, e1, a2, e2);
@@ -122,12 +142,13 @@ int main(void) {
 
     make_tree();
     long b = run(200000, 0);
-    printf("200,000 random queries, tree unchanged: %ld differences, %ld cache answers, %ld names learned\n", b, g_hits, g_inserts);
-    fail |= b != 0 || g_hits < 50000;
+    printf("200,000 random queries, tree unchanged: %ld differences, %ld check + %ld open cache answers, %ld names learned\n",
+           b, g_hits, g_open_hits, g_inserts);
+    fail |= b != 0 || g_hits < 25000 || g_open_hits < 25000;
 
-    long h0 = g_hits;
+    long h0 = g_hits + g_open_hits;
     b = run(200000, 50);
-    printf("200,000 random queries, a change every 50 queries: %ld differences, %ld cache answers, %ld resets\n", b, g_hits - h0, g_resets);
+    printf("200,000 random queries, a change every 50 queries: %ld differences, %ld cache answers, %ld resets\n", b, g_hits + g_open_hits - h0, g_resets);
     fail |= b != 0;
 
     b = run(50000, 1);
@@ -157,6 +178,13 @@ int main(void) {
     QueryPerformanceCounter(&t2);
     double us_c = 1e6 * (double)(t1.QuadPart - t0.QuadPart) / f.QuadPart / N, us_w = 1e6 * (double)(t2.QuadPart - t1.QuadPart) / f.QuadPart / N;
     printf("missing-file checks: cache %.2f us, Windows %.2f us per call (%.1fx)\n", us_c, us_w, us_w / us_c);
+    QueryPerformanceCounter(&t0);
+    for (int i = 0; i < N; i++) { swprintf(p, MAX_PATH, L"%ls\\r%d\\variantmeshes\\unit\\m%d.variantmeshdefinition", g_base, i % 15, i % 1000); ac_CreateFileW(p, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0x68000001, NULL); }
+    QueryPerformanceCounter(&t1);
+    for (int i = 0; i < N; i++) { swprintf(p, MAX_PATH, L"%ls\\r%d\\variantmeshes\\unit\\m%d.variantmeshdefinition", g_base, i % 15, i % 1000); CreateFileW(p, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0x68000001, NULL); }
+    QueryPerformanceCounter(&t2);
+    us_c = 1e6 * (double)(t1.QuadPart - t0.QuadPart) / f.QuadPart / N, us_w = 1e6 * (double)(t2.QuadPart - t1.QuadPart) / f.QuadPart / N;
+    printf("missing-file opens: cache %.2f us, Windows %.2f us per call (%.1fx)\n", us_c, us_w, us_w / us_c);
 
     reset_cache();
     del_tree(g_base);

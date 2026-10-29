@@ -17,6 +17,7 @@
 
 static wchar_t g_dlog[MAX_PATH];
 static DWORD g_main_tid, g_self_base;
+volatile DWORD g_uikeep_tid;  // uikeep.c: the thread that is keeping or deleting a menu picture right now, else 0
 static volatile LONG g_records, g_busy;
 static char g_buf[8192];  // the handler's only buffer: static, so a stack overflow record needs no stack
 
@@ -94,6 +95,9 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *e) {
     p += snprintf(p, end - p, "  -> %s%s. If the game closed or froze right now, this is why; if it kept running, it "
                   "recovered.\n", ours ? "inside this mod (please report it)" : game ? "in the game's own code, not in this mod"
                   : "not in this mod, in ", ours || game ? "" : at_name ? at_name : "code outside any DLL");
+    if (g_uikeep_tid && g_uikeep_tid == tid)
+        p += snprintf(p, end - p, "  -> it happened while the menu texture fix was keeping or deleting a menu picture. "
+                      "To switch that fix off, create an empty uikeep_off.txt in the game folder, and please report it.\n");
     if ((code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) &&
         e->ExceptionRecord->NumberParameters >= 2) {
         ULONG_PTR k = e->ExceptionRecord->ExceptionInformation[0];

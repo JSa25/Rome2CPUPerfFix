@@ -9,6 +9,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include "version.h"
+#include "logtrim.h"
 
 int install_tilescan(HMODULE m, int mode, int fpslog, void (*log)(const char *fmt, ...));  // tilescan.c
 extern void (*g_frame_check)(void);                                                    // tilescan.c
@@ -20,8 +21,11 @@ void update_check(HMODULE self, void (*log)(const char *fmt, ...));             
 int install_fileio(HMODULE m, void (*log)(const char *fmt, ...));                              // fileio.c
 int install_strfix(HMODULE m, void (*log)(const char *fmt, ...));                              // strfix.c
 int install_attrcache(HMODULE m, int verify, void (*log)(const char *fmt, ...));               // attrcache.c
+int install_bridgeprobe(HMODULE m, const wchar_t *dir, void (*log)(const char *fmt, ...));     // bridgeprobe.c (the DLSS add-on)
 #ifdef PROFILING
-void sortfix_enable(int on);                                                           // sortfix.c
+// the menu-picture fix is profiling-only: it halves the reloads but made no measurable difference (AGENT_LOG 2026-10-27)
+int install_uikeep(HMODULE m, int loadnames, void (*log)(const char *fmt, ...));               // uikeep.c
+void sortfix_enable(int on);                                                         // sortfix.c
 int install_probes(HMODULE m, const wchar_t *list, const wchar_t *out, void (*log)(const char *fmt, ...));  // probes.c
 void probes_frame(void);                                                               // probes.c
 int install_viewtouch(HMODULE m, const wchar_t *cfg, void (*log)(const char *fmt, ...));  // viewtouch.c
@@ -30,6 +34,8 @@ int install_heapfix(HMODULE m, void (*log)(const char *fmt, ...));              
 extern void (*g_ab_flip)(int on);                                                      // tilescan.c
 extern const char *g_ab_name;
 static int g_probes_on;
+extern volatile unsigned char g_uikeep_on, g_ac_open_on;  // uikeep.c, attrcache.c
+static void menus_enable(int on) { g_uikeep_on = g_ac_open_on = (unsigned char)on; }
 #endif
 
 static int g_x87_on;
@@ -47,6 +53,7 @@ static wchar_t g_log_path[MAX_PATH];
 
 // One line per game start that stands out in the log: version and date.
 static void log_header(void) {
+    trim_log(g_log_path);  // past 1 MB, the oldest sessions go (players must be able to post it)
     FILE *f = _wfopen(g_log_path, L"a");
     if (!f) return;
     SYSTEMTIME t;
@@ -85,9 +92,15 @@ static FARPROC real_proc(const char *name) {
     return GetProcAddress(g_real, name);
 }
 
+void (*g_dev_di8_created)(void *di);   // the DLSS add-on's F11 panel filters the game's mouse while open (fgpanel.c)
 HRESULT WINAPI stub_DirectInput8Create(HINSTANCE h, DWORD v, REFIID r, LPVOID *o, LPUNKNOWN u) {
     typedef HRESULT(WINAPI * fn)(HINSTANCE, DWORD, REFIID, LPVOID *, LPUNKNOWN);
     fn f = (fn)real_proc("DirectInput8Create");
+    if (f && g_dev_di8_created) {
+        HRESULT hr = f(h, v, r, o, u);
+        if (SUCCEEDED(hr) && o && *o) g_dev_di8_created(*o);
+        return hr;
+    }
     return f ? f(h, v, r, o, u) : E_FAIL;
 }
 HRESULT WINAPI stub_DllCanUnloadNow(void) {
@@ -113,17 +126,23 @@ HRESULT WINAPI stub_DllUnregisterServer(void) {
 
 // The plain-language summary after the install lines (those stay as the details for bug reports).
 enum { FIX_SWITCHED_OFF = -1, FIX_INACTIVE = 0, FIX_ON = 1, FIX_PARTLY = 2 };
-static const char *const g_fix_names[6] = {"FPS: tile feedback scan", "FPS: x87 rounding", "FPS: render-list sorts",
-                                           "Loading: file reading", "Loading: string functions", "Loading: missing-file cache"};
+#ifdef PROFILING
+#define NFIX 7
+#else
+#define NFIX 6  // without "Menus" (profiling-only)
+#endif
+static const char *const g_fix_names[7] = {"FPS: tile feedback scan", "FPS: x87 rounding", "FPS: render-list sorts",
+                                           "Loading: file reading", "Loading: string functions", "Loading: missing-file cache",
+                                           "Menus: pictures stay loaded"};
 
-static void log_status(const int st[6]) {
+static void log_status(const int st[7]) {
     int on = 0;
-    for (int i = 0; i < 6; i++) on += st[i] == FIX_ON;
-    if (on == 6)
-        wlog("STATUS: all 6 fixes are on");
+    for (int i = 0; i < NFIX; i++) on += st[i] == FIX_ON;
+    if (on == NFIX)
+        wlog("STATUS: all %d fixes are on", NFIX);
     else
-        wlog("STATUS: %d of 6 fixes are on", on);
-    for (int i = 0; i < 6; i++)
+        wlog("STATUS: %d of %d fixes are on", on, NFIX);
+    for (int i = 0; i < NFIX; i++)
         wlog("  %-4s %s%s", st[i] == FIX_ON ? "on" : st[i] == FIX_PARTLY ? "part" : "OFF", g_fix_names[i],
              st[i] == FIX_SWITCHED_OFF ? " (switched off by its _off.txt file in the game folder)"
              : st[i] == FIX_PARTLY ? " (only part of it fits this game version)"
@@ -132,7 +151,7 @@ static void log_status(const int st[6]) {
 
 // Installs everything into the game DLL m (mapped and relocated, its own startup code not run yet).
 static void install_all(HMODULE m) {
-    int st[6] = {0};
+    int st[7] = {0};
     diag_startup(m, g_log_path, wlog);  // version, process, game build, system, settings; crash records
     update_check(g_self, wlog);         // a newer Workshop copy replaces this DLL for the next launch
     // Off switches: empty files in the game folder.
@@ -181,6 +200,14 @@ static void install_all(HMODULE m) {
 #endif
         st[5] = install_attrcache(m, verify, wlog) > 0;
     }
+#ifdef PROFILING
+    int loadnames = PRESENT(L"loadnames_on.txt");  // count menu picture loads per name
+    if (PRESENT(L"uikeep_off.txt")) {
+        wlog("uikeep_off.txt found - menu pictures freed when closed, as the game does");
+        st[6] = FIX_SWITCHED_OFF;
+    } else
+        st[6] = install_uikeep(m, loadnames, wlog) > 0;
+#endif
     int sorts = 0;
     if (PRESENT(L"sortfix_off.txt")) {
         wlog("sortfix_off.txt found - render-list sorts not replaced");
@@ -195,6 +222,11 @@ static void install_all(HMODULE m) {
         g_ab_name = "sortfix";
         g_ab_flip = sortfix_enable;
         wlog("sortfix_ab.txt found - A/B mode for the sort fix");
+    } else if (st[6] == FIX_ON && PRESENT(L"uikeep_ab.txt")) {
+        // A/B: menu pictures kept + menu stat opens cached, on/off every 10 s (off frees everything kept)
+        g_ab_name = "menus";
+        g_ab_flip = menus_enable;
+        wlog("uikeep_ab.txt found - A/B mode for the menu fixes");
     }
     // probes.txt: time the listed functions per frame into probes_<date>_<time>.bin.
     if (PRESENT(L"probes.txt")) {
@@ -212,6 +244,28 @@ static void install_all(HMODULE m) {
     // attrprobe.txt: count and time the game's GetFileAttributesW calls (attrprobe.c)
     if (PRESENT(L"attrprobe.txt")) install_attrprobe(m, wlog);
 #endif
+    // the DLSS add-on (Upscaling and Framegen for Rome II): <game>\FrameBridge\ with the 64-bit helper and NVIDIA's DLLs;
+    // without it, or with addon=off in its settings.txt, nothing is installed. Dev builds: also bridgeprobe.txt (the
+    // bridge capture probe, fgbridge_on.txt; dlss/DLSS_LOG.md)
+    int addon = PRESENT(L"FrameBridge\\helper64.exe");
+    if (addon) {
+        char text[1024] = {0};
+        FILE *sf = PRESENT(L"FrameBridge\\settings.txt") ? _wfopen(f, L"r") : NULL;
+        if (sf) { fread(text, 1, sizeof text - 1, sf); fclose(sf); }
+        if (strstr(text, "\naddon=off") || !strncmp(text, "addon=off", 9)) {
+            wlog("DLSS add-on found but switched off (addon=off in FrameBridge\\settings.txt) - the game runs with the performance fix only");
+            addon = 0;
+        }
+    }
+#ifdef PROFILING
+    if (PRESENT(L"bridgeprobe.txt")) addon = 1;
+#endif
+    if (addon) {
+        wchar_t dir[MAX_PATH];
+        wcscpy(dir, f);
+        dir[name - f - 1] = 0;
+        install_bridgeprobe(m, dir, wlog);
+    }
 }
 
 // Something else in the process (an overlay, another hook DLL) can load dinput8.dll before the game loads

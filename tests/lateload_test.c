@@ -189,6 +189,7 @@ int main(int argc, char **argv) {
     CHECK(has("x87 fix: 1196 of 1196") || has("x87 fix: 1213 of 1213"));  // 2026-09-17 build / pantheon beta
     CHECK(has("draw-list sort replaced") && has("render-list sort (+0x44/+0x40) replaced"));
     CHECK(has("string fix installed"));
+    int uk = has("menu textures: the last");  // the menu-picture fix is in the profiling build only
     CHECK(!has("does not match") && !has("skipped") && !has("not installed"));
 
     unsigned char *b = (unsigned char *)game, *lo = (unsigned char *)me;
@@ -206,6 +207,17 @@ int main(int argc, char **argv) {
         if (all) found = k;
     }
     CHECK(found >= 0);
+    // menu textures: the queue step's pinned test (step+0x7D, 6 bytes) and the allocator's call of the step
+    // (alloc+0x40) go into our DLL; the next instruction (step+0x83) is untouched
+    const DWORD uk_step[2] = {0x143DCD0, 0x1417950}, uk_alloc[2] = {0x143ABE0, 0x14148C0};
+    unsigned char *pin = b + uk_step[found] + 0x7D, *call = b + uk_alloc[found] + 0x40;
+    if (uk) {
+        CHECK(pin[0] == 0xE9 && target(pin) >= lo && target(pin) < hi && pin[5] == 0x90);
+        CHECK(pin[6] == 0x8B && pin[7] == 0x47 && pin[8] == 0x04);  // movl 0x4(%edi), %eax
+        CHECK(call[0] == 0xE8 && target(call) >= lo && target(call) < hi);
+    } else
+        CHECK(pin[0] != 0xE9 && call[0] == 0xE8 && !(target(call) >= lo && target(call) < hi));  // left as the game's
+    CHECK(has(uk ? "STATUS: all 7 fixes are on" : "STATUS: all 6 fixes are on"));
     printf("late install: game DLL relocated to %p, all fixes installed from the load notification (build %d)\n", (void *)game, found);
     CHECK(heap == has("game heap replaced"));
     CHECK(!heap || found == 0);  // the heap test (profiling build only) knows the first build only

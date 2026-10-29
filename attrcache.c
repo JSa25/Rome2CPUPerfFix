@@ -1,12 +1,16 @@
-// Loading fix: a cache of missing folders behind the game's GetFileAttributesW import.
+// Loading fix: a cache of missing folders behind the game's GetFileAttributesW and CreateFileW imports.
 // Before using a file from the packs, the game checks whether a loose copy exists under each of its search roots
 // (+0x126BD0 -> +0x102CC0 -> GetFileAttributesW; Data, every Workshop mod folder, two language folders). Nearly
 // every check fails: a DEI save load made 3.4 million of them, all "not found", 11.6 s of a 28 s load.
+// Opening a menu also stats loose files under every search root (the static CRT stat: CreateFileW with
+// FILE_READ_ATTRIBUTES and FILE_FLAG_BACKUP_SEMANTICS); those opens get the same answers (ported from the Attila fix).
 // A failed check for path P finds the deepest existing folder A above P and records M, the first missing name
 // below A. Later checks of exactly M fail with ERROR_FILE_NOT_FOUND and checks of anything below M fail with
 // ERROR_PATH_NOT_FOUND, which is what Windows returns. Exactness: A and its parent are watched for created/
 // renamed/deleted files and folders (watches registered before M is confirmed missing) and the watches are
 // polled on every call; any change clears the whole cache. Paths in unusual forms are passed straight through.
+// Opens use the same answers only where Windows' answer for a missing path is the same as for the check: read-only,
+// OPEN_EXISTING, no template, plain flags.
 #include <windows.h>
 #include <string.h>
 
@@ -16,6 +20,9 @@
 #define MAXWATCH   189       // polled in groups of 63 (WaitForMultipleObjects takes at most 64 handles)
 
 static DWORD(WINAPI *r_attr)(LPCWSTR);
+typedef HANDLE(WINAPI *ac_open_fn)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+static ac_open_fn r_open;
+volatile unsigned char g_ac_open_on = 1;  // dev A/B (uikeep_ab.txt) flips the open part with the menu fix  // what the game's import pointed at before (kernel32, or fileio.c's hook)
 static void (*g_log)(const char *fmt, ...);
 static int g_verify;  // run the real call too and count differences (profiling builds, attrcache_verify.txt)
 
@@ -27,7 +34,7 @@ static SRWLOCK g_lock = SRWLOCK_INIT;
 static HANDLE g_watch[MAXWATCH];
 static wchar_t *g_watch_dir[MAXWATCH];
 static volatile LONG g_nwatch;
-static volatile LONG g_hits, g_calls, g_inserts, g_resets, g_mismatch, g_skips;
+static volatile LONG g_hits, g_calls, g_inserts, g_resets, g_mismatch, g_skips, g_open_calls, g_open_hits;
 static int g_nowatch;  // tests only: ignore the watches, to prove the test catches a stale cache
 
 static DWORD fnv_step(DWORD h, wchar_t c) { return (h ^ c) * 0x01000193u; }
@@ -231,9 +238,44 @@ DWORD WINAPI ac_GetFileAttributesW(LPCWSTR p) {
     return a;
 }
 
+// Flags whose open of a missing path fails exactly like the check: attributes (ignored when opening), buffering hints,
+// backup semantics (the game's stat, FUN_119fd930: FILE_READ_ATTRIBUTES, used per search root when a menu opens).
+#define AC_OPEN_FLAGS (0x7FFFu | FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN |                        FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_WRITE_THROUGH)
+
+HANDLE WINAPI ac_CreateFileW(LPCWSTR p, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disp, DWORD flags,
+                             HANDLE tmpl) {
+    wchar_t q[MAXPATHC + 2];
+    DWORD n = 0;
+    if (g_ac_open_on && disp == OPEN_EXISTING && (access == GENERIC_READ || access == FILE_READ_ATTRIBUTES) && !tmpl && !(flags & ~AC_OPEN_FLAGS)) n = normalize(p, q);
+    if (!n) return r_open(p, access, share, sa, disp, flags, tmpl);
+    DWORD entry_le = GetLastError();
+    InterlockedIncrement(&g_open_calls);
+    DWORD cached = lookup(q, n);
+    if (cached && !g_verify) {
+        InterlockedIncrement(&g_open_hits);
+        SetLastError(cached);
+        return INVALID_HANDLE_VALUE;
+    }
+    SetLastError(entry_le);
+    HANDLE h = r_open(p, access, share, sa, disp, flags, tmpl);
+    DWORD le = GetLastError();
+    if (cached) {
+        InterlockedIncrement(&g_open_hits);
+        if (h != INVALID_HANDLE_VALUE || le != cached) {
+            if (InterlockedIncrement(&g_mismatch) <= 20 && g_log)
+                g_log("attribute cache MISMATCH (open): %ls cached error %lu, Windows %s error %lu", p, cached,
+                      h != INVALID_HANDLE_VALUE ? "opened it," : "failed,", h != INVALID_HANDLE_VALUE ? 0 : le);
+        }
+    } else if (h == INVALID_HANDLE_VALUE)
+        learn(q, n, le);
+    SetLastError(le);
+    return h;
+}
+
 void attrcache_stats(void (*log)(const char *fmt, ...)) {
-    log("attribute cache: %ld calls, %ld answered from the cache, %ld missing names learned, %ld resets, %ld watches, "
-        "%ld not cacheable", g_calls, g_hits, g_inserts, g_resets, g_nwatch, g_skips);
+    log("attribute cache: %ld checks, %ld answered from the cache; %ld opens, %ld answered from the cache; %ld missing "
+        "names learned, %ld resets, %ld watches, %ld not cacheable", g_calls, g_hits, g_open_calls, g_open_hits,
+        g_inserts, g_resets, g_nwatch, g_skips);
     if (g_verify) log("attribute cache verify: %ld mismatches", g_mismatch);
 }
 
@@ -242,7 +284,7 @@ static DWORD WINAPI stats_thread(void *a) {  // one line after each burst of cal
     LONG logged = 0, last = 0;
     for (;;) {
         Sleep(2000);
-        LONG c = g_calls;
+        LONG c = g_calls + g_open_calls;
         if (c != last) { last = c; continue; }
         if (c - logged < 10000) continue;
         logged = c;
@@ -277,9 +319,11 @@ static void *ac_iat_hook(HMODULE m, const char *name, void *to) {
 int attrcache_init(int verify, void (*log)(const char *fmt, ...)) {
     g_log = log;
     g_verify = verify;
-    r_attr = (DWORD(WINAPI *)(LPCWSTR))(void *)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetFileAttributesW");
-    g_arena = VirtualAlloc(NULL, ARENA * sizeof(wchar_t), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    return r_attr && g_arena;
+    HMODULE k = GetModuleHandleW(L"kernel32.dll");
+    r_attr = (DWORD(WINAPI *)(LPCWSTR))(void *)GetProcAddress(k, "GetFileAttributesW");
+    r_open = (ac_open_fn)(void *)GetProcAddress(k, "CreateFileW");
+    if (!g_arena) g_arena = VirtualAlloc(NULL, ARENA * sizeof(wchar_t), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    return r_attr && r_open && g_arena;
 }
 
 int install_attrcache(HMODULE m, int verify, void (*log)(const char *fmt, ...)) {
@@ -287,6 +331,11 @@ int install_attrcache(HMODULE m, int verify, void (*log)(const char *fmt, ...)) 
         log("attribute cache: GetFileAttributesW import not found - not installed");
         return 0;
     }
+    // Opens: chain to whatever the import pointed at (fileio.c's hook when that fix is installed first). r_open is
+    // kernel32's until then, which is the same function when nothing else hooked it.
+    void *old = ac_iat_hook(m, "CreateFileW", (void *)ac_CreateFileW);
+    if (old) r_open = (ac_open_fn)old;
+    else log("attribute cache: CreateFileW import not found - only file checks are cached");
     HANDLE t = CreateThread(NULL, 64 * 1024, stats_thread, NULL, 0, NULL);
     if (t) CloseHandle(t);
     log("attribute cache installed: missing loose-file folders are remembered (cleared when a watched folder changes)%s",

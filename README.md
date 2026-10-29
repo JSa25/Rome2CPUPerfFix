@@ -14,7 +14,10 @@ active whenever `dinput8.dll` is in the game folder; the STATUS lines in `rome2f
 
 Version 1.1 adds faster loading (a Divide et Impera save: 38 s with 1.0, 20 s with 1.1 on the test PC; see the
 player README for all measurements). Version 1.2 also supports the "pantheon" beta and makes `rome2fix.log`
-easier to read.
+easier to read. Version 1.3 keeps `rome2fix.log` small, answers more missing-file checks while loading, and carries
+the game side of the separate DLSS add-on "Upscaling and Framegen for Rome II" (NVIDIA DLSS Super Resolution and
+Frame Generation): it only starts when the add-on's `FrameBridge` folder is in the game folder, otherwise none of it
+runs. The add-on's 64-bit helper is its own repository: https://github.com/JSa25/TotalWarUpscalingFramegen
 
 ## What each file does
 
@@ -28,7 +31,13 @@ easier to read.
 | `fileio.c` | Loading: `.pack` files opened without `FILE_FLAG_NO_BUFFERING` (so Windows caches them), and small reads of read-only files in the game's user folder (the unpacked save) served from a 64 KB buffer with the exact file position kept; writes to the same file drop the buffer |
 | `strfix.c` | Loading: the game's string equality, compare and assign helpers and a pair-table search, rewritten with 16-byte compares and `memcpy` (same results, byte-for-byte checked sites) |
 | `diag.c` | Diagnostics in `rome2fix.log`: mod version, game build, system, settings, other hook DLLs, and crash records (a vectored exception handler that only logs and never handles the exception) |
-| `update.c` | Self-update from the Steam Workshop copy (item 3826423359): a newer version there replaces the DLL in the game folder for the next start; never downgrades, no network |
+| `update.c` | Self-update from the Steam Workshop copy (item 3826423359): a newer version there replaces the DLL in the game folder for the next start; never downgrades, no network. Also updates the DLSS add-on: from the one Workshop item its `install.bat` recorded (`FrameBridge\source.txt`), only when that item's `FrameBridge\version.txt` is higher; `settings.txt` and logs are kept |
+| `logtrim.c`, `logtrim.h` | Past 1 MB, `rome2fix.log` drops its oldest whole game sessions (about 256 KB stay), so players can still post it |
+| `bridgeprobe.c` | DLSS add-on, game side (only with `<game>\FrameBridge\helper64.exe`): finds the frame without the HUD, the camera and the scene depth in the game's Direct3D 11 calls, moves the game's swapchain to a hidden window, jitters the viewport for DLSS, reads `FrameBridge\settings.txt` |
+| `fgbridge.c` | Hands each frame (picture, depth, camera motion) to the 64-bit helper through shared textures and fences, and paces the game to it; stops the helper and falls back to the game's own frames if it stops answering |
+| `fgb_proto.h` | The shared-memory layout and fences between `fgbridge.c` and the helper (the same file in the helper's repository) |
+| `fgpanel.c` | The F11 settings panel drawn over the frame |
+| `r2motion.c`, `r2motionvs.h` | Per-object motion vectors for moving soldiers and horses: the animated models drawn again on the GPU with the game's own skinning, matched to the previous frame by position |
 | `builds.h` | The game builds the fixes know (normal Steam version 2026-09-17, "pantheon" beta 2026-10-01); each fix keeps its addresses and byte hashes per build |
 | `version.h` | Mod version |
 | `dinput8.def` | The exports a `dinput8.dll` must have |
@@ -78,7 +87,9 @@ random cases. `fileio_test` compares 300,000 random reads and seeks with plain W
 compares 450,000 random file checks with plain Windows (attributes and error codes) while files and folders are
 created, renamed and deleted between checks; with the folder watches switched off the same test finds thousands
 of differences, so it would catch a stale cache. `diag_test` checks
-the crash records on deliberate faults, `selfupd_test` the update rules on throwaway files, and
+the crash records on deliberate faults, `selfupd_test` the update rules (the DLL and the DLSS add-on) on throwaway
+files, `bridgelive_test` the DLSS add-on's game side against a stand-in game on your graphics card (`addon`: its
+settings), `r2motion_test` the per-object motion vectors against values worked out on the CPU, and
 `lateload_test` loads the built DLL before the game DLL (as an overlay can) and checks every fix
 still installs from Windows' load notification. They read your copy of the game's
 `empire.retail.dll` (it is not included here):

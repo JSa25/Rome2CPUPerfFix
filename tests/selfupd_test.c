@@ -27,6 +27,33 @@ static void make(const wchar_t *path, int version, const char *body) {
 
 static int exists(const wchar_t *p) { return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES; }
 
+// dir\name holds exactly s / is written with s
+static void text(const wchar_t *dir, const wchar_t *name, const char *s) {
+    wchar_t p[MAX_PATH];
+    swprintf(p, MAX_PATH, L"%ls\\%ls", dir, name);
+    FILE *f = _wfopen(p, L"wb");
+    fputs(s, f);
+    fclose(f);
+}
+static int same(const wchar_t *dir, const wchar_t *name, const char *s) {
+    wchar_t p[MAX_PATH];
+    char buf[256] = {0};
+    swprintf(p, MAX_PATH, L"%ls\\%ls", dir, name);
+    FILE *f = _wfopen(p, L"rb");
+    if (!f) return 0;
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    return n == strlen(s) && !memcmp(buf, s, n);
+}
+static void clean(const wchar_t *dir) {   // the add-on test's files and folders only
+    static const wchar_t *const names[] = {L"source.txt", L"version.txt", L"settings.txt", L"helper64.exe", L"licenses\\license.txt"};
+    wchar_t p[MAX_PATH];
+    for (unsigned i = 0; i < sizeof names / sizeof *names; i++) { swprintf(p, MAX_PATH, L"%ls\\%ls", dir, names[i]); DeleteFileW(p); }
+    swprintf(p, MAX_PATH, L"%ls\\licenses", dir);
+    RemoveDirectoryW(p);
+    RemoveDirectoryW(dir);
+}
+
 int main(void) {
     GetTempPathW(MAX_PATH, g_dir);
     wcscat(g_dir, L"update_test");
@@ -75,6 +102,48 @@ int main(void) {
     wchar_t me[MAX_PATH];
     GetModuleFileNameW(NULL, me, MAX_PATH);
     CHECK(file_version(me) == MOD_VERSION_NUM);
+
+    // ---- the DLSS add-on: <game>\FrameBridge from the Workshop item install.bat recorded, newer versions only
+    wchar_t gfb[MAX_PATH], wfb[MAX_PATH], p[MAX_PATH], id[24];
+    swprintf(gfb, MAX_PATH, L"%ls\\rome2_FrameBridge", g_dir);   // own names: Attila's test uses this temp folder too
+    swprintf(wfb, MAX_PATH, L"%ls\\rome2_ws_FrameBridge", g_dir);
+    clean(gfb);   // left by an earlier run
+    clean(wfb);
+    CHECK(addon_update_from(gfb, wfb, say) == 0 && !exists(gfb));   // not installed: never installed by the update
+    CreateDirectoryW(gfb, NULL);
+    CHECK(!addon_item(gfb, id, 24));                                // no install record: no updates (Nexus, manual copy)
+    text(gfb, L"source.txt", "workshop_item=12a\r\n");
+    CHECK(!addon_item(gfb, id, 24));                                // not an id
+    text(gfb, L"source.txt", "workshop_item=..\\..\\x\r\n");
+    CHECK(!addon_item(gfb, id, 24));
+    text(gfb, L"source.txt", "workshop_item=3829001234\r\n");
+    CHECK(addon_item(gfb, id, 24) && !wcscmp(id, L"3829001234"));
+    text(gfb, L"version.txt", "addon_version=2\r\n");
+    text(gfb, L"settings.txt", "super_resolution=quality\r\n");
+    text(gfb, L"helper64.exe", "old helper");
+    CHECK(addon_update_from(gfb, wfb, say) == 0);                   // the item is gone (unsubscribed)
+    CreateDirectoryW(wfb, NULL);
+    swprintf(p, MAX_PATH, L"%ls\\licenses", wfb);
+    CreateDirectoryW(p, NULL);
+    text(wfb, L"helper64.exe", "new helper");
+    text(p, L"license.txt", "license");
+    CHECK(addon_update_from(gfb, wfb, say) == 0);                   // no version.txt there: 0, not newer
+    text(wfb, L"version.txt", "addon_version=2\r\n");
+    CHECK(addon_update_from(gfb, wfb, say) == 0);                   // same
+    text(gfb, L"version.txt", "addon_version=3\r\n");
+    CHECK(addon_update_from(gfb, wfb, say) == 0);                   // older: never downgrade
+    CHECK(same(gfb, L"helper64.exe", "old helper"));
+    // newer, with a file in use: nothing counts as updated (version.txt stays), so the next start tries again
+    text(gfb, L"version.txt", "addon_version=1\r\n");
+    swprintf(p, MAX_PATH, L"%ls\\helper64.exe", gfb);
+    HANDLE busy = CreateFileW(p, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
+    CHECK(busy != INVALID_HANDLE_VALUE);
+    CHECK(addon_update_from(gfb, wfb, say) == 0 && addon_version(gfb) == 1);
+    CloseHandle(busy);
+    CHECK(addon_update_from(gfb, wfb, say) == 3 && addon_version(gfb) == 2);   // helper, license, version.txt
+    CHECK(same(gfb, L"helper64.exe", "new helper") && same(gfb, L"licenses\\license.txt", "license"));
+    CHECK(same(gfb, L"settings.txt", "super_resolution=quality\r\n") && same(gfb, L"source.txt", "workshop_item=3829001234\r\n"));
+    CHECK(addon_update_from(gfb, wfb, say) == 0);                   // next start: up to date
     printf("all update tests passed\n");
     return 0;
 }
