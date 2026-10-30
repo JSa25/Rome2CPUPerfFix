@@ -18,6 +18,8 @@ easier to read. Version 1.3 keeps `rome2fix.log` small, answers more missing-fil
 the game side of the separate DLSS add-on "Upscaling and Framegen for Rome II" (NVIDIA DLSS Super Resolution and
 Frame Generation): it only starts when the add-on's `FrameBridge` folder is in the game folder, otherwise none of it
 runs. The add-on's 64-bit helper is its own repository: https://github.com/JSa25/TotalWarUpscalingFramegen
+Version 1.4 fixes naval battles with the add-on below native resolution: the ships' selection markers and wake foam,
+and the water's reflections.
 
 ## What each file does
 

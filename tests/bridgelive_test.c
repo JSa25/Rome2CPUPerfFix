@@ -257,19 +257,19 @@ static int inv4(const float *m, float *out) {
     return 1;
 }
 static void mul4(const float *m, const float *v, float *o) { for (int r = 0; r < 4; r++) o[r] = m[r * 4] * v[0] + m[r * 4 + 1] * v[1] + m[r * 4 + 2] * v[2] + m[r * 4 + 3] * v[3]; }
-static int cam_patch_check(void) {
+static int cam_patch_check(int bottom) {   // bottom: the scene in the bottom-left corner (the ocean's reflection)
     float f[144] = {0}, mv[16], inv[16];
     for (int i = 0; i < 16; i++) mv[i] = main_vp(7, i);
     if (!inv4(mv, inv)) return 0;
     memcpy(f + 20, mv, 64); memcpy(f + 36, mv, 64);   // projection, view_projection
     memcpy(f + 68, inv, 64); memcpy(f + 84, inv, 64);  // inverse_projection, inv_view_projection
     UINT rw = W / 2, rh = H / 2;
-    cam_patch(f, rw, rh);
+    cam_patch(f, rw, rh, bottom);
     const float pw[4] = {0.3f, -0.2f, 10, 1};
     float c[4], o[4], back[4];
     mul4(mv, pw, c);
     float nx = c[0] / c[3], ny = c[1] / c[3], nz = c[2] / c[3];
-    float px = (nx * 0.5f + 0.5f) * rw, py = (0.5f - ny * 0.5f) * rh;   // the pixel it is drawn at (shrunk viewport)
+    float px = (nx * 0.5f + 0.5f) * rw, py = (0.5f - ny * 0.5f) * rh + (bottom ? H - rh : 0);   // drawn at (shrunk viewport)
     float fx = px / W * 2 - 1, fy = 1 - py / H * 2;                     // what the shader makes of it (full screen size)
     mul4(f + 36, pw, o);   // forward: the point to the "full-size" ndc
     const float q[4] = {fx, fy, nz, 1};
@@ -330,6 +330,7 @@ int main(int argc, char **argv) {
         fclose(h);
         swprintf(q, MAX_PATH, L"%ls\\settings.txt", fb);
         DeleteFileW(q);
+        DeleteFileW(p);   // a dev run's fgbridge_on.txt left in a reused folder (same process id) would win over the defaults
         // a first start (no settings.txt): Quality, frame generation 2x, camera-only motion, and the file written with them
         CHECK(install_bridgeprobe(GetModuleHandleW(NULL), dir, tlog) && g_live && g_sr == 2 && g_fg == 1 && !g_motion_on, "add-on defaults: live %d, SR %d, FG %u, motion %d",
               g_live, g_sr, g_fg, g_motion_on);
@@ -421,7 +422,7 @@ int main(int argc, char **argv) {
         printf("bridge live test (no frame generation) passed\n");
         return 0;
     }
-    CHECK(cam_patch_check(), "the pixel shaders' camera copy below native size");
+    CHECK(cam_patch_check(0) && cam_patch_check(1), "the pixel shaders' camera copy below native size (top-left, bottom-left)");
     // the frame cap (NVIDIA Reflex limit, us per shown frame, rounded up so never above the screen's rate): Auto at 2x =
     // the screen's rate / 2 rendered; Auto without frame generation: none; 60: 60 rendered, 60 or 120 shown
     unsigned hz = refresh_hz(hwnd), want = hz ? (unsigned)ceil(1e6 / (hz / 2 * 2.0)) : 0;
@@ -583,6 +584,53 @@ int main(int argc, char **argv) {
                                 0, 1, D3D11_COMPARISON_NEVER, {0, 0, 0, 0}, 0, D3D11_FLOAT32_MAX};
     ID3D11SamplerState *r2pt;
     ID3D11Device_CreateSamplerState(dev, &r2smp, &r2pt);
+    // a naval battle: an overlay target drawn without depth before the scene, read by an ocean (its vertex shader names
+    // g_swell_uv_scale, its pixel shader samples ui_colour_overlay_texture at t9 as on ultra water quality)
+    static const char ohlsl[] =
+        "cbuffer ocean : register(b1) { float4 g_swell_uv_scale; }\n"
+        "float4 vs(uint i : SV_VertexID) : SV_Position { float2 t = float2((i << 1) & 2, i & 2); return float4(t * float2(2, -2) + float2(-1, 1), 0.5, 1) + g_swell_uv_scale * 1e-6; }\n"
+        "Texture2D ui_colour_overlay_texture : register(t9); Texture2D reflection_texture : register(t5); SamplerState smp : register(s0);\n"
+        "float4 ps(float4 p : SV_Position) : SV_Target { return ui_colour_overlay_texture.Sample(smp, p.xy / 64) + reflection_texture.Sample(smp, p.xy / 64); }\n";
+    ID3DBlob *ovb, *opb;
+    CHECK(SUCCEEDED(comp(ohlsl, sizeof ohlsl - 1, "o", NULL, NULL, "vs", "vs_5_0", 0, 0, &ovb, NULL)) &&
+          SUCCEEDED(comp(ohlsl, sizeof ohlsl - 1, "o", NULL, NULL, "ps", "ps_5_0", 0, 0, &opb, NULL)), "ocean shader compile");
+    ID3D11VertexShader *ovs;
+    ID3D11PixelShader *ops;
+    ID3D11Device_CreateVertexShader(dev, ID3D10Blob_GetBufferPointer(ovb), ID3D10Blob_GetBufferSize(ovb), NULL, &ovs);
+    ID3D11Device_CreatePixelShader(dev, ID3D10Blob_GetBufferPointer(opb), ID3D10Blob_GetBufferSize(opb), NULL, &ops);
+    CHECK(overlay_slots(ID3D10Blob_GetBufferPointer(opb), ID3D10Blob_GetBufferSize(opb), "colour_overlay_texture") == 1u << 9 &&
+          overlay_slots(ID3D10Blob_GetBufferPointer(opb), ID3D10Blob_GetBufferSize(opb), "reflection_texture") == 1u << 5 &&
+          !overlay_slots(ID3D10Blob_GetBufferPointer(bpb), ID3D10Blob_GetBufferSize(bpb), "colour_overlay_texture"), "ocean slots from the pixel shaders' RDEF");
+    D3D11_TEXTURE2D_DESC otd = {W, H, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+    ID3D11Texture2D *otex;
+    ID3D11RenderTargetView *ortv;
+    ID3D11ShaderResourceView *osrv, *nosrv = NULL;
+    ID3D11Device_CreateTexture2D(dev, &otd, NULL, &otex);
+    ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)otex, NULL, &ortv);
+    ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)otex, NULL, &osrv);
+    otd.Width = W / 2; otd.Height = H / 2;   // the water reflection: half size
+    ID3D11Texture2D *rtex;
+    ID3D11RenderTargetView *rrtv;
+    ID3D11ShaderResourceView *rsrv;
+    ID3D11Device_CreateTexture2D(dev, &otd, NULL, &rtex);
+    ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)rtex, NULL, &rrtv);
+    ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)rtex, NULL, &rsrv);
+    D3D11_VIEWPORT hvp = {0, 0, W / 2, H / 2, 0, 1};
+    // the game's screen-space reflection pass (helpers.hlsl: cbuffer screen_space_refl_params, scene_tex t0, depth_tex t1)
+    static const char shlsl[] =
+        "cbuffer screen_space_refl_params : register(b0) { float4 quality_factor; }\n"
+        "Texture2D scene_tex : register(t0); Texture2D depth_tex : register(t1); SamplerState smp : register(s0);\n"
+        "float4 ps(float4 p : SV_Position) : SV_Target { return scene_tex.Sample(smp, p.xy / 64) * depth_tex.Sample(smp, p.xy / 64).x + quality_factor; }\n";
+    ID3DBlob *spb;
+    CHECK(SUCCEEDED(comp(shlsl, sizeof shlsl - 1, "s", NULL, NULL, "ps", "ps_5_0", 0, 0, &spb, NULL)), "screen-space reflection shader compile");
+    ID3D11PixelShader *ssrps;
+    ID3D11Device_CreatePixelShader(dev, ID3D10Blob_GetBufferPointer(spb), ID3D10Blob_GetBufferSize(spb), NULL, &ssrps);
+    D3D11_SHADER_RESOURCE_VIEW_DESC dsrd = {DXGI_FORMAT_R24_UNORM_X8_TYPELESS, D3D11_SRV_DIMENSION_TEXTURE2D};
+    dsrd.Texture2D.MipLevels = 1;
+    ID3D11ShaderResourceView *dsrv, *ssr_in[2];
+    CHECK(SUCCEEDED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)ds, &dsrd, &dsrv)), "depth view");
+    ssr_in[0] = osrv; ssr_in[1] = dsrv;
+    float ssr_depth = -1;   // the depth corner the glue made, read back once (Performance)
 #endif
     D3D11_DEPTH_STENCIL_DESC dsd = {0};   // depth test off
     ID3D11DepthStencilState *nodepth;
@@ -648,6 +696,28 @@ int main(int argc, char **argv) {
         int live = g_fr <= dead_at, jit = live && g_fr >= 1 && !msaa && g_fr != 25 && (g_fr <= 100 || g_fr > 150);
         int scaled = jit && g_fr >= 175;
         if (live) jit_check(ctx, 0, "shadow pass");
+        // the naval overlay pass: full size once the ocean's draw of frame 0 showed its texture
+        ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &ortv, NULL);
+        ID3D11DeviceContext_PSSetShader(ctx, red, NULL, 0);
+        ID3D11DeviceContext_Draw(ctx, 3, 0);
+        if (live && g_fr >= 1) jit_check2(ctx, 0, 0, "naval overlay");
+        // the water reflection (half size, no depth): below native size shrunk into the bottom-left corner, with the
+        // pixel shaders' camera copy for that corner
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rrtv, NULL);
+        ID3D11DeviceContext_RSSetViewports(ctx, 1, &hvp);
+        ID3D11DeviceContext_Draw(ctx, 3, 0);
+        if (live && g_fr >= 1) {
+            ID3D11Buffer *pcb = NULL;
+            ID3D11DeviceContext_PSGetConstantBuffers(ctx, 0, 1, &pcb);
+            int ok = scaled ? g_avp[0].Width == s_rw / 2 && g_avp[0].Height == s_rh / 2 && g_avp[0].TopLeftY == H / 2 - s_rh / 2 &&
+                                  g_avp[0].TopLeftX == 0 && g_nccopy && pcb == g_ccopy[0].bl && g_ccopy[0].bl_valid
+                            : g_avp[0].Width == W / 2 && g_avp[0].Height == H / 2 && g_avp[0].TopLeftY == 0 && pcb == cam;
+            if (!ok && s_jit_bad++ < 3)
+                printf("  reflection at frame %d: applied (%g, %g) %gx%g, pixel shader cb0 %p (bottom-left copy %p), scaled %d\n", g_fr,
+                       g_avp[0].TopLeftX, g_avp[0].TopLeftY, g_avp[0].Width, g_avp[0].Height, (void *)pcb, g_nccopy ? (void *)g_ccopy[0].bl : NULL, scaled);
+            if (pcb) ID3D11Buffer_Release(pcb);
+        }
 #endif
         // the scene: swapchain-sized depth, the main camera
         ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
@@ -698,6 +768,56 @@ int main(int argc, char **argv) {
             ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
             ID3D11DeviceContext_VSSetShader(ctx, vs, NULL, 0);
             ID3D11DeviceContext_IASetIndexBuffer(ctx, NULL, DXGI_FORMAT_UNKNOWN, 0);
+            // the screen-space reflection into the water reflection (no depth bound: it reads the scene depth), then the
+            // scene's targets again for the ocean, as the game does. Below native size it must read the render-size corner
+            ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rrtv, NULL);
+            ID3D11DeviceContext_RSSetViewports(ctx, 1, &hvp);
+            ID3D11DeviceContext_PSSetShader(ctx, ssrps, NULL, 0);
+            ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 2, ssr_in);
+            unsigned ssr_before = g_ssr_draws;
+            ID3D11DeviceContext_Draw(ctx, 3, 0);
+            ID3D11ShaderResourceView *ssr_after[2] = {NULL, NULL};
+            ID3D11DeviceContext_PSGetShaderResources(ctx, 0, 2, ssr_after);
+            int ssr_ok = ssr_after[0] == osrv && ssr_after[1] == dsrv && (g_ssr_draws == ssr_before + 1) == scaled;
+            if (scaled && g_crop[1]) {
+                D3D11_TEXTURE2D_DESC cd;
+                ID3D11Texture2D_GetDesc(g_crop[1], &cd);
+                ssr_ok &= cd.Width == (UINT)s_rw && cd.Height == (UINT)s_rh;
+                if (ssr_depth < 0) {   // the corner holds the scene's depth (its triangle at 0.5), all of it
+                    D3D11_TEXTURE2D_DESC sd2 = cd;
+                    sd2.Usage = D3D11_USAGE_STAGING; sd2.BindFlags = 0; sd2.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                    ID3D11Texture2D *st2 = NULL;
+                    D3D11_MAPPED_SUBRESOURCE sm2;
+                    if (SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &sd2, NULL, &st2))) {
+                        ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)st2, (ID3D11Resource *)g_crop[1]);
+                        if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)st2, 0, D3D11_MAP_READ, 0, &sm2))) {
+                            // the far corner one pixel in: the jittered scene may leave the last row uncovered
+                            float a = *(const float *)sm2.pData, b = *(const float *)((const char *)sm2.pData + (cd.Height - 2) * sm2.RowPitch + (cd.Width - 2) * 4);
+                            ssr_depth = fabsf(a - 0.5f) < 1e-3f && fabsf(b - 0.5f) < 1e-3f ? 0.5f : a;
+                            ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)st2, 0);
+                        }
+                        ID3D11Texture2D_Release(st2);
+                    }
+                }
+            }
+            if (!ssr_ok && s_jit_bad++ < 3)
+                printf("  screen-space reflection at frame %d: views put back %d, corner pass run %u (scaled %d)\n", g_fr,
+                       ssr_after[0] == osrv && ssr_after[1] == dsrv, g_ssr_draws - ssr_before, scaled);
+            for (int i = 0; i < 2; i++) if (ssr_after[i]) ID3D11ShaderResourceView_Release(ssr_after[i]);
+            ID3D11ShaderResourceView *ssr_none[2] = {NULL, NULL};
+            ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 2, ssr_none);
+            ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &scv, dsv);
+            ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
+            // the ocean, reading the overlay
+            ID3D11DeviceContext_VSSetShader(ctx, ovs, NULL, 0);
+            ID3D11DeviceContext_PSSetShader(ctx, ops, NULL, 0);
+            ID3D11DeviceContext_PSSetShaderResources(ctx, 9, 1, &osrv);
+            ID3D11DeviceContext_PSSetShaderResources(ctx, 5, 1, &rsrv);
+            ID3D11DeviceContext_PSSetSamplers(ctx, 0, 1, &r2pt);
+            ID3D11DeviceContext_Draw(ctx, 3, 0);
+            ID3D11DeviceContext_PSSetShaderResources(ctx, 9, 1, &nosrv);
+            ID3D11DeviceContext_PSSetShaderResources(ctx, 5, 1, &nosrv);
+            ID3D11DeviceContext_VSSetShader(ctx, vs, NULL, 0);
         }
 #endif
         ID3D11DeviceContext_PSSetShader(ctx, blue, NULL, 0);
@@ -802,6 +922,7 @@ int main(int argc, char **argv) {
     CHECK(g_br_msaa == 5, "MSAA frames seen %u", g_br_msaa);
     // DLAA: frames 1..20 and 26..dead_at start jittered (each after a frame with a scene; 20 is MSAA, so nothing to jitter)
     CHECK(!s_jit_bad && g_jit_frames == 20u + 75 + (unsigned)dead_at - 150, "DLAA: %d bad viewports, %u frames jittered", s_jit_bad, g_jit_frames);
+    CHECK(ssr_depth == 0.5f, "screen-space reflection's depth corner: %g (the scene's 0.5 expected)", ssr_depth);
     // the motion probe: three battle frames (it captured at once), each with every kind of chunk, the instance records as
     // drawn (record 0's x shift = 0.01 x the frame), the meshes once, the animated vertex shader's bytecode
     for (int k = 0; k < 3; k++) {

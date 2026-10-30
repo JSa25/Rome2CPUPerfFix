@@ -179,6 +179,13 @@ the details; the engine fix keeps it up to date from the add-on's Workshop item.
 
 Changelog
 ---------
+Version 1.4: naval battles with the DLSS add-on below native resolution
+           (Quality ... Ultra Performance): ship selection markers and wake
+           foam sit on the ships again, and the water's reflections (sky,
+           clouds, ships) are drawn in the right place. No change without the
+           add-on.
+           SHA-256 of dinput8.dll:
+           15e87e437f5e091c87a808b26db85bfd2ac62545c50ff7d1c0872ecf3e97d5df
 Version 1.3: runs the separate DLSS add-on "Upscaling and Framegen for Rome II"
            (does nothing without it) and copies the add-on's Workshop updates
            in at game start. rome2fix.log keeps only the newest ~256 KB once
