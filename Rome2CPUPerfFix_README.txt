@@ -188,6 +188,10 @@ the game folder (its install.bat puts it there). The add-on's own README has
 the details; the engine fix keeps it up to date from the add-on's Workshop item.
 1.5 brings a sharper, more native-looking DLSS picture and the add-on's new
 F11 settings (DLSS preset, sharpness) together with add-on version 2.
+1.6 makes ReShade work with the add-on: ReShade's effects go on the DLSS
+picture before the game's UI is drawn (banners and menus stay clean), and
+ReShade gets the game's real depth, so depth effects (DOF, AO, fog) line up
+without setting anything. Nothing changes for ReShade without the add-on.
 
 
 Third-party notices
@@ -215,6 +219,15 @@ is published for review at github.com/JSa25/Rome2CPUPerfFix.
 
 Changelog
 ---------
+Version 1.6: ReShade works with the DLSS add-on: its effects now go on after
+           DLSS and before the game's UI, ReShade gets the game's real depth
+           with the camera's near / far distances, and the ReShade menu shows
+           and takes keys again (with the add-on it was drawn where nobody saw
+           it). With frame generation and DLSS upscaling the effects are in
+           the generated frames too (needs add-on version 4). No change
+           without the add-on.
+           SHA-256 of dinput8.dll:
+           5a9f8de1ae0b6311574bcddb275d999da0687fe555a12b2f87b2385bf7d1de34
 Version 1.5: with the DLSS add-on: sharper image (the game's lighting now
            follows DLSS's sub-pixel jitter, as games with DLSS built in do;
            new Sharpness setting, default Low), DLSS preset choice (J, K, L,

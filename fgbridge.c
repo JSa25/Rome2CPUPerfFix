@@ -52,7 +52,7 @@ static FgbShared *g_sh;
 static HWND g_hwnd;           // the game's window (the helper presents into it)
 static UINT g_w, g_h, g_dw, g_dh;
 static uint32_t g_n;          // the frame being built
-static int g_hud_done, g_waited, g_live;
+static int g_hud_done, g_waited, g_live, g_hud_post;   // g_hud_post: this frame's HUD-less image after SR is the game's (fgb_hud_post)
 static float g_prev_vp[16];
 static int g_have_prev;
 static unsigned g_pace_timeouts;
@@ -416,6 +416,13 @@ void fgb_cpu_stats(double *hud_ms, double *present_ms, double *pace_ms, unsigned
 }
 static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, const float vp[16]);
 static void depth_upscale(void);
+// after the SR round trip and ReShade's effects on its output (bridgeprobe.c): the back buffer, still without the UI, is
+// frame generation's HUD-less image (a helper without FGB_CAP_HUD_POST keeps its SR output: the effects only in the final)
+void fgb_hud_post(ID3D11Resource *backbuffer) {
+    if (!fgb_active() || !g_hud_done || !(g_sh->helper_caps & FGB_CAP_HUD_POST)) return;
+    ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_hud, backbuffer);
+    g_hud_post = 1;
+}
 void fgb_hudless(ID3D11Resource *backbuffer, ID3D11Resource *depth, const float vp[16]) {
     LARGE_INTEGER t0;
     QueryPerformanceCounter(&t0);
@@ -659,6 +666,9 @@ void fgb_present(ID3D11Resource *backbuffer) {
     wait_previous();
     tq(TQ_P0);
     if (!g_hud_done) ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_hud, backbuffer);   // no HUD-less point this frame
+    // frame generation's HUD-less image after SR: the game's own (fgb_hud_post) or the helper's SR output
+    uint32_t bit = 1u << (g_n % 32);
+    g_sh->hud_post = g_hud_post && g_hud_done ? g_sh->hud_post | bit : g_sh->hud_post & ~bit;
     ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_final, backbuffer);
     tq(TQ_END);
     if (!g_tq_failed && g_tq[g_n % 8][TQ_DIS]) ID3D11DeviceContext_End(g_ctx, (ID3D11Asynchronous *)g_tq[g_n % 8][TQ_DIS]);
@@ -683,7 +693,7 @@ void fgb_present(ID3D11Resource *backbuffer) {
     g_present_ms += ms_since(t0);
     g_cpu_frames++;
     g_n++;
-    g_hud_done = g_waited = 0;
+    g_hud_done = g_waited = g_hud_post = 0;
     g_jx = g_jy = 0;   // a frame that never asked fgb_jitter() is not jittered
 }
 

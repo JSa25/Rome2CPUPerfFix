@@ -58,6 +58,11 @@ void fgb_stop(void);
 IDXGISwapChain *fgb_fallback_frame(ID3D11Resource *src, HRESULT(STDMETHODCALLTYPE *create)(IDXGIFactory *, IUnknown *, DXGI_SWAP_CHAIN_DESC *, IDXGISwapChain **));
 void fgb_fallback_close(void);
 void *fgb_vt_original(void **vt, size_t slot);
+// rslink.cpp: ReShade's effects at the HUD-less point (DLSS add-on on, ReShade in the game folder)
+int rsl_attach(HMODULE self, HMODULE reshade, void (*log)(const char *, ...), int (*swapchain_cb)(void *));
+int rsl_effects(ID3D11DeviceContext *ctx, ID3D11Resource *bb, ID3D11Resource *depth);
+void rsl_camera(const float vp[16]);
+void fgb_hud_post(ID3D11Resource *backbuffer);
 void *fgb_unhooked(void *fn);
 void fgb_set_test_not_nvidia(int on);
 void fgb_cpu_stats(double *hud_ms, double *present_ms, double *pace_ms, unsigned *frames);
@@ -112,6 +117,12 @@ static wchar_t g_logdir[MAX_PATH];     // where the helper writes its logs: Fram
 static unsigned g_fg;
 static UINT g_live_w, g_live_h;
 static IDXGISwapChain *g_hid_sc;   // the game's swapchain on the hidden window
+// ReShade (rslink.cpp): it wraps the game's swapchain, so the bridge's Present / GetDesc hooks go on the real one under
+// the wrapper (g_rs_sc): ReShade draws its menu before the frame goes to the helper, and its menu reads the game window's keys
+static int g_rs, g_rs_tried, g_rs_creating, g_rs_fb;   // g_rs_fb: the fallback's Present through ReShade's wrapper
+static IDXGISwapChain *g_rs_sc, *g_rs_new;
+static HWND g_hid_hwnd;             // the hidden window the game's swapchain was made on
+static unsigned g_rs_frames;        // frames with ReShade's effects at the HUD-less point
 static HWND g_out_hwnd;             // the game's window (the helper presents into it)
 static float g_vp[16];              // this frame's main camera view-projection (camera_VS_PS @144)
 static unsigned g_vp_frame = ~0u, g_scene_frame = ~0u, g_hud_frame = ~0u;
@@ -351,6 +362,11 @@ static void live_targets(ID3D11RenderTargetView *rtv0, ID3D11DepthStencilView *d
         ID3D11Resource *bb = backbuffer();
         int cam = g_vp_frame == g_frame;
         if (!cam) g_br_novp++;   // no main camera seen: no motion vectors (a scaled frame still goes through DLSS, last camera)
+        // ReShade: its effects before the HUD-less copy (frame generation's two images both have them), or with DLSS SR
+        // on DLSS's output after it (full size, the depth back at full size too), then handed to the helper as frame
+        // generation's HUD-less image
+        int sr_trip = g_sr && g_frame_scaled && bb && g_scene_depth;   // DLSS SR runs in this frame's fgb_hudless
+        if (g_rs && bb && !sr_trip) g_rs_frames += rsl_effects(g_ctx, bb, g_scene_depth);
         if (g_sr && !g_frame_scaled) g_br_native++;   // a scene frame not scaled (the first after loading): native, no DLSS
         else if ((cam || g_frame_scaled) && bb && g_scene_depth) {
             // below native size fgbridge.c puts the depth back to full size for what is drawn after (banners), on the
@@ -360,6 +376,8 @@ static void live_targets(ID3D11RenderTargetView *rtv0, ID3D11DepthStencilView *d
             fgb_hudless(bb, g_scene_depth, g_vp);
             g_br_hud++;
         }
+        if (g_rs && sr_trip && rsl_effects(g_ctx, bb, g_scene_depth)) { g_rs_frames++; fgb_hud_post(bb); }
+        if (g_rs && cam) rsl_camera(g_vp);
         if (bb) ID3D11Resource_Release(bb);
     }
     ID3D11Resource *r = NULL, *bb = backbuffer();
@@ -2003,7 +2021,10 @@ static void motion_cb(ID3D11Resource *depth, float jx, float jy) {
 // The frame cap on rendered frames, through NVIDIA Reflex's limiter in the helper. Auto (the default): with frame
 // generation on, the screen's refresh rate / the frames shown per rendered frame (240 Hz, 2x: 120 rendered, 240 shown),
 // so every rendered frame gets its generated frames instead of the helper dropping them past the screen's rate (a
-// 162 fps game at 2x showed ~185 on a 240 Hz screen); no cap without frame generation. Reflex counts shown frames.
+// 162 fps game at 2x showed ~185 on a 240 Hz screen); no cap without frame generation (the helper's V-Sync holds the
+// screen's rate). No G-Sync margin: the helper presents from another process than the window's, and NVIDIA's driver gives
+// windowed G-Sync only to the window's own process (DLSS_LOG 50), so the screen runs at its fixed rate here. Reflex counts
+// shown frames.
 static unsigned g_refresh;   // the game window's screen, Hz (0 unknown: Auto does nothing)
 static unsigned g_cap_fps;   // the rendered-frame cap in effect (0 none)
 static unsigned refresh_hz(HWND w) {
@@ -2160,6 +2181,7 @@ static void bp_report(void) {
         g_log("  frame bridge %s: %u frames handed over, %u pacing timeouts, HUD-less copies %u, no camera %u, MSAA depth seen %u, "
               "fallback frames %u", g_live_state == 1 ? "running" : g_live_state == 2 ? "off" : "not started", fgb_frames(),
               fgb_pace_timeouts(), g_br_hud, g_br_novp, g_br_msaa, g_fb_frames);
+    if (g_rs) g_log("  ReShade: effects before the UI in %u frames%s", g_rs_frames, g_rs_sc ? "" : " (the game's swapchain was not ReShade's wrapper)");
     if (g_live_state == 1 && g_sr) {   // this period only
         unsigned sf, st;
         double sa, sm;
@@ -2344,7 +2366,7 @@ static HRESULT STDMETHODCALLTYPE present_body(IDXGISwapChain *sc, UINT sync, UIN
 static HRESULT STDMETHODCALLTYPE w_present(IDXGISwapChain *sc, UINT sync, UINT flags) {
     static __thread int depth;
     if (depth) {
-        if (!g_nested++) {
+        if (!g_rs_fb && !g_nested++) {
             unsigned ret = (unsigned)(UINT_PTR)__builtin_return_address(0);
             HMODULE m = NULL;
             char at[MAX_PATH] = "?";
@@ -2362,7 +2384,7 @@ static HRESULT STDMETHODCALLTYPE w_present(IDXGISwapChain *sc, UINT sync, UINT f
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE present_body(IDXGISwapChain *sc, UINT sync, UINT flags) {
-    if (sc != g_sc) return r_present(sc, sync, flags);
+    if (sc != g_sc && (!g_rs_sc || sc != g_rs_sc)) return r_present(sc, sync, flags);
     g_presents++;
     if (!g_main_tid) g_main_tid = GetCurrentThreadId();
     if (GetCurrentThreadId() != g_main_tid) g_present_other_thread++;
@@ -2418,7 +2440,7 @@ static HRESULT STDMETHODCALLTYPE present_body(IDXGISwapChain *sc, UINT sync, UIN
         }
         if (bb) ID3D11Resource_Release(bb);
     }
-    if (sc == g_hid_sc && g_live_state == 2) {   // after the bridge: the frame goes to the window through the mod's swapchain
+    if ((sc == g_hid_sc || (g_rs_sc && sc == g_rs_sc && g_hid_sc)) && g_live_state == 2) {   // after the bridge: the frame goes to the window through the mod's swapchain
         ID3D11Resource *bb = backbuffer();
         if (bb) fallback_panel(bb);
         IDXGISwapChain *own = bb ? fgb_fallback_frame(bb, dxgi_create_sc) : NULL;
@@ -2426,7 +2448,13 @@ static HRESULT STDMETHODCALLTYPE present_body(IDXGISwapChain *sc, UINT sync, UIN
         bp_frame();
         if (!own) return S_OK;
         if (!g_fb_frames++) g_log("frame bridge: the game's frames go to its window through the mod's own swapchain");
-        return dxgi_present(own, sync, flags);
+        if (!g_rs_sc) return dxgi_present(own, sync, flags);
+        // with ReShade the mod's swapchain is ReShade's wrapper too (made through its factory): its own Present, which
+        // comes back through the real one (the nested-Present path, expected here)
+        g_rs_fb = 1;
+        HRESULT hr = IDXGISwapChain_Present(own, sync, flags);
+        g_rs_fb = 0;
+        return hr;
     }
     bp_frame();
     return r_present(sc, sync, flags);
@@ -2473,6 +2501,34 @@ static HRESULT STDMETHODCALLTYPE w_getfs(IDXGISwapChain *sc, BOOL *fs, IDXGIOutp
         if (g_fs_wanted && FAILED(IDXGISwapChain_GetContainingOutput(sc, target))) *target = NULL;
     }
     return S_OK;
+}
+
+// ReShade's wrapper reads the real swapchain's window for its menu's keys (its runtime: get_hwnd at start): the hidden
+// window gets none, so the real GetDesc says the game's window for it, like the wrapper's does for the game and other mods
+static HRESULT(STDMETHODCALLTYPE *r_getdesc_real)(IDXGISwapChain *, DXGI_SWAP_CHAIN_DESC *);
+static HRESULT STDMETHODCALLTYPE w_getdesc_real(IDXGISwapChain *sc, DXGI_SWAP_CHAIN_DESC *d) {
+    HRESULT hr = r_getdesc_real(sc, d);
+    if (SUCCEEDED(hr) && d && g_hid_hwnd && d->OutputWindow == g_hid_hwnd && g_out_hwnd) d->OutputWindow = g_out_hwnd;
+    return hr;
+}
+// rslink.cpp, from ReShade's init_swapchain event (inside the game's CreateSwapChain, before ReShade starts its runtime):
+// the real swapchain; Present and GetDesc hooked on its table (all real swapchains share it), once
+static int rs_swapchain(void *real) {
+    if (!g_rs_creating || !real) return 0;
+    g_rs_new = (IDXGISwapChain *)real;
+    void **vt = *(void ***)real;
+    if (!r_present) {
+        void **sl = &vt[offsetof(IDXGISwapChainVtbl, Present) / sizeof(void *)];
+        r_present = *sl;
+        patch_slot(sl, (void *)w_present);
+        g_present_real = dxgi_own(vt, offsetof(IDXGISwapChainVtbl, Present) / sizeof(void *), (void *)r_present, "Present");
+    }
+    if (!r_getdesc_real) {
+        void **sl = &vt[offsetof(IDXGISwapChainVtbl, GetDesc) / sizeof(void *)];
+        r_getdesc_real = *sl;
+        patch_slot(sl, (void *)w_getdesc_real);
+    }
+    return 1;
 }
 
 static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXGI_SWAP_CHAIN_DESC *d, IDXGISwapChain **out) {
@@ -2549,7 +2605,10 @@ static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXG
     }
     fgb_fallback_close();   // ours belongs to the previous swapchain
     g_hid_sc = NULL;
+    g_hid_hwnd = dd.OutputWindow != d->OutputWindow ? dd.OutputWindow : NULL;
+    g_rs_creating = g_rs; g_rs_new = NULL;   // ReShade tells the real swapchain under its wrapper (rs_swapchain) while making it
     HRESULT hr = r_create_sc(f, dev, &dd, out);
+    g_rs_creating = 0;
     int hidden = SUCCEEDED(hr) && dd.OutputWindow != d->OutputWindow;
     if (FAILED(hr) && g_live_state == 1) { g_log("frame bridge: the game's swapchain on the hidden window failed (0x%08lx) - bridge off", hr); bridge_off(); }
     if (FAILED(hr) && dd.OutputWindow != d->OutputWindow) hr = r_create_sc(f, dev, d, out);
@@ -2559,12 +2618,16 @@ static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXG
     if (SUCCEEDED(hr) && out && *out) {
         g_sc = *out;   // shortcut: the newest swapchain is the game's (a resize recreates buffers, not the swapchain)
         if (hidden) g_hid_sc = *out;
+        if (g_rs_new && (void *)g_rs_new != (void *)*out) {
+            g_rs_sc = g_rs_new;
+            g_log("ReShade: the game's swapchain is ReShade's wrapper - the bridge presents from under it (ReShade's menu and effects first)");
+        }
         if (g_staging) { ID3D11Texture2D_Release(g_staging); g_staging = NULL; }
         void **vt = *(void ***)*out;
         void **sl = &vt[offsetof(IDXGISwapChainVtbl, Present) / sizeof(void *)];
         // DXGI slots are hooked once (all swapchains share the vtable): a mod hooked on top of ours calls ours as its
         // original, so hooking again would make ours call it back forever (Attila 6.3, a new swapchain in game)
-        if (!r_present) {
+        if (!r_present && !g_rs_sc) {   // with ReShade: hooked on the real swapchain (rs_swapchain)
             r_present = *sl;
             patch_slot(sl, (void *)w_present);
             g_present_real = dxgi_own(vt, offsetof(IDXGISwapChainVtbl, Present) / sizeof(void *), (void *)r_present, "Present");
@@ -2630,9 +2693,19 @@ static HRESULT WINAPI w_create(IDXGIAdapter *a, D3D_DRIVER_TYPE t, HMODULE sw, U
 }
 
 static FARPROC(WINAPI *r_gpa)(HMODULE, LPCSTR);
+// ReShade in the game folder (as dxgi.dll or d3d11.dll): the game's first look-up in it links the mod as a ReShade add-on
+// (DLSS add-on on only: without the bridge ReShade works as it always did)
+static void rs_find(HMODULE m) {
+    if (g_rs_tried || !g_live || !r_gpa(m, "ReShadeRegisterAddon")) return;
+    g_rs_tried = 1;
+    HMODULE self = NULL;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)(void *)rs_find, &self);
+    g_rs = rsl_attach(self, m, g_log, rs_swapchain);
+}
 static FARPROC WINAPI w_gpa(HMODULE m, LPCSTR name) {
     FARPROC f = r_gpa(m, name);
     if (!f || (UINT_PTR)name <= 0xFFFF) return f;
+    if (!strcmp(name, "D3D11CreateDevice") || !strcmp(name, "CreateDXGIFactory1")) rs_find(m);
     if (!strcmp(name, "D3D11CreateDevice")) { r_create = (create_fn)(void *)f; return (FARPROC)(void *)w_create; }
     if (!strcmp(name, "CreateDXGIFactory1")) { r_factory = (factory_fn)(void *)f; return (FARPROC)(void *)w_factory; }
     return f;

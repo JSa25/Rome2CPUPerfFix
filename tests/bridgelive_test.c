@@ -63,7 +63,9 @@ int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UI
 }
 // the HUD-less copy: the back buffer's centre must be the scene's blue copy (not the red UI, not last frame's picture)
 // and vp this frame's main camera (not the shadow or reflection camera)
+static void (*s_on_hud)(ID3D11Resource *bb), (*s_on_hud_post)(ID3D11Resource *bb), (*s_on_present)(ID3D11Resource *bb);   // reshade_test
 void fgb_hudless(ID3D11Resource *bb, ID3D11Resource *depth, const float vp[16]) {
+    if (s_on_hud) s_on_hud(bb);
     D3D11_TEXTURE2D_DESC d;
     ID3D11Texture2D_GetDesc((ID3D11Texture2D *)depth, &d);
     if (!s_stage) {
@@ -128,6 +130,7 @@ static int s_view_ok = -1;
 static int view_check(ID3D11Resource *bb);
 void fgb_present(ID3D11Resource *bb) {   // 80: the fake whole-screen jump must not tint the view (the models' own motion only)
     s_present_n++;
+    if (s_on_present) s_on_present(bb);
     if (g_fr == 60 || g_fr == 80) s_view_ok = (g_fr == 60 || s_view_ok == 1) && view_check(bb);
 }
 int fgb_active(void) { return s_active; }
@@ -136,12 +139,15 @@ unsigned fgb_pace_timeouts(void) { return 0; }
 static unsigned s_fg_max = 1;   // "nofg": a GPU without frame generation (RTX 20 / 30)
 unsigned fgb_fg_max(void) { return s_fg_max; }
 void fgb_stop(void) { s_stopped++; }
+static IDXGISwapChain *(*s_fallback_impl)(ID3D11Resource *src, HRESULT(STDMETHODCALLTYPE *create)(IDXGIFactory *, IUnknown *, DXGI_SWAP_CHAIN_DESC *, IDXGISwapChain **));   // reshade_test
 IDXGISwapChain *fgb_fallback_frame(ID3D11Resource *src, HRESULT(STDMETHODCALLTYPE *create)(IDXGIFactory *, IUnknown *, DXGI_SWAP_CHAIN_DESC *, IDXGISwapChain **)) {
     (void)src; (void)create;
     s_fallback_n++;
+    if (s_fallback_impl) return s_fallback_impl(src, create);
     return NULL;   // not this frame: the glue returns S_OK
 }
 void fgb_fallback_close(void) {}
+void fgb_hud_post(ID3D11Resource *bb) { if (s_on_hud_post) s_on_hud_post(bb); }
 void *fgb_vt_original(void **vt, size_t slot) { (void)vt; (void)slot; return NULL; }
 void *fgb_unhooked(void *fn) { return fn; }
 void fgb_set_test_not_nvidia(int on) { (void)on; }
@@ -423,7 +429,7 @@ int main(int argc, char **argv) {
     DXGI_SWAP_CHAIN_DESC got;
     if (off) IDXGISwapChain_GetDesc(sc, &got);
     else r_getdesc(sc, &got);   // the real one (the hook says the game's window, below)
-    CHECK(off || (got.OutputWindow != hwnd && got.Windowed && g_out_hwnd == hwnd), "the game's swapchain is not on the hidden window");
+    CHECK(off || g_rs_sc || (got.OutputWindow != hwnd && got.Windowed && g_out_hwnd == hwnd), "the game's swapchain is not on the hidden window");
     if (!off) {   // what other mods see: the game's window, through GetDesc and IDXGISwapChain1::GetHwnd
         static const GUID iid_sc1 = {0x790a45f7, 0x0d42, 0x4876, {0x98, 0x3a, 0x0a, 0x55, 0xcf, 0xe6, 0xf4, 0xaa}};
         IDXGISwapChain1 *s1 = NULL;
@@ -1298,6 +1304,10 @@ int main(int argc, char **argv) {
     if (ph && (q = strstr(ph, "tag failures "))) tagf = (unsigned)atoi(q + 13);
     if (ph && (q = strstr(ph, "present failures "))) presf = (unsigned)atoi(q + 17);
     printf("  helper, frame generation 2x: %.2f frames shown per present, bad status %u, tag failures %u, present failures %u\n", per, bad, tagf, presf);
+    // with ReShade (run from a folder with it as dxgi.dll) and SR: frame generation's HUD-less image is the game's, with the effects
+    unsigned hpost = ph && (q = strstr(ph, "HUD-less from the game after SR ")) ? (unsigned)atoi(q + 32) : 0;
+    if (g_rs_sc) printf("  ReShade: the helper took the game's HUD-less image after SR in %u frames of the 2x phase\n", hpost);
+    CHECK(!g_rs_sc || !g_sr || hpost >= 400, "with ReShade and SR the helper used the game's HUD-less image in only %u frames", hpost);
     CHECK(fabs(per - 2.0) < 0.05 && !bad && !tagf && !presf, "frame generation 2x through the glue%s",
           fg_window ? "" : " (the test window was not in the foreground: run it alone, not right after another test window)");
 #endif

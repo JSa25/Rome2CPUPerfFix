@@ -23,7 +23,9 @@ and the water's reflections. Version 1.5 brings the add-on's DLSS closer to a na
 camera follows the sub-pixel jitter, NVIDIA's mip bias below native size, AMD FidelityFX RCAS sharpening of the DLSS
 output, the DLSS preset choice), fixes the tone mapper's exposure, the land water's reflections, the terrain's
 virtual-texture page requests and shadow maps below native size, supports the GOG version, and adds `rome2fix.ini`
-for switching parts off.
+for switching parts off. Version 1.6 links the add-on into ReShade (`rslink.cpp`): ReShade wraps the game's swapchain,
+so the bridge now hands frames over from under ReShade's wrapper, runs ReShade's effects at its HUD-less point (after
+DLSS, before the UI) and gives ReShade the scene depth with the camera's direction and near / far distances.
 
 ## What each file does
 
@@ -44,6 +46,7 @@ for switching parts off.
 | `fgb_proto.h` | The shared-memory layout and fences between `fgbridge.c` and the helper (the same file in the helper's repository) |
 | `fgpanel.c` | The F11 settings panel drawn over the frame |
 | `r2motion.c`, `r2motionvs.h` | Per-object motion vectors for moving soldiers and horses: the animated models drawn again on the GPU with the game's own skinning, matched to the previous frame by position |
+| `rslink.cpp`, `reshade/` | The bridge's ReShade link (C++, no C++ runtime linked): the mod registers itself as a ReShade add-on and runs ReShade's effects at the HUD-less point with the scene depth; `reshade/` holds ReShade's add-on API headers (v6.8.0, unchanged) |
 | `builds.h` | The game builds the fixes know (normal Steam version 2026-09-17, "pantheon" beta 2026-10-01); each fix keeps its addresses and byte hashes per build |
 | `version.h` | Mod version |
 | `dinput8.def` | The exports a `dinput8.dll` must have |
@@ -129,3 +132,7 @@ WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEM
 COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
 OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
+
+The headers in `reshade/` are ReShade's add-on API (https://github.com/crosire/reshade, v6.8.0), copyright (C) 2021
+Patrick Mours, used unchanged under their licence (SPDX-License-Identifier: BSD-3-Clause OR MIT; the notice is in
+each file).
