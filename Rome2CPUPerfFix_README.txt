@@ -219,6 +219,14 @@ is published for review at github.com/JSa25/Rome2CPUPerfFix.
 
 Changelog
 ---------
+Version 1.8: with the DLSS add-on and DLSS upscaling or DLAA: a moment where
+           the graphics card is busy (for example while ReShade loads its
+           effects) no longer switches DLSS off for the rest of the session.
+           DLSS now only turns off when its helper has really stopped
+           (closed, failed, or no answer for 3 seconds). Slow frames are
+           noted in rome2fix.log.
+           SHA-256 of dinput8.dll:
+           ab55488009c52f903074d15827b5ab3fdf680fc7d7dc49c9439ec026c2b5fb0c
 Version 1.7: fixes 1.6's ReShade depth range getting stuck: ReShade saves the
            value the mod sets in your preset, and on the next start the mod
            took it for your own setting and stopped changing it (the campaign
