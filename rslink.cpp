@@ -60,12 +60,16 @@ static void on_present(command_queue *, swapchain *, const rect *, const rect *,
     s_presents++;
 }
 
+static void far_load(const wchar_t *state);
+
 extern "C" {
 
-// once, when the game looks up DXGI / D3D11 in a module that is ReShade (exports ReShadeRegisterAddon)
-int rsl_attach(HMODULE self, HMODULE reshade, void (*log)(const char *, ...), int (*swapchain_cb)(void *)) {
+// once, when the game looks up DXGI / D3D11 in a module that is ReShade (exports ReShadeRegisterAddon); state: the file
+// that remembers the mod's own far plane across starts (in the add-on folder)
+int rsl_attach(HMODULE self, HMODULE reshade, void (*log)(const char *, ...), int (*swapchain_cb)(void *), const wchar_t *state) {
     s_log = log;
     s_swapchain_cb = swapchain_cb;
+    far_load(state);
     if (!reshade::register_addon(self, reshade)) {
         log("ReShade: found, but it did not take the mod as an add-on (API %d) - ReShade runs as it would without the mod's link", RESHADE_API_VERSION);
         return 0;
@@ -157,8 +161,23 @@ int rsl_depth_planes(const float vp[16], int *reversed, float *ratio) {
     *ratio = *reversed ? w[0] / w[1] : w[1] / w[0];
     return 1;
 }
-// the player's own value wins; ReShade's default (its installer writes 1000.0) and the mod's last one do not count as theirs
-static char s_far_set[24];
+// the player's own value wins; ReShade's default (its installer writes 1000.0) and the mod's own do not count as theirs.
+// ReShade saves the mod's value in the player's preset, and with the installer's global line in ReShade.ini it reads it
+// back as theirs at the next start (Attila's in-game test; here: 500.0 "kept" at 05:35), so the mod's last value is
+// remembered in the add-on folder (s_far_file) across starts
+static char s_far_set[24], s_far_mine[24];
+static wchar_t s_far_file[MAX_PATH];
+static void far_load(const wchar_t *state) {
+    if (!state) return;
+    wcsncpy(s_far_file, state, MAX_PATH - 1);
+    FILE *f = _wfopen(s_far_file, L"r");
+    char line[64] = {0};
+    if (f && fgets(line, sizeof line, f) && !strncmp(line, "far_plane=", 10)) {
+        line[strcspn(line, "\r\n")] = 0;
+        strncpy(s_far_mine, line + 10, sizeof s_far_mine - 1);
+    }
+    if (f) fclose(f);
+}
 static float s_far_ratio, s_far_cand;
 static unsigned s_far_steady;
 static int s_far_kept;
@@ -170,7 +189,7 @@ static void far_plane(float ratio) {
     if (++s_far_steady < 60) return;
     s_far_steady = 0;
     char v[24];
-    if (s_rt->get_preprocessor_definition("RESHADE_DEPTH_LINEARIZATION_FAR_PLANE", v) && strcmp(v, "1000.0") && strcmp(v, "1000") && strcmp(v, s_far_set)) {
+    if (s_rt->get_preprocessor_definition("RESHADE_DEPTH_LINEARIZATION_FAR_PLANE", v) && strcmp(v, "1000.0") && strcmp(v, "1000") && strcmp(v, s_far_mine)) {
         if (!s_far_kept++ && s_log) s_log("ReShade: RESHADE_DEPTH_LINEARIZATION_FAR_PLANE is %s in the player's settings (the game's camera: %.1f) - kept", v, ratio);
         s_far_ratio = ratio;
         return;
@@ -178,6 +197,9 @@ static void far_plane(float ratio) {
     s_far_ratio = ratio;
     snprintf(s_far_set, sizeof s_far_set, "%.1f", ratio);
     s_rt->set_preprocessor_definition("RESHADE_DEPTH_LINEARIZATION_FAR_PLANE", s_far_set);
+    memcpy(s_far_mine, s_far_set, sizeof s_far_mine);
+    FILE *f = s_far_file[0] ? _wfopen(s_far_file, L"w") : nullptr;
+    if (f) { fprintf(f, "far_plane=%s\n", s_far_set); fclose(f); }
     if (s_log) s_log("ReShade: RESHADE_DEPTH_LINEARIZATION_FAR_PLANE set to %s (the game's camera: far / near)", s_far_set);
 }
 void rsl_camera(const float vp[16]) {

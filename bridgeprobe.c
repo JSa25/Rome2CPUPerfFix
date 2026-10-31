@@ -59,7 +59,7 @@ IDXGISwapChain *fgb_fallback_frame(ID3D11Resource *src, HRESULT(STDMETHODCALLTYP
 void fgb_fallback_close(void);
 void *fgb_vt_original(void **vt, size_t slot);
 // rslink.cpp: ReShade's effects at the HUD-less point (DLSS add-on on, ReShade in the game folder)
-int rsl_attach(HMODULE self, HMODULE reshade, void (*log)(const char *, ...), int (*swapchain_cb)(void *));
+int rsl_attach(HMODULE self, HMODULE reshade, void (*log)(const char *, ...), int (*swapchain_cb)(void *), const wchar_t *state);
 int rsl_effects(ID3D11DeviceContext *ctx, ID3D11Resource *bb, ID3D11Resource *depth);
 void rsl_camera(const float vp[16]);
 void fgb_hud_post(ID3D11Resource *backbuffer);
@@ -2693,6 +2693,26 @@ static HRESULT WINAPI w_create(IDXGIAdapter *a, D3D_DRIVER_TYPE t, HMODULE sw, U
 }
 
 static FARPROC(WINAPI *r_gpa)(HMODULE, LPCSTR);
+// 1.6 kept no record of its own far plane, which ReShade saved in the player's preset: from 1.6 to 1.7 the last value it
+// logged in rome2fix.log is taken as the mod's (else 1.7 would keep that value as the player's for good)
+static void rs_migrate(const wchar_t *state) {
+    wchar_t p[MAX_PATH];
+    _snwprintf(p, MAX_PATH, L"%ls\\rome2fix.log", g_dir);
+    p[MAX_PATH - 1] = 0;
+    FILE *f = _wfopen(p, L"r");
+    if (!f) return;
+    static const char key[] = "RESHADE_DEPTH_LINEARIZATION_FAR_PLANE set to ";
+    char line[512], last[24] = {0};
+    while (fgets(line, sizeof line, f)) {
+        const char *k = strstr(line, key);
+        if (k) { k += sizeof key - 1; size_t n = strcspn(k, " \r\n"); if (n && n < sizeof last) { memcpy(last, k, n); last[n] = 0; } }
+    }
+    fclose(f);
+    if (!last[0] || !(f = _wfopen(state, L"w"))) return;
+    fprintf(f, "far_plane=%s\n", last);
+    fclose(f);
+    g_log("ReShade: the far plane this mod set before (%s, from rome2fix.log) is the mod's, not the player's", last);
+}
 // ReShade in the game folder (as dxgi.dll or d3d11.dll): the game's first look-up in it links the mod as a ReShade add-on
 // (DLSS add-on on only: without the bridge ReShade works as it always did)
 static void rs_find(HMODULE m) {
@@ -2700,7 +2720,11 @@ static void rs_find(HMODULE m) {
     g_rs_tried = 1;
     HMODULE self = NULL;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)(void *)rs_find, &self);
-    g_rs = rsl_attach(self, m, g_log, rs_swapchain);
+    wchar_t state[MAX_PATH];   // the mod's own ReShade far plane, kept across starts (FrameBridge in the release add-on)
+    _snwprintf(state, MAX_PATH, L"%ls\\reshade_link.txt", g_logdir);
+    state[MAX_PATH - 1] = 0;
+    if (GetFileAttributesW(state) == INVALID_FILE_ATTRIBUTES) rs_migrate(state);
+    g_rs = rsl_attach(self, m, g_log, rs_swapchain, state);
 }
 static FARPROC WINAPI w_gpa(HMODULE m, LPCSTR name) {
     FARPROC f = r_gpa(m, name);

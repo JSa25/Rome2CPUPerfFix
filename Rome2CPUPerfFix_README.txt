@@ -219,6 +219,14 @@ is published for review at github.com/JSa25/Rome2CPUPerfFix.
 
 Changelog
 ---------
+Version 1.7: fixes 1.6's ReShade depth range getting stuck: ReShade saves the
+           value the mod sets in your preset, and on the next start the mod
+           took it for your own setting and stopped changing it (the campaign
+           map kept the battle's range or the other way round). The mod now
+           remembers its own value (FrameBridge\reshade_link.txt); a value you
+           set yourself in ReShade is still left alone.
+           SHA-256 of dinput8.dll:
+           3b246bfcc7e383d07ff3cf6c0fe8e37f7d57bd18c9ff79a9cf06acaf5158e67a
 Version 1.6: ReShade works with the DLSS add-on: its effects now go on after
            DLSS and before the game's UI, ReShade gets the game's real depth
            with the camera's near / far distances, and the ReShade menu shows
