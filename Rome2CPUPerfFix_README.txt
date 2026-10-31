@@ -192,6 +192,8 @@ F11 settings (DLSS preset, sharpness) together with add-on version 2.
 picture before the game's UI is drawn (banners and menus stay clean), and
 ReShade gets the game's real depth, so depth effects (DOF, AO, fog) line up
 without setting anything. Nothing changes for ReShade without the add-on.
+1.9 adds a V-Sync On / Off setting (F11, with add-on version 5) and fixes thin
+white lines along the right edge with DLAA while the camera moves.
 
 
 Third-party notices
@@ -219,6 +221,17 @@ is published for review at github.com/JSa25/Rome2CPUPerfFix.
 
 Changelog
 ---------
+Version 1.9: with the DLSS add-on:
+           -fix1: thin white lines along the right edge of the screen with
+           DLAA while the camera moved (and the bottom edge the same way).
+           Half the frames left the last column / row of the picture
+           empty and DLSS smeared it.
+           -fix2: V-Sync On / Off in the F11 panel (vsync= in
+           FrameBridge\settings.txt). On stays the default (no tearing);
+           Off takes the cap at the screen's refresh rate away, but the
+           picture may tear. Needs add-on version 5.
+           SHA-256 of dinput8.dll:
+           9d913468ff15b268d6aa859bd1e62f378cfe40ef0ac6d2a0a378ca36b1f12e05
 Version 1.8: with the DLSS add-on and DLSS upscaling or DLAA: a moment where
            the graphics card is busy (for example while ReShade loads its
            effects) no longer switches DLSS off for the rest of the session.

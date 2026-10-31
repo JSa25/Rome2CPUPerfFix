@@ -181,6 +181,10 @@ static int s_presets_avail = -1;   // what the glue told the panel about the hel
 void fgp_set_presets_available(int on) { s_presets_avail = on; }
 static int s_helper_presets = 1;   // the stub helper: a current one (0: an older add-on's)
 int fgb_helper_has_presets(void) { return s_helper_presets; }
+void fgb_set_vsync(int on) { (void)on; }
+int fgb_helper_has_vsync(void) { return 1; }
+void fgp_set_vsync(int on) { (void)on; }
+void fgp_set_vsync_available(int on) { (void)on; }
 void fgp_di8_created(void *di) { (void)di; }
 static int s_panel_moved;
 static const wchar_t *s_panel_note;

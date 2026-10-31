@@ -79,8 +79,10 @@ void fgb_set_frame_limit(unsigned us);
 void fgb_set_preset(unsigned preset);
 int fgb_helper_has_presets(void);
 void fgb_set_sharpness(float con);
+void fgb_set_vsync(int on);
+int fgb_helper_has_vsync(void);
 // the F11 panel (fgpanel.c, Attila's; Rome 2: Super Resolution off / DLAA only so far)
-typedef struct { void (*sr)(int mode); void (*fg)(int frames); void (*motion)(int on); void (*view)(int on); void (*cap)(int choice); void (*preset)(int choice); void (*jtest)(int mode); void (*sharp)(int choice); } FgpApply;
+typedef struct { void (*sr)(int mode); void (*fg)(int frames); void (*motion)(int on); void (*view)(int on); void (*cap)(int choice); void (*preset)(int choice); void (*jtest)(int mode); void (*sharp)(int choice); void (*vsync)(int on); } FgpApply;
 int fgp_init(ID3D11Device *, ID3D11DeviceContext *, UINT bw, UINT bh, DXGI_FORMAT fmt, int sr, int fg, int motion, FgpApply apply);
 void fgp_frame(ID3D11Resource *backbuffer, HWND hwnd);
 void fgp_set_fps(double game, double shown);
@@ -89,6 +91,8 @@ void fgp_set_cap(int choice, unsigned fps);
 void fgp_set_preset(int choice);
 void fgp_set_sharp(int choice);
 void fgp_set_presets_available(int on);
+void fgp_set_vsync(int on);
+void fgp_set_vsync_available(int on);
 void fgp_di8_created(void *di);
 int fgp_move_device(ID3D11Device *dev, ID3D11DeviceContext *ctx, UINT bw, UINT bh);
 void fgp_set_note(const wchar_t *note);
@@ -1921,6 +1925,10 @@ static int g_preset;
 static const char *const SHARP_KEYS[4] = {"off", "low", "medium", "high"};
 static const float SHARP_CON[4] = {0, 0.42f, 0.66f, 0.87f};
 static int g_sharp = 1;
+// V-Sync of the add-on's frames (Attila 6.9.2's: players with fps held at their screen's refresh rate): on (default, no
+// tearing) or off
+static const char *const VSYNC_KEYS[2] = {"off", "on"};
+static int g_vsync = 1;
 static void settings_save(void) {
     if (g_settings[0]) {
         FILE *f = _wfopen(g_settings, L"w");
@@ -1934,24 +1942,25 @@ static void settings_save(void) {
                    "# dlss_preset: default, j, k, l, m (NVIDIA's DLSS model; default: K for DLAA / Quality / Balanced, M for\n"
                    "#              Performance, L for Ultra Performance)\n"
                    "# sharpness: off, low, medium, high (sharpening of the DLSS output, as games with DLSS built in have)\n"
+                   "# vsync: on, off (on: frames are shown at the screen's refresh rate, no tearing; off: no cap, but they may tear)\n"
                    "# addon: on, off (off: the add-on does nothing at all from the next game start; set on again to use it)\n"
-                   "super_resolution=%s\nframe_generation=%s\nmotion_vectors=%s\nframe_cap=%s\ndlss_preset=%s\nsharpness=%s\naddon=on\nversion=2\n",
+                   "super_resolution=%s\nframe_generation=%s\nmotion_vectors=%s\nframe_cap=%s\ndlss_preset=%s\nsharpness=%s\nvsync=%s\naddon=on\nversion=2\n",
                 SR_KEYS[g_sr >= 0 && g_sr < 6 ? g_sr : 2], FG_KEYS[g_fg < 4 ? g_fg : 0], g_motion_on ? "per_object" : "camera_only",
                 CAP_KEYS[g_fcap >= 0 && g_fcap < 5 ? g_fcap : 1], PRESET_KEYS[g_preset >= 0 && g_preset < 5 ? g_preset : 0],
-                SHARP_KEYS[g_sharp >= 0 && g_sharp < 4 ? g_sharp : 1]);
+                SHARP_KEYS[g_sharp >= 0 && g_sharp < 4 ? g_sharp : 1], VSYNC_KEYS[g_vsync != 0]);
         fclose(f);
         return;
     }
     // dev: line 4 = words (super resolution, "motion", "cap<key>" unless auto, "preset<key>" unless default, "sharp<key>" unless
-    // low, the test options kept)
+    // low, "vsyncoff", the test options kept)
     static const char *const words[6] = {"", "dlaa", "quality", "balanced", "perf", "ultraperf"};
     char l4[128] = {0};
-    const char *w[6] = {words[g_sr], g_motion_on ? "motion" : "", "", "", "", g_on_test};
+    const char *w[7] = {words[g_sr], g_motion_on ? "motion" : "", "", "", "", g_vsync ? "" : "vsyncoff", g_on_test};
     char capw[16] = {0}, prw[16] = {0}, shw[16] = {0};
     if (g_fcap != 1) { snprintf(capw, sizeof capw, "cap%s", CAP_KEYS[g_fcap]); w[2] = capw; }
     if (g_preset) { snprintf(prw, sizeof prw, "preset%s", PRESET_KEYS[g_preset]); w[3] = prw; }
     if (g_sharp != 1) { snprintf(shw, sizeof shw, "sharp%s", SHARP_KEYS[g_sharp]); w[4] = shw; }
-    for (int i = 0; i < 6; i++)
+    for (int i = 0; i < 7; i++)
         if (w[i][0]) snprintf(l4 + strlen(l4), sizeof l4 - strlen(l4), "%s%s", l4[0] ? " " : "", w[i]);
     wchar_t p[MAX_PATH];
     _snwprintf(p, MAX_PATH, L"%ls\\fgbridge_on.txt", g_dir);
@@ -1977,6 +1986,12 @@ static void panel_sharp(int choice) {
     g_sharp = choice >= 0 && choice < 4 ? choice : 1;
     fgb_set_sharpness(SHARP_CON[g_sharp]);
     g_log("F11 panel: sharpness %s", SHARP_KEYS[g_sharp]);
+    settings_save();
+}
+static void panel_vsync(int on) {
+    g_vsync = on != 0;
+    fgb_set_vsync(g_vsync);
+    g_log("F11 panel: V-Sync %s", VSYNC_KEYS[g_vsync]);
     settings_save();
 }
 static void panel_preset(int choice) {
@@ -2179,8 +2194,9 @@ static void bp_report(void) {
     g_log("  D3D11CreateDevice calls seen %d, device %s, nested Presents sent to DXGI %u", g_creates, g_ctx ? "known" : "not known yet", g_nested);
     if (g_live)
         g_log("  frame bridge %s: %u frames handed over, %u pacing timeouts, HUD-less copies %u, no camera %u, MSAA depth seen %u, "
-              "fallback frames %u", g_live_state == 1 ? "running" : g_live_state == 2 ? "off" : "not started", fgb_frames(),
-              fgb_pace_timeouts(), g_br_hud, g_br_novp, g_br_msaa, g_fb_frames);
+              "fallback frames %u, V-Sync %s%s", g_live_state == 1 ? "running" : g_live_state == 2 ? "off" : "not started", fgb_frames(),
+              fgb_pace_timeouts(), g_br_hud, g_br_novp, g_br_msaa, g_fb_frames, VSYNC_KEYS[g_vsync],
+              g_vsync || fgb_helper_has_vsync() ? "" : " (the add-on's helper keeps it on)");
     if (g_rs) g_log("  ReShade: effects before the UI in %u frames%s", g_rs_frames, g_rs_sc ? "" : " (the game's swapchain was not ReShade's wrapper)");
     if (g_live_state == 1 && g_sr) {   // this period only
         unsigned sf, st;
@@ -2569,6 +2585,8 @@ static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXG
             sr_set(g_sr);   // DLAA / presets: the render size and DLSS (off: native, no DLSS)
             fgb_set_preset(PRESET_NGX[g_preset]);
             fgb_set_sharpness(SHARP_CON[g_sharp]);
+            fgb_set_vsync(g_vsync);
+            if (!g_vsync && !fgb_helper_has_vsync()) g_log("DLSS add-on: V-Sync off needs add-on version 5 - its helper keeps V-Sync on");
             if (!fgb_helper_has_presets())   // the engine fix updated, the add-on not (or a hand install of an older one)
                 g_log("DLSS add-on: its helper is older than this engine fix (add-on version 1) - the DLSS preset choice needs "
                       "add-on version 2: update the add-on (Workshop: run its install.bat again; elsewhere: copy its FrameBridge folder)");
@@ -2580,12 +2598,14 @@ static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXG
             if (no_fg) g_log("motion pass: off - this GPU has no frame generation, which per-object motion is for");
             g_motion = no_fg ? 0 : r2m_init(g_dev, g_ctx, fgb_mv_texture(), g_log);
             if (g_motion) { fgb_set_motion(motion_cb); r2m_set_enabled(g_motion_on); }
-            FgpApply ap = {panel_sr, panel_fg, panel_motion, PANEL_VIEW, panel_cap, panel_preset, PANEL_JTEST, panel_sharp};
+            FgpApply ap = {panel_sr, panel_fg, panel_motion, PANEL_VIEW, panel_cap, panel_preset, PANEL_JTEST, panel_sharp, panel_vsync};
             if (fgp_init(g_dev, g_ctx, g_live_w, g_live_h, d->BufferDesc.Format, g_sr, (int)g_fg, g_motion ? g_motion_on : no_fg ? -2 : -1, ap)) {
                 fgp_set_sr_choices(6);
                 fgp_set_preset(g_preset);
                 fgp_set_sharp(g_sharp);
                 fgp_set_presets_available(fgb_helper_has_presets());
+                fgp_set_vsync(g_vsync);
+                fgp_set_vsync_available(fgb_helper_has_vsync());
             }
             else g_log("frame bridge: F11 panel not available (back buffer format %u)", d->BufferDesc.Format);
         } else if (hid) DestroyWindow(hid);
@@ -2775,10 +2795,11 @@ int install_bridgeprobe(HMODULE m, const wchar_t *dir, void (*log)(const char *f
         g_fcap = settings_value(text, "frame_cap=", CAP_KEYS, 5, 1);                       // default auto
         g_preset = settings_value(text, "dlss_preset=", PRESET_KEYS, 5, 0);                // default: NVIDIA's per mode
         g_sharp = settings_value(text, "sharpness=", SHARP_KEYS, 4, 1);                     // default low
+        g_vsync = settings_value(text, "vsync=", VSYNC_KEYS, 2, 1);                         // default on (files without the key too)
         g_live = 1;
         g_dev_di8_created = fgp_di8_created;   // the panel hides the game's mouse buttons while the cursor is over it
-        log("DLSS add-on found: super resolution %s, frame generation %s, motion vectors %s, frame cap %s, preset %s, sharpness %s (%ls)", SR_KEYS[g_sr],
-            FG_KEYS[g_fg], MV_KEYS[g_motion_on], CAP_KEYS[g_fcap], PRESET_KEYS[g_preset], SHARP_KEYS[g_sharp], sf ? L"settings.txt" : L"defaults");
+        log("DLSS add-on found: super resolution %s, frame generation %s, motion vectors %s, frame cap %s, preset %s, sharpness %s, V-Sync %s (%ls)", SR_KEYS[g_sr],
+            FG_KEYS[g_fg], MV_KEYS[g_motion_on], CAP_KEYS[g_fcap], PRESET_KEYS[g_preset], SHARP_KEYS[g_sharp], VSYNC_KEYS[g_vsync], sf ? L"settings.txt" : L"defaults");
         if (!sf) settings_save();   // the file to edit, with its comments, from the first start on
     }
     if (f) {   // helper64.exe path, Streamline dir, frames to generate (0..3), options ("fakeamd": treat the GPU as not NVIDIA)
@@ -2797,6 +2818,7 @@ int install_bridgeprobe(HMODULE m, const wchar_t *dir, void (*log)(const char *f
         g_sr = strstr(l[3], "ultraperf") ? 5 : strstr(l[3], "perf") ? 4 : strstr(l[3], "balanced") ? 3 : strstr(l[3], "quality") ? 2
              : strstr(l[3], "dlaa") ? 1 : 0;   // the F11 panel switches it
         g_motion_on = has_word(l[3], "motion");   // the word, not "motionprobe"
+        if (has_word(l[3], "vsyncoff")) g_vsync = 0;   // dev: V-Sync off
         for (int k = 0; k < 5; k++) {   // capoff / cap60 / cap90 / cap120; none: auto
             char t[16];
             snprintf(t, sizeof t, "cap%s", CAP_KEYS[k]);

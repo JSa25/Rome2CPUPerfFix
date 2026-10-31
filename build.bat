@@ -35,11 +35,14 @@ for %%T in (diag selfupd fileio attrcache logtrim) do (
 rem the frame bridge (needs a D3D11 GPU): the glue with fgbridge.c stubbed, the add-on's settings, the motion pass
 "%CC%" -O2 -Wall -static -o build\bridgelive_test.exe tests\bridgelive_test.c r2motion.c build\rslink.o || exit /b 1
 "%CC%" -O2 -Wall -static -o build\r2motion_test.exe tests\r2motion_test.c || exit /b 1
+"%CC%" -O2 -Wall -static -o build\jitedge_test.exe tests\jitedge_test.c -ld3d11 -lgdi32 || exit /b 1
 echo == bridgelive
 build\bridgelive_test.exe || (echo bridgelive test FAILED & exit /b 1)
 build\bridgelive_test.exe addon || (echo bridgelive add-on test FAILED & exit /b 1)
 echo == r2motion
 build\r2motion_test.exe || (echo r2motion test FAILED & exit /b 1)
+echo == jitedge
+build\jitedge_test.exe || (echo jitedge test FAILED & exit /b 1)
 echo == lateload
 build\lateload_test.exe "%~dp0build\dinput8.dll" "%~2" || (echo lateload test FAILED & exit /b 1)
 echo all tests passed

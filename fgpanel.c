@@ -19,7 +19,7 @@
 UINT fgb_render_w(void), fgb_render_h(void);   // fgbridge.c
 unsigned fgb_fg_max(void);
 
-typedef struct { void (*sr)(int mode); void (*fg)(int frames); void (*motion)(int on); void (*view)(int on); void (*cap)(int choice); void (*preset)(int choice); void (*jtest)(int mode); void (*sharp)(int choice); } FgpApply;
+typedef struct { void (*sr)(int mode); void (*fg)(int frames); void (*motion)(int on); void (*view)(int on); void (*cap)(int choice); void (*preset)(int choice); void (*jtest)(int mode); void (*sharp)(int choice); void (*vsync)(int on); } FgpApply;
 
 static ID3D11Device *p_dev;
 static ID3D11DeviceContext *p_ctx;
@@ -47,6 +47,10 @@ static const wchar_t *const sharp_names[4] = {L"Off", L"Low", L"Medium", L"High"
 void fgp_set_sharp(int choice) { p_sharp = choice; p_dirty = 1; }
 static int p_presets_ok = 1;       // the add-on's helper applies presets (an older one: the row greyed out, a note)
 void fgp_set_presets_available(int on) { p_presets_ok = on; p_dirty = 1; }
+static int p_vsync = 1, p_vsync_ok = 1;   // V-Sync of the shown frames (row 8): 0 off, 1 on; p_vsync_ok: the helper applies it
+static const wchar_t *const vsync_names[2] = {L"Off", L"On"};
+void fgp_set_vsync(int on) { p_vsync = on != 0; p_dirty = 1; }
+void fgp_set_vsync_available(int on) { p_vsync_ok = on; p_dirty = 1; }
 static int p_jtest;                // dev: what DLSS is told of the jitter (0 the frame's, 1 none, 2 / 3 x / y reversed, 4 / 5 the previous / next frame's)
 static const wchar_t *const jtest_names[6] = {L"Normal", L"Tell 0", L"Flip X", L"Flip Y", L"Prev", L"Next"};
 
@@ -183,9 +187,9 @@ static const wchar_t *const cap_names[5] = {L"Off", L"Auto", L"60", L"90", L"120
 static const wchar_t *const view_names[4] = {L"Off", L"No mip bias", L"No jitter", L"Motion"};
 static const wchar_t *const preset_names[5] = {L"Default", L"J", L"K", L"L", L"M"};
 #ifdef PROFILING
-#define P_ROWS 8   // + Debug View (the soldiers' motion) and Jitter Test: dev builds only
+#define P_ROWS 9   // + Debug View (the soldiers' motion) and Jitter Test: dev builds only
 #else
-#define P_ROWS 6
+#define P_ROWS 7
 #endif
 // the frame cap (row 3): the choice (0 off, 1 auto, 2.. 60 / 90 / 120) and the rendered-frame cap in effect (0 none)
 static int p_cap = 1;
@@ -215,7 +219,7 @@ static void redraw(void) {
     fill_rr(x0, y, x1, y + 1 * u, 0, C_RULE, 1);
     y += 18 * u;
     // the three settings: name and what it does now on the left, the choices on the right
-    wchar_t cap[8][64];
+    wchar_t cap[9][64];
     _snwprintf(cap[0], 64, L"Render %u \x00d7 %u", fgb_render_w(), fgb_render_h());
     unsigned fgmax = fgb_fg_max();   // NVIDIA's rules for this GPU: frame generation on RTX 40 / 50, 3x and 4x on RTX 50
     if (!fgmax) _snwprintf(cap[1], 64, L"Needs an RTX 40 or 50 series GPU");
@@ -235,9 +239,12 @@ static void redraw(void) {
     else _snwprintf(cap[5], 64, L"%ls", preset_caps[p_preset]);
     _snwprintf(cap[6], 64, L"What DLSS is told of the jitter");
     _snwprintf(cap[7], 64, !p_sr ? L"Needs Super Resolution or DLAA" : p_sharp ? L"Crisper DLSS output" : L"DLSS output as it is");
-    static const wchar_t *const label[8] = {L"Super Resolution", L"Frame Generation", L"Motion Vectors", L"Frame Cap", L"Debug View", L"DLSS Preset", L"Jitter Test",
-                                            L"Sharpness"};
-    static const int order[8] = {0, 5, 7, 1, 2, 3, 4, 6};   // the preset and sharpness right under Super Resolution (rows keep their ids)
+    _snwprintf(cap[8], 64, !p_vsync_ok ? L"Update the DLSS add-on for this" : p_vsync ? L"No tearing, up to the screen's rate"
+                                                                                     : L"No cap, the picture may tear");
+    static const wchar_t *const label[9] = {L"Super Resolution", L"Frame Generation", L"Motion Vectors", L"Frame Cap", L"Debug View", L"DLSS Preset", L"Jitter Test",
+                                            L"Sharpness", L"V-Sync"};
+    // the preset and sharpness right under Super Resolution, V-Sync under Frame Cap (rows keep their ids)
+    static const int order[9] = {0, 5, 7, 1, 2, 3, 8, 4, 6};
     float lab = x0 + 196 * u, rh = 38 * u;
     for (int i = 0; i < P_ROWS; i++) {
         int row = order[i];
@@ -251,6 +258,7 @@ static void redraw(void) {
         else if (row == 5) choices(5, c0, y, x1, y + rh, preset_names, 5, p_preset, p_sr && p_presets_ok ? 5 : 0);
         else if (row == 6) choices(6, c0, y, x1, y + rh, jtest_names, 6, p_jtest, p_sr ? 6 : 0);
         else if (row == 7) choices(7, c0, y, x1, y + rh, sharp_names, 4, p_sharp, p_sr ? 4 : 0);
+        else if (row == 8) choices(8, c0, y, x1, y + rh, vsync_names, 2, p_vsync, p_vsync_ok ? 2 : 0);
         else choices(4, c0, y, x1, y + rh, view_names, 4, p_view, p_motion >= 0 ? 4 : 3);
         y += rh + 20 * u;
     }
@@ -480,6 +488,7 @@ void fgp_frame(ID3D11Resource *backbuffer, HWND hwnd) {
             if (b->row == 5 && b->value != p_preset) { p_preset = b->value; if (p_apply.preset) p_apply.preset(p_preset); }
             if (b->row == 6 && b->value != p_jtest) { p_jtest = b->value; if (p_apply.jtest) p_apply.jtest(p_jtest); }
             if (b->row == 7 && b->value != p_sharp) { p_sharp = b->value; if (p_apply.sharp) p_apply.sharp(p_sharp); }
+            if (b->row == 8 && b->value != p_vsync) { p_vsync = b->value; if (p_apply.vsync) p_apply.vsync(p_vsync); }
             p_dirty = 1;
         }
     }
