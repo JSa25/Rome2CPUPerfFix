@@ -19,7 +19,7 @@
 UINT fgb_render_w(void), fgb_render_h(void);   // fgbridge.c
 unsigned fgb_fg_max(void);
 
-typedef struct { void (*sr)(int mode); void (*fg)(int frames); void (*motion)(int on); void (*view)(int on); void (*cap)(int choice); } FgpApply;
+typedef struct { void (*sr)(int mode); void (*fg)(int frames); void (*motion)(int on); void (*view)(int on); void (*cap)(int choice); void (*preset)(int choice); void (*jtest)(int mode); void (*sharp)(int choice); } FgpApply;
 
 static ID3D11Device *p_dev;
 static ID3D11DeviceContext *p_ctx;
@@ -41,9 +41,17 @@ static volatile int p_block;       // the game's mouse buttons are hidden (panel
 static double p_game_fps, p_shown_fps;
 static const wchar_t *p_note;      // shown instead of the frame rates (fgp_set_note): why DLSS is off
 static int p_sr_n = 6;             // Rome 2: the Super Resolution choices built so far (2 = off and DLAA), the rest greyed out
+static int p_preset;               // the DLSS preset: 0 NVIDIA's default per mode, 1..4 J / K / L / M
+static int p_sharp = 1;            // sharpening of the DLSS output: 0 off, 1..3 low / medium / high
+static const wchar_t *const sharp_names[4] = {L"Off", L"Low", L"Medium", L"High"};
+void fgp_set_sharp(int choice) { p_sharp = choice; p_dirty = 1; }
+static int p_presets_ok = 1;       // the add-on's helper applies presets (an older one: the row greyed out, a note)
+void fgp_set_presets_available(int on) { p_presets_ok = on; p_dirty = 1; }
+static int p_jtest;                // dev: what DLSS is told of the jitter (0 the frame's, 1 none, 2 / 3 x / y reversed, 4 / 5 the previous / next frame's)
+static const wchar_t *const jtest_names[6] = {L"Normal", L"Tell 0", L"Flip X", L"Flip Y", L"Prev", L"Next"};
 
 typedef struct { RECT r; int row, value, enabled; } Btn;
-static Btn p_btn[24];
+static Btn p_btn[40];
 static int p_nbtn;
 
 // ---- the game's mouse through DirectInput 8: buttons and wheel hidden while p_block ----
@@ -160,7 +168,7 @@ static void choices(int row, float x0, float y0, float x1, float y1, const wchar
         else if (hot) fill_rr(sx0 + 2 * u, y0 + 2 * u, sx1 - 2 * u, y1 - 2 * u, r, C_HOVER, 1);
         if (k && k != chosen && k != chosen + 1) fill_rr(sx0 - 0.5f * u, y0 + 9 * u, sx0 + 0.5f * u, y1 - 9 * u, 0, C_RULE, 1);
         text(names[k], p_small, !enabled ? C_OFF : sel ? C_ON_BRONZE : hot ? C_TEXT : C_DIM, (int)sx0, (int)y0, (int)sx1, (int)y1, DT_CENTER);
-        if (p_nbtn < 24) {
+        if (p_nbtn < 40) {
             RECT rc = {(LONG)sx0, (LONG)y0, (LONG)sx1, (LONG)y1};
             p_btn[p_nbtn].r = rc; p_btn[p_nbtn].row = row; p_btn[p_nbtn].value = k; p_btn[p_nbtn].enabled = enabled;
             p_nbtn++;
@@ -172,16 +180,18 @@ static const wchar_t *const sr_names[6] = {L"Off", L"DLAA", L"Quality", L"Balanc
 static const wchar_t *const fg_names[4] = {L"Off", L"2x", L"3x", L"4x"};
 static const wchar_t *const mv_names[2] = {L"Camera only", L"Per object"};
 static const wchar_t *const cap_names[5] = {L"Off", L"Auto", L"60", L"90", L"120"};
-static const wchar_t *const view_names[2] = {L"Off", L"Soldiers' motion"};
+static const wchar_t *const view_names[4] = {L"Off", L"No mip bias", L"No jitter", L"Motion"};
+static const wchar_t *const preset_names[5] = {L"Default", L"J", L"K", L"L", L"M"};
 #ifdef PROFILING
-#define P_ROWS 5   // + Debug View (the soldiers' motion): dev builds only
+#define P_ROWS 8   // + Debug View (the soldiers' motion) and Jitter Test: dev builds only
 #else
-#define P_ROWS 4
+#define P_ROWS 6
 #endif
 // the frame cap (row 3): the choice (0 off, 1 auto, 2.. 60 / 90 / 120) and the rendered-frame cap in effect (0 none)
 static int p_cap = 1;
 static unsigned p_cap_fps;
 void fgp_set_cap(int choice, unsigned fps) { p_cap = choice; p_cap_fps = fps; p_dirty = 1; }
+void fgp_set_preset(int choice) { p_preset = choice; p_dirty = 1; }
 
 static void redraw(void) {
     float u = p_u;
@@ -205,7 +215,7 @@ static void redraw(void) {
     fill_rr(x0, y, x1, y + 1 * u, 0, C_RULE, 1);
     y += 18 * u;
     // the three settings: name and what it does now on the left, the choices on the right
-    wchar_t cap[5][64];
+    wchar_t cap[8][64];
     _snwprintf(cap[0], 64, L"Render %u \x00d7 %u", fgb_render_w(), fgb_render_h());
     unsigned fgmax = fgb_fg_max();   // NVIDIA's rules for this GPU: frame generation on RTX 40 / 50, 3x and 4x on RTX 50
     if (!fgmax) _snwprintf(cap[1], 64, L"Needs an RTX 40 or 50 series GPU");
@@ -214,18 +224,34 @@ static void redraw(void) {
     _snwprintf(cap[2], 64, p_motion == -2 ? L"Needs frame generation" : p_motion < 0 ? L"Not available this session" : p_motion ? L"Soldiers and horses tracked" : L"Camera movement only");
     if (p_cap_fps) _snwprintf(cap[3], 64, L"%u rendered, %u shown fps", p_cap_fps, p_cap_fps * (p_fg + 1));
     else _snwprintf(cap[3], 64, p_cap == 1 ? L"Screen rate with frame generation" : L"No cap");
-    _snwprintf(cap[4], 64, p_motion < 0 ? L"Not available this session" : p_view ? L"Tracked models, tinted as they move" : L"The frame as it is");
-    static const wchar_t *const label[5] = {L"Super Resolution", L"Frame Generation", L"Motion Vectors", L"Frame Cap", L"Debug View"};
+    _snwprintf(cap[4], 64, p_view == 3 ? L"Tracked models, tinted as they move" : p_view == 2 ? L"No sub-pixel jitter" : p_view ? L"Textures without the mip bias" : L"The frame as it is");
+    static const wchar_t *const preset_caps[5] = {L"", L"Less ghosting, more flicker", L"Best image for DLAA / Quality",
+                                                  L"Sharpest, the slowest", L"Sharp, faster than L"};
+    // Default: NVIDIA's documented preset for the mode (Streamline 2.14.16; nothing reports the one DLSS really runs, and the
+    // NVIDIA app's override can change it): DLAA / Quality / Balanced K, Performance M, Ultra Performance L
+    if (!p_presets_ok) _snwprintf(cap[5], 64, L"Update the DLSS add-on for this");
+    else if (!p_sr) _snwprintf(cap[5], 64, L"Needs Super Resolution or DLAA");
+    else if (!p_preset) _snwprintf(cap[5], 64, L"NVIDIA's pick here: %lc", L"-KKKML"[p_sr < 6 ? p_sr : 0]);
+    else _snwprintf(cap[5], 64, L"%ls", preset_caps[p_preset]);
+    _snwprintf(cap[6], 64, L"What DLSS is told of the jitter");
+    _snwprintf(cap[7], 64, !p_sr ? L"Needs Super Resolution or DLAA" : p_sharp ? L"Crisper DLSS output" : L"DLSS output as it is");
+    static const wchar_t *const label[8] = {L"Super Resolution", L"Frame Generation", L"Motion Vectors", L"Frame Cap", L"Debug View", L"DLSS Preset", L"Jitter Test",
+                                            L"Sharpness"};
+    static const int order[8] = {0, 5, 7, 1, 2, 3, 4, 6};   // the preset and sharpness right under Super Resolution (rows keep their ids)
     float lab = x0 + 196 * u, rh = 38 * u;
-    for (int row = 0; row < P_ROWS; row++) {
-        float c0 = row && row != 3 ? lab + (x1 - lab) * 0.30f : lab;   // the shorter rows leave their caption more room
+    for (int i = 0; i < P_ROWS; i++) {
+        int row = order[i];
+        float c0 = row && row != 3 && row != 6 ? lab + (x1 - lab) * 0.30f : lab;   // the shorter rows leave their caption more room
         text(label[row], p_label, C_TEXT, (int)x0, (int)(y - 3 * u), (int)c0, (int)(y + rh * 0.55f), DT_LEFT);
         text(cap[row], p_tiny, C_DIM, (int)x0, (int)(y + rh * 0.5f), (int)(c0 - 10 * u), (int)(y + rh + 3 * u), DT_LEFT | DT_END_ELLIPSIS);
         if (row == 0) choices(0, c0, y, x1, y + rh, sr_names, 6, p_sr, p_sr_n);
         else if (row == 1) choices(1, c0, y, x1, y + rh, fg_names, 4, p_fg, (int)fgmax + 1);
         else if (row == 2) choices(2, c0, y, x1, y + rh, mv_names, 2, p_motion, p_motion >= 0 ? 2 : 0);
         else if (row == 3) choices(3, c0, y, x1, y + rh, cap_names, 5, p_cap, 5);
-        else choices(4, c0, y, x1, y + rh, view_names, 2, p_view, p_motion >= 0 ? 2 : 0);
+        else if (row == 5) choices(5, c0, y, x1, y + rh, preset_names, 5, p_preset, p_sr && p_presets_ok ? 5 : 0);
+        else if (row == 6) choices(6, c0, y, x1, y + rh, jtest_names, 6, p_jtest, p_sr ? 6 : 0);
+        else if (row == 7) choices(7, c0, y, x1, y + rh, sharp_names, 4, p_sharp, p_sr ? 4 : 0);
+        else choices(4, c0, y, x1, y + rh, view_names, 4, p_view, p_motion >= 0 ? 4 : 3);
         y += rh + 20 * u;
     }
     y -= 4 * u;
@@ -451,6 +477,9 @@ void fgp_frame(ID3D11Resource *backbuffer, HWND hwnd) {
             if (b->row == 2 && b->value != p_motion) { p_motion = b->value; if (p_apply.motion) p_apply.motion(p_motion); }
             if (b->row == 3 && b->value != p_cap) { p_cap = b->value; if (p_apply.cap) p_apply.cap(p_cap); }
             if (b->row == 4 && b->value != p_view) { p_view = b->value; if (p_apply.view) p_apply.view(p_view); }
+            if (b->row == 5 && b->value != p_preset) { p_preset = b->value; if (p_apply.preset) p_apply.preset(p_preset); }
+            if (b->row == 6 && b->value != p_jtest) { p_jtest = b->value; if (p_apply.jtest) p_apply.jtest(p_jtest); }
+            if (b->row == 7 && b->value != p_sharp) { p_sharp = b->value; if (p_apply.sharp) p_apply.sharp(p_sharp); }
             p_dirty = 1;
         }
     }

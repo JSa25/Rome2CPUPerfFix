@@ -27,6 +27,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <math.h>
+#include "iathook.h"
 
 static wchar_t g_dir[MAX_PATH];
 static void (*g_log)(const char *fmt, ...);
@@ -62,19 +63,27 @@ void fgb_set_test_not_nvidia(int on);
 void fgb_cpu_stats(double *hud_ms, double *present_ms, double *pace_ms, unsigned *frames);
 void fgb_set_sr(int on, UINT render_w, UINT render_h);
 void fgb_jitter(float *jx, float *jy);
+void fgb_set_jitter(float jx, float jy);
+void fgb_jitter_at(int d, float *jx, float *jy);
 void fgb_sr_stats(unsigned *frames, unsigned *timeouts, double *wait_avg_ms, double *wait_max_ms);
 static void jit_apply(ID3D11DeviceContext *c, int force), jit_frame_end(void), cam_copy_write(ID3D11Resource *r, const void *src);
 static int is_cam_copy(ID3D11Buffer *b);
 unsigned fgb_shown(void);
 void fgb_set_fg(unsigned frames_to_generate);
 void fgb_set_frame_limit(unsigned us);
+void fgb_set_preset(unsigned preset);
+int fgb_helper_has_presets(void);
+void fgb_set_sharpness(float con);
 // the F11 panel (fgpanel.c, Attila's; Rome 2: Super Resolution off / DLAA only so far)
-typedef struct { void (*sr)(int mode); void (*fg)(int frames); void (*motion)(int on); void (*view)(int on); void (*cap)(int choice); } FgpApply;
+typedef struct { void (*sr)(int mode); void (*fg)(int frames); void (*motion)(int on); void (*view)(int on); void (*cap)(int choice); void (*preset)(int choice); void (*jtest)(int mode); void (*sharp)(int choice); } FgpApply;
 int fgp_init(ID3D11Device *, ID3D11DeviceContext *, UINT bw, UINT bh, DXGI_FORMAT fmt, int sr, int fg, int motion, FgpApply apply);
 void fgp_frame(ID3D11Resource *backbuffer, HWND hwnd);
 void fgp_set_fps(double game, double shown);
 void fgp_set_sr_choices(int n);
 void fgp_set_cap(int choice, unsigned fps);
+void fgp_set_preset(int choice);
+void fgp_set_sharp(int choice);
+void fgp_set_presets_available(int on);
 void fgp_di8_created(void *di);
 int fgp_move_device(ID3D11Device *dev, ID3D11DeviceContext *ctx, UINT bw, UINT bh);
 void fgp_set_note(const wchar_t *note);
@@ -294,7 +303,9 @@ typedef void(STDMETHODCALLTYPE *di_fn)(ID3D11DeviceContext *, UINT, UINT, UINT, 
 typedef void(STDMETHODCALLTYPE *rsvp_fn)(ID3D11DeviceContext *, UINT, const D3D11_VIEWPORT *);
 typedef void(STDMETHODCALLTYPE *rsgetvp_fn)(ID3D11DeviceContext *, UINT *, D3D11_VIEWPORT *);
 typedef void(STDMETHODCALLTYPE *omdss_fn)(ID3D11DeviceContext *, ID3D11DepthStencilState *, UINT);
-enum { S_OMRT, S_OMRTUAV, S_VSCB, S_CRTV, S_CDSV, S_MAP, S_UNMAP, S_UPD, S_DIP, S_D, S_DII, S_DI, S_RSVP, S_RSGETVP, S_OMDSS, S_PSCB, S_VSSET, NSLOT };
+typedef void(STDMETHODCALLTYPE *disp_fn)(ID3D11DeviceContext *, UINT, UINT, UINT);
+typedef void(STDMETHODCALLTYPE *psset_fn)(ID3D11DeviceContext *, ID3D11PixelShader *, ID3D11ClassInstance *const *, UINT);
+enum { S_OMRT, S_OMRTUAV, S_VSCB, S_CRTV, S_CDSV, S_MAP, S_UNMAP, S_UPD, S_DIP, S_D, S_DII, S_DI, S_RSVP, S_RSGETVP, S_OMDSS, S_PSCB, S_VSSET, S_PSSAMP, S_DISP, S_PSSET, NSLOT };
 static struct { void **vt; void *orig[NSLOT]; int rw; } g_vts[16];   // rw: the table is in writable memory
 static unsigned g_rh_calls, g_rh_patches, g_rh_foreign;   // re-hook checks, slots hooked again, foreign slots left alone
 static LONGLONG g_rh_ticks;                                // QPC ticks spent where a slot differed
@@ -706,12 +717,18 @@ static int bc_has(const void *bc, SIZE_T len, const char *s) {   // the bytecode
 // the water. Shrunk into the bottom-left instead, the game's own lookup lands exactly on it (row H - r * y_full); its
 // pixel shaders get a camera copy patched for that corner. Only until the frame's first ocean draw (it reads it there;
 // the game may use the same texture for something else later in the frame).
+// Lakes, sea on land maps and rivers (waterplane.hlsl, rigidriver.hlsl; user: "water is messed up" at Quality, a coastal
+// land battle) read theirs the same way under another name, s_terrain_reflection (t2: sample_l at (x, 1 - y)): the
+// mirrored terrain / sky pass and the screen-space pass into it, then the water. Learned at the water's own draws (its
+// vertex shader is not the ocean's).
 typedef HRESULT(STDMETHODCALLTYPE *cps_fn)(ID3D11Device *, const void *, SIZE_T, ID3D11ClassLinkage *, ID3D11PixelShader **);
 static cps_fn r_cps;
-static struct { const void *ps; unsigned slots, rslots; int ssr; } g_ovps[64];   // the ocean's pixel shaders (overlay / reflection
+static struct { const void *ps; unsigned slots, rslots, tmcb; int ssr; } g_ovps[64];   // the ocean's pixel shaders (overlay / reflection
                                                                                 // slots) and the screen-space reflection one (below)
 static volatile LONG g_novps;
-static unsigned overlay_slots(const void *bc, SIZE_T len, const char *name) {   // texture slots named *name* (DXBC RDEF)
+#define overlay_slots(bc, len, name) rdef_slots(bc, len, name, 2)
+static unsigned rdef_slots(const void *bc, SIZE_T len, const char *name, unsigned type) {   // slots of the resources of a type
+                                                                                         // (2 texture, 0 cbuffer) named *name* (DXBC RDEF)
     const unsigned char *b = bc;
     unsigned nc, off, slots = 0;
     if (len < 32 || memcmp(b, "DXBC", 4)) return 0;
@@ -728,7 +745,7 @@ static unsigned overlay_slots(const void *bc, SIZE_T len, const char *name) {   
         for (unsigned j = 0; j < nb && bo + 32 * j + 32 <= rlen; j++) {
             unsigned e[8];
             memcpy(e, r + bo + 32 * j, 32);   // name, type (2: texture), return type, dimension, samples, bind point, count, flags
-            if (e[1] != 2 || e[5] >= 32 || e[0] >= rlen) continue;
+            if (e[1] != type || e[5] >= 32 || e[0] >= rlen) continue;
             const char *nm = (const char *)r + e[0];
             if (memchr(nm, 0, rlen - e[0]) && strstr(nm, name)) slots |= 1u << e[5];
         }
@@ -737,6 +754,54 @@ static unsigned overlay_slots(const void *bc, SIZE_T len, const char *name) {   
 }
 static struct { const void *ps; unsigned long long sum; } g_capps[8192];   // every pixel shader's DXBC checksum (captures)
 static volatile LONG g_ncapps;
+// Pixel shaders whose camera block is not in slot 0 (RDEF; 26 kinds in the packs: the 3D UI's forward lighting, campaign
+// borders, MLAA, the low-quality sprites, the terrain's virtual-texture page touch): ps_cb_apply only swaps slot 0, so
+// below native size these get the patched copy at their draws (cs_begin). slot 0xFF: a shader created at a freed one's
+// address that has it in slot 0. pt: ps30_page_touch (cs_begin, below).
+static struct { const void *volatile ps; unsigned char slot, pt; } g_camps[1024];
+// Per pixel shader, what the per-draw fixes look for (set at creation), and the bound one's (PSSetShader, w_psset): draws
+// by any other shader skip them (asking d3d11 for the shader at every draw cost 70-80 ns a draw: 0.46 ms a frame in a
+// 5700-draw naval battle). The fixes still check the shader they are given.
+enum { PSF_WATER = 1, PSF_TM = 2, PSF_CAM = 4 };
+static struct { const void *volatile ps; unsigned char f; } g_psf[2048];
+static unsigned g_cur_psf;
+static void psf_set(const void *ps, unsigned f) {   // loader threads too
+    for (unsigned h = ((unsigned)(UINT_PTR)ps >> 4) & 2047, k = 0; k < 2048; h = (h + 1) & 2047, k++) {
+        if (g_psf[h].ps == ps || (!g_psf[h].ps && !InterlockedCompareExchangePointer((void *volatile *)&g_psf[h].ps, (void *)ps, NULL))) {
+            g_psf[h].f = (unsigned char)f;
+            return;
+        }
+    }   // shortcut: 2048 at most (the packs have about 200 such shaders), the rest skip the fixes
+}
+static unsigned psf_get(const void *ps) {
+    for (unsigned h = ((unsigned)(UINT_PTR)ps >> 4) & 2047, k = 0; k < 2048 && g_psf[h].ps; h = (h + 1) & 2047, k++)
+        if (g_psf[h].ps == ps) return g_psf[h].f;
+    return 0;
+}
+static void STDMETHODCALLTYPE w_psset(ID3D11DeviceContext *c, ID3D11PixelShader *ps, ID3D11ClassInstance *const *ci, UINT n) {
+    if (!r2m_internal && c == g_ctx) g_cur_psf = ps ? psf_get(ps) : 0;
+    ORIG(psset_fn, S_PSSET, c)(c, ps, ci, n);
+}
+static void camps_set(const void *ps, unsigned slot, int pt) {   // loader threads too
+    for (unsigned h = ((unsigned)(UINT_PTR)ps >> 4) & 1023, k = 0; k < 1024; h = (h + 1) & 1023, k++) {
+        if (g_camps[h].ps == ps || (!g_camps[h].ps && !InterlockedCompareExchangePointer((void *volatile *)&g_camps[h].ps, (void *)ps, NULL))) {
+            g_camps[h].slot = (unsigned char)slot; g_camps[h].pt = (unsigned char)pt;
+            return;
+        }
+    }   // shortcut: 1024 at most (the packs have 113), the rest keep the game's camera
+}
+static int camps_find(const void *ps, unsigned *slot, int *pt) {
+    for (unsigned h = ((unsigned)(UINT_PTR)ps >> 4) & 1023, k = 0; k < 1024; h = (h + 1) & 1023, k++) {
+        if (!g_camps[h].ps) return 0;
+        if (g_camps[h].ps == ps) { *slot = g_camps[h].slot; *pt = g_camps[h].pt; return g_camps[h].slot != 0xFF; }
+    }
+    return 0;
+}
+static int camps_has(const void *ps) {   // an entry for this address, valid or not
+    for (unsigned h = ((unsigned)(UINT_PTR)ps >> 4) & 1023, k = 0; k < 1024 && g_camps[h].ps; h = (h + 1) & 1023, k++)
+        if (g_camps[h].ps == ps) return 1;
+    return 0;
+}
 static HRESULT STDMETHODCALLTYPE w_cps(ID3D11Device *d, const void *bc, SIZE_T len, ID3D11ClassLinkage *cl, ID3D11PixelShader **out) {
     HRESULT hr = r_cps(d, bc, len, cl, out);
     if (SUCCEEDED(hr) && out && *out && bc && len >= 12 && !memcmp(bc, "DXBC", 4)) {
@@ -744,11 +809,20 @@ static HRESULT STDMETHODCALLTYPE w_cps(ID3D11Device *d, const void *bc, SIZE_T l
         if (i < 8192) { memcpy(&g_capps[i].sum, (const char *)bc + 4, 8); g_capps[i].ps = *out; }   // shortcut: never freed
     }
     int ok = SUCCEEDED(hr) && out && *out && bc;
-    unsigned slots = ok ? overlay_slots(bc, len, "colour_overlay_texture") : 0, rslots = ok ? overlay_slots(bc, len, "reflection_texture") : 0;
+    unsigned slots = ok ? overlay_slots(bc, len, "colour_overlay_texture") : 0, rslots = ok ? overlay_slots(bc, len, "reflection_texture") | overlay_slots(bc, len, "s_terrain_reflection") : 0;
     int ssr = ok && bc_has(bc, len, "screen_space_refl_params");
-    if (slots || rslots || ssr) {
+    unsigned tmcb = ok && bc_has(bc, len, "g_render_target_recip_size") ? rdef_slots(bc, len, "render_target_dims_buffer", 0) : 0;   // tone mapper
+    unsigned cams = ok ? rdef_slots(bc, len, "camera_VS_PS", 0) : 0;
+    if (cams && !(cams & 1)) {
+        unsigned sl = 1;
+        while (!(cams >> sl & 1)) sl++;
+        camps_set(*out, sl, bc_has(bc, len, "g_page_touch_constants"));
+    } else if (ok && camps_has(*out)) camps_set(*out, 0xFF, 0);
+    unsigned psf = (slots | rslots ? PSF_WATER : 0) | (tmcb ? PSF_TM : 0) | (cams && !(cams & 1) ? PSF_CAM : 0);
+    if (ok && (psf || psf_get(*out))) psf_set(*out, psf);   // (a shader at a freed one's address: its entry cleared)
+    if (slots || rslots || ssr || tmcb) {
         LONG i = InterlockedIncrement(&g_novps) - 1;   // loader threads too
-        if (i < 64) { g_ovps[i].slots = slots; g_ovps[i].rslots = rslots; g_ovps[i].ssr = ssr; g_ovps[i].ps = *out; }   // shortcut: 64 at most (Rome 2: 4 per shadow mode), never freed
+        if (i < 64) { g_ovps[i].slots = slots; g_ovps[i].rslots = rslots; g_ovps[i].tmcb = tmcb; g_ovps[i].ssr = ssr; g_ovps[i].ps = *out; }   // shortcut: 64 at most (Rome 2: 4 per shadow mode), never freed
     }
     return hr;
 }
@@ -798,12 +872,13 @@ static void cap_ocean(ID3D11DeviceContext *c, unsigned slots, unsigned rslots) {
         ID3D11ShaderResourceView_Release(s[i]);
     }
 }
-static void overlay_learn(ID3D11DeviceContext *c) {   // at the ocean's draws
+static void overlay_learn(ID3D11DeviceContext *c) {   // at the scene's draws: the ocean's, the land water's
     ID3D11PixelShader *ps = NULL;
     ID3D11DeviceContext_PSGetShader(c, &ps, NULL, NULL);
     unsigned slots = 0, rslots = 0;
     for (LONG i = g_novps < 64 ? g_novps : 64; ps && i-- > 0;) if (g_ovps[i].ps == ps) slots = g_ovps[i].slots, rslots = g_ovps[i].rslots;
     if (ps) ID3D11PixelShader_Release(ps);
+    if (!(slots | rslots) && !(g_cur_mpvs && g_cur_mpvs->ocean)) return;   // not water
     if (g_capturing && g_cap && g_ocean_frame != g_frame) cap_ocean(c, slots, rslots);
     g_ocean_frame = g_frame;
     for (UINT s = 0; s < 32 && (slots | rslots) >> s; s++) {
@@ -820,7 +895,7 @@ static void overlay_learn(ID3D11DeviceContext *c) {   // at the ocean's draws
             if (g_ovres[n]) ID3D11Resource_Release(g_ovres[n]);
             g_ovres[n] = r;   // the reference is kept: a freed texture's address must not come back as another one
             g_ovkind[n] = kind;
-            g_log("DLSS: ocean %s texture found (slot t%u) - drawn into %s", kind == 1 ? "overlay" : "reflection", s,
+            g_log("DLSS: water %s texture found (slot t%u) - drawn into %s", kind == 1 ? "overlay" : "reflection", s,
                   kind == 1 ? "at full size" : "in the bottom-left corner below native size");
         } else if (r) ID3D11Resource_Release(r);
     }
@@ -1107,6 +1182,24 @@ static void mp_frame(void) {
 // capture: the shaders (DXBC checksums: the file in data.pack) and the pixel shader's textures at each draw, logged when
 // they change (what the banners and the UI read: below native size a screen-sized texture made earlier in the frame
 // still holds the shrunk scene; what the water reflection's passes read)
+// compute dispatches (depth of field's blurs: the packs' only compute shaders): what they read and write, in captures
+static void STDMETHODCALLTYPE w_disp(ID3D11DeviceContext *c, UINT x, UINT y, UINT z) { if (r2m_internal) { ORIG(disp_fn, S_DISP, c)(c, x, y, z); return; }
+    if (g_capturing && g_cap && c == g_ctx) {
+        ID3D11ComputeShader *cs = NULL;
+        ID3D11ShaderResourceView *sv[4] = {0};
+        ID3D11UnorderedAccessView *uv[2] = {0};
+        ID3D11DeviceContext_CSGetShader(c, &cs, NULL, NULL);
+        ID3D11DeviceContext_CSGetShaderResources(c, 0, 4, sv);
+        ID3D11DeviceContext_CSGetUnorderedAccessViews(c, 0, 2, uv);
+        fprintf(g_cap, "    dispatch after draw %u: cs %p, groups %u x %u x %u", g_draws, (void *)cs, x, y, z);
+        char t[160];
+        for (int i = 0; i < 4; i++) if (sv[i]) desc_of((ID3D11View *)sv[i], t, sizeof t, NULL), fprintf(g_cap, " t%d [%s]", i, t), ID3D11ShaderResourceView_Release(sv[i]);
+        for (int i = 0; i < 2; i++) if (uv[i]) desc_of((ID3D11View *)uv[i], t, sizeof t, NULL), fprintf(g_cap, " u%d [%s]", i, t), ID3D11UnorderedAccessView_Release(uv[i]);
+        fprintf(g_cap, "\n");
+        if (cs) ID3D11ComputeShader_Release(cs);
+    }
+    ORIG(disp_fn, S_DISP, c)(c, x, y, z);
+}
 static void cap_draw_srvs(ID3D11DeviceContext *c) {
     if (!g_capturing || !g_cap || c != g_ctx) return;
     static const void *last_vsh, *last_ps;
@@ -1134,6 +1227,23 @@ static void cap_draw_srvs(ID3D11DeviceContext *c) {
         fprintf(g_cap, "\n");
     }
     for (int i = 0; i < 16; i++) if (s[i]) ID3D11ShaderResourceView_Release(s[i]);
+    // and its samplers (filter, address u/v/w, mip bias, mip range: the texture mip bias below native size shows here)
+    static ID3D11SamplerState *last_smp[16];
+    ID3D11SamplerState *smp[16] = {0};
+    ID3D11DeviceContext_PSGetSamplers(c, 0, 16, smp);
+    if (memcmp(smp, last_smp, sizeof smp)) {
+        memcpy(last_smp, smp, sizeof smp);
+        fprintf(g_cap, "    draw %u samplers:", g_draws);
+        for (int i = 0; i < 16; i++) {
+            if (!smp[i]) continue;
+            D3D11_SAMPLER_DESC sd;
+            ID3D11SamplerState_GetDesc(smp[i], &sd);
+            fprintf(g_cap, " s%d [%p filter 0x%x address %u/%u/%u bias %.2f mips %.0f..%.0f]", i, (void *)smp[i], sd.Filter, sd.AddressU,
+                    sd.AddressV, sd.AddressW, sd.MipLODBias, sd.MinLOD, sd.MaxLOD);
+        }
+        fprintf(g_cap, "\n");
+    }
+    for (int i = 0; i < 16; i++) if (smp[i]) ID3D11SamplerState_Release(smp[i]);
     // the vertex shader's too (banners may test their visibility against a depth image there)
     static ID3D11ShaderResourceView *last_vs[8];
     ID3D11ShaderResourceView *vsr[8] = {0};
@@ -1213,17 +1323,28 @@ static void motion_draw(ID3D11DeviceContext *c, int indexed, UINT count, UINT in
     if (il) ID3D11InputLayout_Release(il);
 }
 #define MP_DRAW(kind, count, inst, start, base, sinst)                                                                        \
+    if (c == g_ctx && g_jit_cur && g_jit_frame != g_frame) g_jit_frame = g_frame, ps_cb_apply(c);                            \
     if (c == g_ctx && g_live_state == 1 && g_lv_scene && g_hud_frame != g_frame) {                                           \
         if (g_mp) mp_draw(c, kind, count, inst, start, base, sinst);                                                         \
         if (g_motion && g_cur_mpvs && g_cur_mpvs->type >= 0) motion_draw(c, (kind) & 1, count, inst, start, base, sinst);    \
-        if (g_cur_mpvs && g_cur_mpvs->ocean) overlay_learn(c);                                                               \
+        if ((g_cur_psf & PSF_WATER) || (g_cur_mpvs && g_cur_mpvs->ocean)) overlay_learn(c);                                  \
     }                                                                                                                        \
-    if (c == g_ctx && g_live_state == 1 && g_rt_overlay == 2) ssr_begin(c);
-static void ssr_begin(ID3D11DeviceContext *c), ssr_end(ID3D11DeviceContext *c);
-static void STDMETHODCALLTYPE w_dip(ID3D11DeviceContext *c, UINT a, UINT b, INT d) { if (r2m_internal) { ORIG(dip_fn, S_DIP, c)(c, a, b, d); return; } if (c == g_ctx) g_draws++, g_set_draws++, g_lv_draws++; cap_draw_srvs(c); MP_DRAW(1, a, 1, b, d, 0); ORIG(dip_fn, S_DIP, c)(c, a, b, d); ssr_end(c); }
-static void STDMETHODCALLTYPE w_d(ID3D11DeviceContext *c, UINT a, UINT b) { if (r2m_internal) { ORIG(d_fn, S_D, c)(c, a, b); return; } if (c == g_ctx) g_draws++, g_set_draws++, g_lv_draws++; cap_draw_srvs(c); MP_DRAW(0, a, 1, b, 0, 0); ORIG(d_fn, S_D, c)(c, a, b); ssr_end(c); }
-static void STDMETHODCALLTYPE w_dii(ID3D11DeviceContext *c, UINT a, UINT b, UINT d, INT e, UINT f) { if (r2m_internal) { ORIG(dii_fn, S_DII, c)(c, a, b, d, e, f); return; } if (c == g_ctx) g_draws++, g_set_draws++, g_lv_draws++; cap_draw_srvs(c); MP_DRAW(3, a, b, d, e, f); ORIG(dii_fn, S_DII, c)(c, a, b, d, e, f); ssr_end(c); }
-static void STDMETHODCALLTYPE w_di(ID3D11DeviceContext *c, UINT a, UINT b, UINT d, UINT e) { if (r2m_internal) { ORIG(di_fn, S_DI, c)(c, a, b, d, e); return; } if (c == g_ctx) g_draws++, g_set_draws++, g_lv_draws++; cap_draw_srvs(c); MP_DRAW(2, a, b, d, 0, e); ORIG(di_fn, S_DI, c)(c, a, b, d, e); ssr_end(c); }
+    if (c == g_ctx && g_live_state == 1 && g_rt_overlay == 2) ssr_begin(c);                                                 \
+    if (c == g_ctx && g_live_state == 1 && (g_cur_psf & (PSF_TM | PSF_CAM))) tm_begin(c), cs_begin(c);
+static void ssr_begin(ID3D11DeviceContext *c), ssr_end(ID3D11DeviceContext *c), tm_begin(ID3D11DeviceContext *c), tm_end(ID3D11DeviceContext *c);
+static void cs_begin(ID3D11DeviceContext *c), cs_end(ID3D11DeviceContext *c), ps_cb_apply(ID3D11DeviceContext *c);
+static int g_jit_cur;          // (below, with jit_apply)
+static unsigned g_jit_frame;
+// the glue's own time at the game's draws and sampler binds, every 8th frame (the 30 s report: what the checks per draw cost)
+static int g_glue_meas;
+static unsigned g_glue_frames, g_glue_draws, g_glue_sbinds;
+static LONGLONG g_glue_t, g_glue_ts;
+#define GLUE_T0 LARGE_INTEGER q0, q1; int gm = g_glue_meas && c == g_ctx; if (gm) QueryPerformanceCounter(&q0);
+#define GLUE_T1(acc) if (gm) { QueryPerformanceCounter(&q1); acc += q1.QuadPart - q0.QuadPart; }
+static void STDMETHODCALLTYPE w_dip(ID3D11DeviceContext *c, UINT a, UINT b, INT d) { if (r2m_internal) { ORIG(dip_fn, S_DIP, c)(c, a, b, d); return; } GLUE_T0 if (c == g_ctx) g_draws++, g_set_draws++, g_lv_draws++; cap_draw_srvs(c); MP_DRAW(1, a, 1, b, d, 0); GLUE_T1(g_glue_t) g_glue_draws += gm; ORIG(dip_fn, S_DIP, c)(c, a, b, d); if (gm) QueryPerformanceCounter(&q0); ssr_end(c); tm_end(c); cs_end(c); GLUE_T1(g_glue_t) }
+static void STDMETHODCALLTYPE w_d(ID3D11DeviceContext *c, UINT a, UINT b) { if (r2m_internal) { ORIG(d_fn, S_D, c)(c, a, b); return; } GLUE_T0 if (c == g_ctx) g_draws++, g_set_draws++, g_lv_draws++; cap_draw_srvs(c); MP_DRAW(0, a, 1, b, 0, 0); GLUE_T1(g_glue_t) g_glue_draws += gm; ORIG(d_fn, S_D, c)(c, a, b); if (gm) QueryPerformanceCounter(&q0); ssr_end(c); tm_end(c); cs_end(c); GLUE_T1(g_glue_t) }
+static void STDMETHODCALLTYPE w_dii(ID3D11DeviceContext *c, UINT a, UINT b, UINT d, INT e, UINT f) { if (r2m_internal) { ORIG(dii_fn, S_DII, c)(c, a, b, d, e, f); return; } GLUE_T0 if (c == g_ctx) g_draws++, g_set_draws++, g_lv_draws++; cap_draw_srvs(c); MP_DRAW(3, a, b, d, e, f); GLUE_T1(g_glue_t) g_glue_draws += gm; ORIG(dii_fn, S_DII, c)(c, a, b, d, e, f); if (gm) QueryPerformanceCounter(&q0); ssr_end(c); tm_end(c); cs_end(c); GLUE_T1(g_glue_t) }
+static void STDMETHODCALLTYPE w_di(ID3D11DeviceContext *c, UINT a, UINT b, UINT d, UINT e) { if (r2m_internal) { ORIG(di_fn, S_DI, c)(c, a, b, d, e); return; } GLUE_T0 if (c == g_ctx) g_draws++, g_set_draws++, g_lv_draws++; cap_draw_srvs(c); MP_DRAW(2, a, b, d, 0, e); GLUE_T1(g_glue_t) g_glue_draws += gm; ORIG(di_fn, S_DI, c)(c, a, b, d, e); if (gm) QueryPerformanceCounter(&q0); ssr_end(c); tm_end(c); cs_end(c); GLUE_T1(g_glue_t) }
 static void STDMETHODCALLTYPE w_vsset(ID3D11DeviceContext *c, ID3D11VertexShader *vs, ID3D11ClassInstance *const *ci, UINT n) {
     if (r2m_internal) { ORIG(vsset_fn, S_VSSET, c)(c, vs, ci, n); return; }
     if ((g_mp || g_live) && c == g_ctx && vs != g_cur_vs) { g_cur_vs = vs; g_cur_mpvs = mp_vs_of(vs); }
@@ -1239,6 +1360,8 @@ static void STDMETHODCALLTYPE w_vsset(ID3D11DeviceContext *c, ID3D11VertexShader
 // render scale, so the scene lands in the top-left render_w x render_h of each; DLSS upscales that corner and the UI is
 // drawn at full size afterwards. The game reads back the viewports it set.
 static int g_jit_on, g_scene_last;       // this frame is jittered / scaled (until the HUD-less point); the last frame had a scene
+static unsigned g_jit_frame = ~0u;       // the frame whose scene draws have been jittered (from then on pixel shaders see it)
+static int g_jit_cur;                    // the viewports applied now are jittered (set by jit_apply, taken at the next draw)
 static float g_jx, g_jy;
 static D3D11_VIEWPORT g_gvp[16], g_avp[16];   // the game's viewports as it set them; what was applied last
 static UINT g_ngvp;
@@ -1249,6 +1372,64 @@ static int screen_part(UINT tw, UINT th) {   // tw x th = screen / k for k = 1, 
     for (UINT k = 1; k <= 8; k *= 2)
         if (g_live_w % k == 0 && g_live_h % k == 0 && tw == g_live_w / k && th == g_live_h / k) return (int)k;
     return 0;
+}
+
+// The tone mapper's first step (hdr_tone_mapper.hlsl ps_downsample_image; user: campaign at Quality "almost looks like the
+// shadows get changed", 20-40 % brighter than DLAA): the HDR scene into a 128x128 target at uv = SV_Position *
+// g_render_target_recip_size (1 / 128): the whole screen-sized texture. Below native size only the render-size corner
+// holds the frame (the rest cleared black), so the black and white points it leads to came out darker and the picture
+// brighter. For a tone-mapper pixel shader (only hdr_tone_mapper.hlsl names g_render_target_recip_size) reading a
+// screen-sized t0 into a target we do not shrink, its render_target_dims_buffer is swapped for one scaled by render /
+// output size for that draw. shortcut: the size is made from the bound target (1 / its size, as the uv above needs at
+// native size), not read from the game's buffer.
+static ID3D11Buffer *g_tm_cb, *g_tm_game;
+static int g_tm_slot = -1;
+static unsigned g_tm_draws;
+static void tm_begin(ID3D11DeviceContext *c) {
+    if (!g_jit_on || g_hud_frame == g_frame || (g_rw == g_live_w && g_rh == g_live_h) || !g_rt_w || !g_rt_h || screen_part(g_rt_w, g_rt_h)) return;
+    ID3D11PixelShader *ps = NULL;
+    ID3D11DeviceContext_PSGetShader(c, &ps, NULL, NULL);
+    unsigned m = 0;
+    for (LONG i = g_novps < 64 ? g_novps : 64; ps && i-- > 0;) if (g_ovps[i].ps == ps) m = g_ovps[i].tmcb;
+    if (ps) ID3D11PixelShader_Release(ps);
+    if (!m) return;
+    ID3D11ShaderResourceView *v = NULL;
+    ID3D11DeviceContext_PSGetShaderResources(c, 0, 1, &v);
+    D3D11_TEXTURE2D_DESC d = {0};
+    if (v) {
+        ID3D11Resource *r = NULL;
+        D3D11_RESOURCE_DIMENSION dim;
+        ID3D11ShaderResourceView_GetResource(v, &r);
+        ID3D11Resource_GetType(r, &dim);
+        if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) ID3D11Texture2D_GetDesc((ID3D11Texture2D *)r, &d);
+        ID3D11Resource_Release(r);
+        ID3D11ShaderResourceView_Release(v);
+    }
+    if (d.Width != g_live_w || d.Height != g_live_h) return;   // the scene itself, not one of the small steps after it
+    unsigned slot = 0;
+    while (!(m >> slot & 1)) slot++;
+    if (slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) return;
+    if (!g_tm_cb) {
+        D3D11_BUFFER_DESC bd = {16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+        if (FAILED(ID3D11Device_CreateBuffer(g_dev, &bd, NULL, &g_tm_cb))) { g_tm_cb = NULL; return; }
+    }
+    float k[4] = {(float)g_rw / g_live_w / g_rt_w, (float)g_rh / g_live_h / g_rt_h, 0, 0};
+    r2m_internal = 1;
+    ID3D11DeviceContext_UpdateSubresource(c, (ID3D11Resource *)g_tm_cb, 0, NULL, k, 0, 0);
+    ID3D11DeviceContext_PSGetConstantBuffers(c, slot, 1, &g_tm_game);
+    ID3D11DeviceContext_PSSetConstantBuffers(c, slot, 1, &g_tm_cb);
+    r2m_internal = 0;
+    g_tm_slot = (int)slot;
+    if (!g_tm_draws++) g_log("DLSS: the tone mapper measures the render-size corner of the scene (%ux%u of %ux%u)", g_rw, g_rh, g_live_w, g_live_h);
+}
+static void tm_end(ID3D11DeviceContext *c) {   // after that draw: the game's buffer back
+    if (g_tm_slot < 0) return;
+    r2m_internal = 1;
+    ID3D11DeviceContext_PSSetConstantBuffers(c, (UINT)g_tm_slot, 1, &g_tm_game);
+    r2m_internal = 0;
+    if (g_tm_game) ID3D11Buffer_Release(g_tm_game);
+    g_tm_game = NULL;
+    g_tm_slot = -1;
 }
 
 // Pixel shaders below native size (Attila AGENT_LOG 103; Rome 2's point-light shader checked: camera_VS_PS in cb0,
@@ -1279,25 +1460,31 @@ static CamCopy *cam_copy(ID3D11Resource *r, int add) {   // r is a camera buffer
     return e;
 }
 // the camera block as the pixel shaders need it at render size rw x rh (src: the game's block, size bytes), the scene in
-// the top-left corner, or the bottom-left (bottom: the ocean's reflection)
-static void cam_patch(float *f, UINT rw, UINT rh, int bottom) {
-    float sx = (float)g_live_w / rw, sy = (float)g_live_h / rh, oy = bottom ? sy - 1 : 1 - sy;
+// the top-left corner, or the bottom-left (bottom: the ocean's reflection), drawn with the sub-pixel jitter (jx, jy) in
+// render pixels (x right, y down). A pixel the shader turns into ndc (SV_Position / screen * 2 - 1, the screen's size)
+// is, in the full view, x = sx * ndc + sx - 1 - 2 jx / rw, y = sy * ndc + (1 - sy, or sy - 1 at the bottom) + 2 jy / rh.
+// With the jitter in it, the lighting, shadows, fog and every other pass that turns pixels back into positions (Rome 2
+// is deferred) sees the geometry where the jittered viewport drew it: without it they were half a pixel off in another
+// direction each frame and DLSS blurred them (DLAA with jitter softer than without; user: "DLAA is very blurry")
+static void cam_patch(float *f, UINT rw, UINT rh, int bottom, float jx, float jy) {
+    float sx = (float)g_live_w / rw, sy = (float)g_live_h / rh;
+    float ox = sx - 1 - 2 * jx / rw, oy = (bottom ? sy - 1 : 1 - sy) + 2 * jy / rh;
     for (int m = 0; m < 2; m++) {   // inverse_projection (byte 272), inv_view_projection (336): rows r_i -> r_i * S
         float *r = f + (m ? 84 : 68);
-        for (int i = 0; i < 4; i++, r += 4) { r[3] += r[0] * (sx - 1) + r[1] * oy; r[0] *= sx; r[1] *= sy; }
+        for (int i = 0; i < 4; i++, r += 4) { r[3] += r[0] * ox + r[1] * oy; r[0] *= sx; r[1] *= sy; }
     }
     for (int m = 0; m < 2; m++) {   // projection (80), view_projection (144): rows x, y -> S^-1 * M
         float *x = f + (m ? 36 : 20), *y = x + 4, *w = x + 12;
-        for (int j = 0; j < 4; j++) { x[j] = (x[j] - (sx - 1) * w[j]) / sx; y[j] = (y[j] - oy * w[j]) / sy; }
+        for (int j = 0; j < 4; j++) { x[j] = (x[j] - ox * w[j]) / sx; y[j] = (y[j] - oy * w[j]) / sy; }
     }
 }
-static void cam_copy_write(ID3D11Resource *r, const void *src) {   // every camera block write while below native size
-    if (g_rw == g_live_w && g_rh == g_live_h) return;
+static void cam_copy_write(ID3D11Resource *r, const void *src) {   // every camera block write while below native size or jittered
+    if (g_rw == g_live_w && g_rh == g_live_h && !g_jx && !g_jy) return;
     CamCopy *e = cam_copy(r, 1);
     if (!e) return;
     float f[144];
     memcpy(f, src, e->size < sizeof f ? e->size : sizeof f);
-    cam_patch(f, g_rw, g_rh, 0);
+    cam_patch(f, g_rw, g_rh, 0, g_jx, g_jy);
     ORIG(upd_fn, S_UPD, g_ctx)(g_ctx, (ID3D11Resource *)e->ours, 0, NULL, f, 0, 0);
     e->valid = 1;
     g_ccopy_writes++;
@@ -1305,7 +1492,7 @@ static void cam_copy_write(ID3D11Resource *r, const void *src) {   // every came
     D3D11_BUFFER_DESC od = {e->size, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
     if (!e->bl && FAILED(ID3D11Device_CreateBuffer(g_dev, &od, NULL, &e->bl))) { e->bl = NULL; return; }
     memcpy(f, src, e->size < sizeof f ? e->size : sizeof f);
-    cam_patch(f, g_rw, g_rh, 1);
+    cam_patch(f, g_rw, g_rh, 1, 0, 0);   // the reflection pass is not jittered
     ORIG(upd_fn, S_UPD, g_ctx)(g_ctx, (ID3D11Resource *)e->bl, 0, NULL, f, 0, 0);
     e->bl_valid = 1;
 }
@@ -1314,9 +1501,10 @@ static int is_cam_copy(ID3D11Buffer *b) {
     return 0;
 }
 static void ps_cb_apply(ID3D11DeviceContext *c) {
-    CamCopy *e = g_ps_cb0 && g_jit_on && g_rt_overlay != 1 && (g_rw != g_live_w || g_rh != g_live_h) && screen_part(g_rt_w, g_rt_h)
+    int scaled = g_rw != g_live_w || g_rh != g_live_h;
+    CamCopy *e = g_ps_cb0 && g_jit_on && g_rt_overlay != 1 && (scaled || ((g_jx || g_jy) && g_jit_frame == g_frame)) && screen_part(g_rt_w, g_rt_h)
                      ? cam_copy((ID3D11Resource *)g_ps_cb0, 0) : NULL;
-    ID3D11Buffer *want = !e ? g_ps_cb0 : g_rt_overlay == 2 ? (e->bl_valid ? e->bl : g_ps_cb0) : e->valid ? e->ours : g_ps_cb0;
+    ID3D11Buffer *want = !e ? g_ps_cb0 : g_rt_overlay == 2 ? (scaled && e->bl_valid ? e->bl : g_ps_cb0) : e->valid ? e->ours : g_ps_cb0;
     if (want != g_ps_bound) { ORIG(pscb_fn, S_PSCB, c)(c, 0, 1, &want); g_ps_bound = want; }
 }
 static void STDMETHODCALLTYPE w_pscb(ID3D11DeviceContext *c, UINT start, UINT n, ID3D11Buffer *const *b) { if (r2m_internal) { ORIG(pscb_fn, S_PSCB, c)(c, start, n, b); return; }
@@ -1336,12 +1524,13 @@ static void STDMETHODCALLTYPE w_pscb(ID3D11DeviceContext *c, UINT start, UINT n,
 }
 
 static void jit_apply(ID3D11DeviceContext *c, int force) {
+    int k = g_jit_on && g_rt_overlay != 1 ? screen_part(g_rt_w, g_rt_h) : 0;
+    int jitter = g_jit_on && g_lv_scene && g_dss_depth && k == 1;
+    g_jit_cur = jitter && (g_jx || g_jy);
     ps_cb_apply(c);
     if (!g_ngvp) return;
     D3D11_VIEWPORT v[16];
     memcpy(v, g_gvp, g_ngvp * sizeof *v);
-    int k = g_jit_on && g_rt_overlay != 1 ? screen_part(g_rt_w, g_rt_h) : 0;
-    int jitter = g_jit_on && g_lv_scene && g_dss_depth && k == 1;
     for (UINT i = 0; k && i < g_ngvp; i++) {
         D3D11_VIEWPORT *x = &v[i];
         if (x->TopLeftX != 0 || x->TopLeftY != 0 || x->Width != (float)g_rt_w || x->Height != (float)g_rt_h) continue;
@@ -1360,6 +1549,69 @@ static void jit_apply(ID3D11DeviceContext *c, int force) {
                 g_ngvp, g_gvp[0].TopLeftX, g_gvp[0].TopLeftY, g_gvp[0].Width, g_gvp[0].Height, g_gvp[0].MinDepth, g_gvp[0].MaxDepth,
                 v[0].TopLeftX, v[0].TopLeftY, v[0].Width, v[0].Height, force ? " (game's call)" : "", g_rt_w, g_rt_h, g_jit_on, g_draws);
 }
+// Texture detail below native size (mip bias log2(render width / output width): Quality -0.58, Performance -1): the
+// game picks mip levels for the render size, so ground and unit textures came out softer than at native. NVIDIA's DLSS
+// Programming Guide 3.5 adds a further -1.0 (DLAA too); tried in game it lifted the shadows' darkness at DLAA (mid-dark
+// pixels +2.5 of 255 against native: the game's look changed; user), so the sharpening below the output recovers that
+// detail instead (DLSS_LOG 45 / 46). While the scene is drawn small, its material samplers (anisotropic or wrapping; not shadow comparison, clamped post-process
+// ones) are swapped for copies with that bias added. Only for draws into the scene's targets (screen / k): the shadow
+// maps keep the game's (campaign, Quality: the trees' alpha-tested leaves cast lighter shadows with the bias; user: "it
+// almost looks like the shadows get changed"). The game's samplers are held (AddRef) so an address is never
+// reused for another one; the copies are made again when the render size changes.
+typedef void(STDMETHODCALLTYPE *pssamp_fn)(ID3D11DeviceContext *, UINT, UINT, ID3D11SamplerState *const *);
+static struct { ID3D11SamplerState *game, *ours; } g_lod[256];
+static unsigned g_nlod, g_lod_swaps, g_lod_full;
+static float g_lod_bias;   // the bias the copies were made with
+static struct { ID3D11SamplerState *in, *out; } g_lodc[256];   // the last answers, by address (cleared with the copies)
+static int g_lod_off;      // dev: switched off from the F11 panel's Debug View row (to compare)
+static int g_jit_off;      // dev: no sub-pixel jitter (Debug View "No jitter": DLAA's own softness against misalignment)
+static int g_jtest;        // dev: what DLSS is told of the jitter (the panel's Jitter Test; the viewports keep the frame's)
+static ID3D11SamplerState *lod_sampler(ID3D11SamplerState *s, float bias) {
+    if (!s) return s;
+    if (bias != g_lod_bias) {   // a new render size: new copies
+        for (unsigned i = 0; i < g_nlod; i++) {
+            ID3D11SamplerState_Release(g_lod[i].game);
+            if (g_lod[i].ours) ID3D11SamplerState_Release(g_lod[i].ours);
+        }
+        g_nlod = 0;
+        g_lod_bias = bias;
+        memset(g_lodc, 0, sizeof g_lodc);
+    }
+    unsigned ch = ((unsigned)(UINT_PTR)s >> 4) & 255;
+    if (g_lodc[ch].in == s) return g_lodc[ch].out;
+    for (unsigned i = 0; i < g_nlod; i++) {
+        if (g_lod[i].game == s) { g_lodc[ch].in = s; return g_lodc[ch].out = g_lod[i].ours ? g_lod[i].ours : s; }
+        if (g_lod[i].ours == s) { g_lodc[ch].in = s; return g_lodc[ch].out = s; }   // our copy, read back and set again by someone saving state
+    }
+    if (g_nlod == 256) { g_lod_full++; return s; }   // shortcut: 256 game samplers at most, the rest keep their bias
+    D3D11_SAMPLER_DESC d;
+    ID3D11SamplerState_GetDesc(s, &d);
+    ID3D11SamplerState *o = NULL;
+    if (d.Filter < D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT && (d.Filter == D3D11_FILTER_ANISOTROPIC || d.AddressU == D3D11_TEXTURE_ADDRESS_WRAP)) {
+        d.MipLODBias = fmaxf(-16.0f, d.MipLODBias + bias);
+        if (FAILED(ID3D11Device_CreateSamplerState(g_dev, &d, &o))) o = NULL;
+    }
+#ifdef PROFILING
+    g_log("texture mip bias: game sampler %p filter 0x%x address %u/%u/%u bias %.2f mips %.0f..%.0f anisotropy %u - %s", (void *)s, d.Filter,
+          d.AddressU, d.AddressV, d.AddressW, o ? d.MipLODBias - bias : d.MipLODBias, d.MinLOD, d.MaxLOD, d.MaxAnisotropy, o ? "biased" : "kept");
+#endif
+    ID3D11SamplerState_AddRef(s);
+    g_lod[g_nlod].game = s;
+    g_lod[g_nlod++].ours = o;
+    return o ? o : s;
+}
+static void STDMETHODCALLTYPE w_pssamp(ID3D11DeviceContext *c, UINT start, UINT n, ID3D11SamplerState *const *s) { if (r2m_internal) { ORIG(pssamp_fn, S_PSSAMP, c)(c, start, n, s); return; }
+    if (g_live_state != 1 || c != g_ctx || !s || !n || n > D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT || !g_frame_scaled || g_hud_frame == g_frame ||
+        g_rw >= g_live_w || g_lod_off || !screen_part(g_rt_w, g_rt_h)) { ORIG(pssamp_fn, S_PSSAMP, c)(c, start, n, s); return; }
+    GLUE_T0
+    float bias = log2f((float)g_rw / g_live_w);
+    ID3D11SamplerState *b[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
+    for (UINT i = 0; i < n; i++) g_lod_swaps += (b[i] = lod_sampler(s[i], bias)) != s[i];
+    GLUE_T1(g_glue_ts)
+    g_glue_sbinds += gm;
+    ORIG(pssamp_fn, S_PSSAMP, c)(c, start, n, b);
+}
+
 static void STDMETHODCALLTYPE w_rsvp(ID3D11DeviceContext *c, UINT n, const D3D11_VIEWPORT *v) { if (r2m_internal) { ORIG(rsvp_fn, S_RSVP, c)(c, n, v); return; }
     if (g_live_state != 1 || c != g_ctx || n > 16 || !v) { ORIG(rsvp_fn, S_RSVP, c)(c, n, v); return; }
     g_ngvp = n;
@@ -1389,6 +1641,15 @@ static void jit_frame_start(void) {
     g_frame_scaled = 0;
     if (!g_sr) return;
     fgb_jitter(&g_jx, &g_jy);
+    if (g_jit_off) { g_jx = g_jy = 0; fgb_set_jitter(0, 0); }
+    else if (g_jtest) {
+        float tx = g_jx, ty = g_jy;
+        if (g_jtest == 1) tx = ty = 0;
+        else if (g_jtest == 2) tx = -tx;
+        else if (g_jtest == 3) ty = -ty;
+        else fgb_jitter_at(g_jtest == 4 ? -1 : 1, &tx, &ty);
+        fgb_set_jitter(tx, ty);
+    }
     // loading screens and movies have no scene (no HUD-less point): never shrunk, or they would show at the render size
     // (Attila 6.4); a scene frame that was not (the first after loading) goes out at native size without DLSS
     g_jit_on = g_scene_last && (g_jx != 0 || g_jy != 0 || g_rw != g_live_w || g_rh != g_live_h);
@@ -1467,6 +1728,31 @@ static ID3D11Texture2D *ssr_tex(int i, DXGI_FORMAT res, DXGI_FORMAT view, UINT w
     }
     return g_crop[i];
 }
+// the top-left w x h of a depth view into g_crop[1] (R32_FLOAT), by a pass in a device context state of our own
+static int crop_depth(ID3D11DeviceContext *c, ID3D11ShaderResourceView *src, UINT w, UINT h) {
+    if (g_ssr_bad || (!g_ssr_state && !ssr_init())) { g_ssr_bad = 1; return 0; }
+    if (!ssr_tex(1, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, w, h)) return 0;
+    r2m_internal = 1;
+    ID3DDeviceContextState *game = NULL;
+    ID3D11DeviceContext1_SwapDeviceContextState(g_ssr_ctx1, g_ssr_state, &game);
+    D3D11_VIEWPORT vp = {0, 0, (float)w, (float)h, 0, 1};
+    ID3D11DeviceContext_OMSetRenderTargets(c, 1, &g_crop_rtv, NULL);
+    ID3D11DeviceContext_RSSetViewports(c, 1, &vp);
+    ID3D11DeviceContext_IASetInputLayout(c, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(c, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(c, g_ssr_vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(c, g_ssr_ps, NULL, 0);
+    ID3D11DeviceContext_PSSetShaderResources(c, 0, 1, &src);
+    ID3D11DeviceContext_Draw(c, 3, 0);
+    ID3D11ShaderResourceView *none = NULL;
+    ID3D11DeviceContext_PSSetShaderResources(c, 0, 1, &none);
+    ID3D11DeviceContext_OMSetRenderTargets(c, 0, NULL, NULL);
+    ID3D11DeviceContext1_SwapDeviceContextState(g_ssr_ctx1, game, NULL);
+    if (game) ID3DDeviceContextState_Release(game);
+    r2m_internal = 0;
+    hook_context();   // the swap puts d3d11's own entries back (bridgelive_test: the next target change went unseen)
+    return 1;
+}
 static void ssr_begin(ID3D11DeviceContext *c) {   // before each draw into the reflection
     if (g_ssr_bad || !g_jit_on || (g_rw == g_live_w && g_rh == g_live_h)) return;
     ID3D11PixelShader *ps = NULL;
@@ -1475,7 +1761,6 @@ static void ssr_begin(ID3D11DeviceContext *c) {   // before each draw into the r
     for (LONG i = g_novps < 64 ? g_novps : 64; ps && i-- > 0;) if (g_ovps[i].ps == ps) ssr = g_ovps[i].ssr;
     if (ps) ID3D11PixelShader_Release(ps);
     if (!ssr) return;
-    if (!g_ssr_state && !ssr_init()) { g_ssr_bad = 1; return; }
     ID3D11DeviceContext_PSGetShaderResources(c, 0, 2, g_ssr_game);
     ID3D11Resource *r[2] = {NULL, NULL};
     D3D11_TEXTURE2D_DESC d[2];
@@ -1490,29 +1775,9 @@ static void ssr_begin(ID3D11DeviceContext *c) {   // before each draw into the r
     }
     // the corner: the viewport shrink's size (render size / k), at least the scene copy's and the depth's
     ID3D11Texture2D *t0 = k[0] ? ssr_tex(0, d[0].Format, vd[0].Format, (g_rw + k[0] - 1) / k[0], (g_rh + k[0] - 1) / k[0]) : NULL;
-    ID3D11Texture2D *t1 = k[1] && d[1].SampleDesc.Count == 1 ? ssr_tex(1, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, (g_rw + k[1] - 1) / k[1], (g_rh + k[1] - 1) / k[1]) : NULL;
-    if (t0 && t1) {
+    if (t0 && k[1] && d[1].SampleDesc.Count == 1 && crop_depth(c, g_ssr_game[1], (g_rw + k[1] - 1) / k[1], (g_rh + k[1] - 1) / k[1])) {
         D3D11_BOX box = {0, 0, 0, (g_rw + k[0] - 1) / k[0], (g_rh + k[0] - 1) / k[0], 1};
         ID3D11DeviceContext_CopySubresourceRegion(c, (ID3D11Resource *)t0, 0, 0, 0, 0, r[0], 0, &box);
-        r2m_internal = 1;
-        ID3DDeviceContextState *game = NULL;
-        ID3D11DeviceContext1_SwapDeviceContextState(g_ssr_ctx1, g_ssr_state, &game);
-        D3D11_VIEWPORT vp = {0, 0, (float)((g_rw + k[1] - 1) / k[1]), (float)((g_rh + k[1] - 1) / k[1]), 0, 1};
-        ID3D11DeviceContext_OMSetRenderTargets(c, 1, &g_crop_rtv, NULL);
-        ID3D11DeviceContext_RSSetViewports(c, 1, &vp);
-        ID3D11DeviceContext_IASetInputLayout(c, NULL);
-        ID3D11DeviceContext_IASetPrimitiveTopology(c, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        ID3D11DeviceContext_VSSetShader(c, g_ssr_vs, NULL, 0);
-        ID3D11DeviceContext_PSSetShader(c, g_ssr_ps, NULL, 0);
-        ID3D11DeviceContext_PSSetShaderResources(c, 0, 1, &g_ssr_game[1]);
-        ID3D11DeviceContext_Draw(c, 3, 0);
-        ID3D11ShaderResourceView *none = NULL;
-        ID3D11DeviceContext_PSSetShaderResources(c, 0, 1, &none);
-        ID3D11DeviceContext_OMSetRenderTargets(c, 0, NULL, NULL);
-        ID3D11DeviceContext1_SwapDeviceContextState(g_ssr_ctx1, game, NULL);
-        if (game) ID3DDeviceContextState_Release(game);
-        r2m_internal = 0;
-        hook_context();   // the swap puts d3d11's own entries back (bridgelive_test: the next target change went unseen)
         ID3D11DeviceContext_PSSetShaderResources(c, 0, 2, g_crop_srv);
         if (!g_ssr_draws++) g_log("DLSS: water reflection's screen-space pass reads the render-size corner of the scene (%ux%u) and its depth", box.right, box.bottom);
         g_ssr_on = 1;
@@ -1527,6 +1792,87 @@ static void ssr_end(ID3D11DeviceContext *c) {   // after it: the game's views ba
     hook_context();   // d3d11 put its entries back once more at the first call after the swap (the draw)
     ID3D11DeviceContext_PSSetShaderResources(c, 0, 2, g_ssr_game);
     for (int i = 0; i < 2; i++) if (g_ssr_game[i]) ID3D11ShaderResourceView_Release(g_ssr_game[i]), g_ssr_game[i] = NULL;
+}
+
+// Below native size, at the draws of a pixel shader with its camera block outside slot 0 (g_camps): the patched copy in
+// that slot for the draw. The terrain's virtual-texture page touch (virtualtexture.hlsl ps30_page_touch, into a quarter-
+// size target the CPU scans for the texture pages to load, tilescan.c) instead runs as at native size: uv = (SV_Position
+// + offset) * g_page_touch_constants.xy over the whole target, depth there, world position by the camera's inverse
+// view-projection, then the page and its level from that position's screen derivatives. Shrunk with the scene it got the
+// game's camera (cb1, not patched: the requests covered the top-left 2/3 of the view) and derivatives 1.5x too large at
+// Quality (one texture level coarser); drawn over the whole target from a render-size crop of the depth, its own uv and
+// the game's camera see the full view at native density.
+static ID3D11Buffer *g_cs_game;
+static int g_cs_slot = -1, g_pt_on;
+static ID3D11ShaderResourceView *g_pt_game;
+static D3D11_VIEWPORT g_pt_vp[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+static UINT g_pt_nvp;
+static unsigned g_cs_draws, g_pt_draws;
+static void pt_begin(ID3D11DeviceContext *c) {
+    ID3D11ShaderResourceView *v = NULL;
+    ID3D11DeviceContext_PSGetShaderResources(c, 0, 1, &v);
+    if (!v) return;
+    ID3D11Resource *r = NULL;
+    D3D11_RESOURCE_DIMENSION dim;
+    D3D11_TEXTURE2D_DESC d = {0};
+    ID3D11ShaderResourceView_GetResource(v, &r);
+    ID3D11Resource_GetType(r, &dim);
+    if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) ID3D11Texture2D_GetDesc((ID3D11Texture2D *)r, &d);
+    ID3D11Resource_Release(r);
+    if (d.Width != g_live_w || d.Height != g_live_h || d.SampleDesc.Count != 1 || !crop_depth(c, v, g_rw, g_rh)) { ID3D11ShaderResourceView_Release(v); return; }
+    g_pt_game = v;
+    ID3D11DeviceContext_PSSetShaderResources(c, 0, 1, &g_crop_srv[1]);
+    D3D11_VIEWPORT full = {0, 0, (float)g_rt_w, (float)g_rt_h, 0, 1};
+    g_pt_nvp = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    r2m_internal = 1;
+    ID3D11DeviceContext_RSGetViewports(c, &g_pt_nvp, g_pt_vp);
+    ID3D11DeviceContext_RSSetViewports(c, 1, &full);
+    r2m_internal = 0;
+    g_pt_on = 1;
+    if (!g_pt_draws++) g_log("DLSS: the terrain's texture page requests are made over the whole view at native density (%ux%u from %ux%u)",
+                             g_rt_w, g_rt_h, g_rw, g_rh);
+}
+static void cs_begin(ID3D11DeviceContext *c) {
+    int scaled = g_rw != g_live_w || g_rh != g_live_h;
+    if (!g_jit_on || g_hud_frame == g_frame || (!scaled && (!(g_jx || g_jy) || g_jit_frame != g_frame)) || g_rt_overlay == 1 || !g_rt_w ||
+        !screen_part(g_rt_w, g_rt_h)) return;
+    ID3D11PixelShader *ps = NULL;
+    ID3D11DeviceContext_PSGetShader(c, &ps, NULL, NULL);
+    if (ps) ID3D11PixelShader_Release(ps);
+    unsigned slot;
+    int pt;
+    if (!ps || !camps_find(ps, &slot, &pt) || slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) return;
+    if (pt) { if (scaled) pt_begin(c); return; }
+    ID3D11Buffer *b = NULL;
+    ID3D11DeviceContext_PSGetConstantBuffers(c, slot, 1, &b);
+    CamCopy *e = b ? cam_copy((ID3D11Resource *)b, 0) : NULL;
+    ID3D11Buffer *want = !e ? NULL : g_rt_overlay == 2 ? (scaled && e->bl_valid ? e->bl : NULL) : e->valid ? e->ours : NULL;
+    if (!want) { if (b) ID3D11Buffer_Release(b); return; }
+    r2m_internal = 1;
+    ID3D11DeviceContext_PSSetConstantBuffers(c, slot, 1, &want);
+    r2m_internal = 0;
+    g_cs_game = b;
+    g_cs_slot = (int)slot;
+    if (!g_cs_draws++) g_log("DLSS: a pixel shader with its camera block in slot %u gets the patched copy below native size", slot);
+}
+static void cs_end(ID3D11DeviceContext *c) {   // after that draw: the game's camera, views and viewports back
+    if (g_pt_on) {
+        g_pt_on = 0;
+        hook_context();   // d3d11 put its entries back once more at the first call after the depth pass's swap (the draw)
+        r2m_internal = 1;
+        ID3D11DeviceContext_RSSetViewports(c, g_pt_nvp, g_pt_vp);
+        r2m_internal = 0;
+        ID3D11DeviceContext_PSSetShaderResources(c, 0, 1, &g_pt_game);
+        ID3D11ShaderResourceView_Release(g_pt_game);
+        g_pt_game = NULL;
+    }
+    if (g_cs_slot < 0) return;
+    r2m_internal = 1;
+    ID3D11DeviceContext_PSSetConstantBuffers(c, (UINT)g_cs_slot, 1, &g_cs_game);
+    r2m_internal = 0;
+    if (g_cs_game) ID3D11Buffer_Release(g_cs_game);
+    g_cs_game = NULL;
+    g_cs_slot = -1;
 }
 
 // the F11 panel's switches (from the next frame; not saved: the next start takes fgbridge_on.txt again)
@@ -1548,6 +1894,15 @@ static const char *const FG_KEYS[4] = {"off", "2x", "3x", "4x"};
 static const char *const CAP_KEYS[5] = {"off", "auto", "60", "90", "120"};
 static const unsigned CAP_FPS[5] = {0, 0, 60, 90, 120};
 static int g_fcap = 1;   // the frame cap choice
+// the DLSS preset (NVIDIA's model): default (NVIDIA's pick per mode: K for DLAA / Quality / Balanced, M Performance,
+// L Ultra Performance) or one for every mode; handed to the helper as NVIDIA's preset number
+static const char *const PRESET_KEYS[5] = {"default", "j", "k", "l", "m"};
+static const unsigned PRESET_NGX[5] = {0, 10, 11, 12, 13};
+static int g_preset;
+// sharpening of the DLSS output (fgbridge.c: AMD's RCAS): off, or RCAS's con at 1.25 / 0.6 / 0.2 stops (AMD's default 0.2)
+static const char *const SHARP_KEYS[4] = {"off", "low", "medium", "high"};
+static const float SHARP_CON[4] = {0, 0.42f, 0.66f, 0.87f};
+static int g_sharp = 1;
 static void settings_save(void) {
     if (g_settings[0]) {
         FILE *f = _wfopen(g_settings, L"w");
@@ -1558,20 +1913,27 @@ static void settings_save(void) {
                    "# motion_vectors: camera_only, per_object (cleaner frame generation on moving soldiers and horses)\n"
                    "# frame_cap: off, auto, 60, 90, 120 (rendered frames; auto: the screen's refresh rate / the frames shown per\n"
                    "#            rendered frame with frame generation on, e.g. 120 at 2x on a 240 Hz screen)\n"
+                   "# dlss_preset: default, j, k, l, m (NVIDIA's DLSS model; default: K for DLAA / Quality / Balanced, M for\n"
+                   "#              Performance, L for Ultra Performance)\n"
+                   "# sharpness: off, low, medium, high (sharpening of the DLSS output, as games with DLSS built in have)\n"
                    "# addon: on, off (off: the add-on does nothing at all from the next game start; set on again to use it)\n"
-                   "super_resolution=%s\nframe_generation=%s\nmotion_vectors=%s\nframe_cap=%s\naddon=on\nversion=2\n",
+                   "super_resolution=%s\nframe_generation=%s\nmotion_vectors=%s\nframe_cap=%s\ndlss_preset=%s\nsharpness=%s\naddon=on\nversion=2\n",
                 SR_KEYS[g_sr >= 0 && g_sr < 6 ? g_sr : 2], FG_KEYS[g_fg < 4 ? g_fg : 0], g_motion_on ? "per_object" : "camera_only",
-                CAP_KEYS[g_fcap >= 0 && g_fcap < 5 ? g_fcap : 1]);
+                CAP_KEYS[g_fcap >= 0 && g_fcap < 5 ? g_fcap : 1], PRESET_KEYS[g_preset >= 0 && g_preset < 5 ? g_preset : 0],
+                SHARP_KEYS[g_sharp >= 0 && g_sharp < 4 ? g_sharp : 1]);
         fclose(f);
         return;
     }
-    // dev: line 4 = words (super resolution, "motion", "cap<key>" unless auto, the test options kept)
+    // dev: line 4 = words (super resolution, "motion", "cap<key>" unless auto, "preset<key>" unless default, "sharp<key>" unless
+    // low, the test options kept)
     static const char *const words[6] = {"", "dlaa", "quality", "balanced", "perf", "ultraperf"};
     char l4[128] = {0};
-    const char *w[4] = {words[g_sr], g_motion_on ? "motion" : "", "", g_on_test};
-    char capw[16] = {0};
+    const char *w[6] = {words[g_sr], g_motion_on ? "motion" : "", "", "", "", g_on_test};
+    char capw[16] = {0}, prw[16] = {0}, shw[16] = {0};
     if (g_fcap != 1) { snprintf(capw, sizeof capw, "cap%s", CAP_KEYS[g_fcap]); w[2] = capw; }
-    for (int i = 0; i < 4; i++)
+    if (g_preset) { snprintf(prw, sizeof prw, "preset%s", PRESET_KEYS[g_preset]); w[3] = prw; }
+    if (g_sharp != 1) { snprintf(shw, sizeof shw, "sharp%s", SHARP_KEYS[g_sharp]); w[4] = shw; }
+    for (int i = 0; i < 6; i++)
         if (w[i][0]) snprintf(l4 + strlen(l4), sizeof l4 - strlen(l4), "%s%s", l4[0] ? " " : "", w[i]);
     wchar_t p[MAX_PATH];
     _snwprintf(p, MAX_PATH, L"%ls\\fgbridge_on.txt", g_dir);
@@ -1593,6 +1955,18 @@ static void panel_sr(int mode) {
     g_log("F11 panel: super resolution %s, render %ux%u", SR_NAMES[g_sr], g_rw, g_rh);
     settings_save();
 }
+static void panel_sharp(int choice) {
+    g_sharp = choice >= 0 && choice < 4 ? choice : 1;
+    fgb_set_sharpness(SHARP_CON[g_sharp]);
+    g_log("F11 panel: sharpness %s", SHARP_KEYS[g_sharp]);
+    settings_save();
+}
+static void panel_preset(int choice) {
+    g_preset = choice >= 0 && choice < 5 ? choice : 0;
+    fgb_set_preset(PRESET_NGX[g_preset]);
+    g_log("F11 panel: DLSS preset %s", PRESET_KEYS[g_preset]);
+    settings_save();
+}
 static void panel_motion(int on) {
     g_motion_on = on;
     r2m_set_enabled(on);
@@ -1600,14 +1974,23 @@ static void panel_motion(int on) {
     settings_save();
 }
 #ifdef PROFILING   // the debug view: dev builds only (release: g_view stays 0, no panel row)
-static void panel_view(int on) {   // for this session only (a debug aid, not saved)
-    g_view = on;
-    r2m_set_view(on);
-    g_log("F11 panel: soldiers' motion view %s", on ? "on" : "off");
+static void panel_view(int v) {   // for this session only (a debug aid, not saved): 0 off, 1 no texture mip bias, 2 no jitter, 3 soldiers' motion
+    g_view = v == 3;
+    g_lod_off = v == 1;
+    g_jit_off = v == 2;
+    r2m_set_view(g_view);
+    g_log("F11 panel: debug view %s", v == 3 ? "soldiers' motion" : v == 2 ? "no jitter" : v ? "no texture mip bias" : "off");
 }
 #define PANEL_VIEW panel_view
+static void panel_jtest(int m) {   // for this session only (a debug aid, not saved)
+    static const char *const names[6] = {"normal", "tell 0", "flip x", "flip y", "previous frame's", "next frame's"};
+    g_jtest = m >= 0 && m < 6 ? m : 0;
+    g_log("F11 panel: jitter test %s", names[g_jtest]);
+}
+#define PANEL_JTEST panel_jtest
 #else
 #define PANEL_VIEW NULL
+#define PANEL_JTEST NULL
 #endif
 // fgbridge.c's motion callback (after its camera-motion pass, before the HUD-less inputs go out): the animated models
 // again, with this frame's main camera, through the scene's viewport (render size, jitter offset)
@@ -1705,10 +2088,11 @@ static void hook_context(void) {
     static const unsigned idx[NSLOT] = {SLOT(OMSetRenderTargets), SLOT(OMSetRenderTargetsAndUnorderedAccessViews), SLOT(VSSetConstantBuffers),
                                         SLOT(ClearRenderTargetView), SLOT(ClearDepthStencilView), SLOT(Map), SLOT(Unmap),
                                         SLOT(UpdateSubresource), SLOT(DrawIndexed), SLOT(Draw), SLOT(DrawIndexedInstanced), SLOT(DrawInstanced),
-                                        SLOT(RSSetViewports), SLOT(RSGetViewports), SLOT(OMSetDepthStencilState), SLOT(PSSetConstantBuffers), SLOT(VSSetShader)};
+                                        SLOT(RSSetViewports), SLOT(RSGetViewports), SLOT(OMSetDepthStencilState), SLOT(PSSetConstantBuffers), SLOT(VSSetShader),
+                                        SLOT(PSSetSamplers), SLOT(Dispatch), SLOT(PSSetShader)};
     void *const fn[NSLOT] = {(void *)w_omrt, (void *)w_omrtuav, (void *)w_vscb, (void *)w_crtv, (void *)w_cdsv, (void *)w_map,
                              (void *)w_unmap, (void *)w_upd, (void *)w_dip, (void *)w_d, (void *)w_dii, (void *)w_di,
-                             (void *)w_rsvp, (void *)w_rsgetvp, (void *)w_omdss, (void *)w_pscb, (void *)w_vsset};
+                             (void *)w_rsvp, (void *)w_rsgetvp, (void *)w_omdss, (void *)w_pscb, (void *)w_vsset, (void *)w_pssamp, (void *)w_disp, (void *)w_psset};
     // This runs at every target change and constant-buffer bind (thousands per frame in battle), so no system calls on
     // the way: d3d11's address range is read once, and a table in writable memory (the context's table is a heap copy
     // that d3d11 itself rewrites) is written directly. (Run 2: the game crawled zoomed in on moving units; guess: the
@@ -1784,7 +2168,12 @@ static void bp_report(void) {
               g_jit_frames, g_jit_vp, sf, sa, sm, st);
         g_log("  super resolution %s, render %ux%u: native frames %u, camera copies for pixel shaders written %u", SR_NAMES[g_sr], g_rw,
               g_rh, g_br_native, g_ccopy_writes);
+        unsigned nb = 0;
+        for (unsigned i = 0; i < g_nlod; i++) nb += g_lod[i].ours != NULL;
+        g_log("  texture mip bias %.2f: %u of %u game samplers biased, %u sampler binds swapped%s", g_lod_bias, nb, g_nlod, g_lod_swaps,
+              g_lod_full ? " (sampler table full)" : "");
         g_ccopy_writes = 0;
+        g_lod_swaps = 0;
         g_jit_frames = g_jit_vp = 0;
     }
     if (g_live_state == 1) {   // this period only
@@ -1809,6 +2198,20 @@ static void bp_report(void) {
               g_t_map_max * ms, g_n_upd / n, g_t_upd * ms / n, g_t_upd_max * ms, g_t_frame_max * ms);
         g_t_map = g_t_map_max = g_t_upd = g_t_upd_max = g_t_frame_max = 0;
         g_n_map = g_n_upd = g_n_frames = 0;
+        double gf = g_glue_frames ? g_glue_frames : 1;
+        static double empty;   // an empty measured span (the timer's own cost): taken off, 2 spans a draw, 1 a sampler bind
+        if (!empty) {
+            LARGE_INTEGER a, b;
+            LONGLONG sum = 0;
+            for (int i = 0; i < 20000; i++) { QueryPerformanceCounter(&a); QueryPerformanceCounter(&b); sum += b.QuadPart - a.QuadPart; }
+            empty = sum / 20000.0;
+        }
+        double td = g_glue_t - 2 * empty * g_glue_draws, ts = g_glue_ts - empty * g_glue_sbinds;
+        g_log("  last 30 s, the glue's own work: %.3f ms per frame at the game's draws (%.0f draws), %.3f ms at sampler binds (every 8th "
+              "frame measured, the timer's own %.0f ns a span taken off)", (td > 0 ? td : 0) * ms / gf, g_glue_draws / gf,
+              (ts > 0 ? ts : 0) * ms / gf, empty * ms * 1e6);
+        g_glue_t = g_glue_ts = 0;
+        g_glue_frames = g_glue_draws = g_glue_sbinds = 0;
     }
     LARGE_INTEGER qf;
     QueryPerformanceFrequency(&qf);
@@ -1832,6 +2235,8 @@ static void bp_report(void) {
 // once per Present: ends a capture, arms / starts the next one
 static void bp_frame(void) {
     g_frame++;
+    g_glue_meas = (g_frame & 7) == 0;
+    g_glue_frames += g_glue_meas;
     if (g_capturing) {
         g_capturing = 0;
         fprintf(g_cap, "== end of captured frame: %u draws, %u target changes\n", g_draws, g_sets);
@@ -2106,6 +2511,11 @@ static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXG
             }
             g_out_hwnd = d->OutputWindow;
             sr_set(g_sr);   // DLAA / presets: the render size and DLSS (off: native, no DLSS)
+            fgb_set_preset(PRESET_NGX[g_preset]);
+            fgb_set_sharpness(SHARP_CON[g_sharp]);
+            if (!fgb_helper_has_presets())   // the engine fix updated, the add-on not (or a hand install of an older one)
+                g_log("DLSS add-on: its helper is older than this engine fix (add-on version 1) - the DLSS preset choice needs "
+                      "add-on version 2: update the add-on (Workshop: run its install.bat again; elsewhere: copy its FrameBridge folder)");
             if (g_fg > fgb_fg_max()) g_fg = fgb_fg_max();   // NVIDIA's rules for this GPU (fgb_start logged it)
             g_refresh = refresh_hz(d->OutputWindow);   // the frame cap's Auto (the screen the game window is on)
             cap_apply();
@@ -2114,8 +2524,13 @@ static HRESULT STDMETHODCALLTYPE w_create_sc(IDXGIFactory *f, IUnknown *dev, DXG
             if (no_fg) g_log("motion pass: off - this GPU has no frame generation, which per-object motion is for");
             g_motion = no_fg ? 0 : r2m_init(g_dev, g_ctx, fgb_mv_texture(), g_log);
             if (g_motion) { fgb_set_motion(motion_cb); r2m_set_enabled(g_motion_on); }
-            FgpApply ap = {panel_sr, panel_fg, panel_motion, PANEL_VIEW, panel_cap};
-            if (fgp_init(g_dev, g_ctx, g_live_w, g_live_h, d->BufferDesc.Format, g_sr, (int)g_fg, g_motion ? g_motion_on : no_fg ? -2 : -1, ap)) fgp_set_sr_choices(6);
+            FgpApply ap = {panel_sr, panel_fg, panel_motion, PANEL_VIEW, panel_cap, panel_preset, PANEL_JTEST, panel_sharp};
+            if (fgp_init(g_dev, g_ctx, g_live_w, g_live_h, d->BufferDesc.Format, g_sr, (int)g_fg, g_motion ? g_motion_on : no_fg ? -2 : -1, ap)) {
+                fgp_set_sr_choices(6);
+                fgp_set_preset(g_preset);
+                fgp_set_sharp(g_sharp);
+                fgp_set_presets_available(fgb_helper_has_presets());
+            }
             else g_log("frame bridge: F11 panel not available (back buffer format %u)", d->BufferDesc.Format);
         } else if (hid) DestroyWindow(hid);
     }
@@ -2223,28 +2638,6 @@ static FARPROC WINAPI w_gpa(HMODULE m, LPCSTR name) {
     return f;
 }
 
-static void *iat_hook(HMODULE m, const char *dll, const char *name, void *to) {
-    unsigned char *b = (unsigned char *)m;
-    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(b + ((IMAGE_DOS_HEADER *)m)->e_lfanew);
-    IMAGE_DATA_DIRECTORY *dd = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (!dd->VirtualAddress) return NULL;
-    for (IMAGE_IMPORT_DESCRIPTOR *d = (IMAGE_IMPORT_DESCRIPTOR *)(b + dd->VirtualAddress); d->Name; d++) {
-        if (_stricmp((char *)(b + d->Name), dll) != 0 || !d->OriginalFirstThunk) continue;
-        IMAGE_THUNK_DATA *names = (IMAGE_THUNK_DATA *)(b + d->OriginalFirstThunk), *iat = (IMAGE_THUNK_DATA *)(b + d->FirstThunk);
-        for (; names->u1.AddressOfData; names++, iat++) {
-            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
-            if (strcmp((char *)((IMAGE_IMPORT_BY_NAME *)(b + names->u1.AddressOfData))->Name, name) != 0) continue;
-            void *old = (void *)iat->u1.Function;
-            DWORD prot;
-            if (!old || !VirtualProtect(&iat->u1.Function, sizeof(void *), PAGE_READWRITE, &prot)) return NULL;
-            iat->u1.Function = (DWORD_PTR)to;
-            VirtualProtect(&iat->u1.Function, sizeof(void *), prot, &prot);
-            return old;
-        }
-    }
-    return NULL;
-}
-
 static int has_word(const char *line, const char *w) {   // w as a whole space-separated word of line
     size_t n = strlen(w);
     for (const char *p = strstr(line, w); p; p = strstr(p + 1, w))
@@ -2275,7 +2668,7 @@ int install_bridgeprobe(HMODULE m, const wchar_t *dir, void (*log)(const char *f
         wcscpy(g_sl, addon);
         wcscpy(g_logdir, addon);
         _snwprintf(g_settings, MAX_PATH, L"%ls\\settings.txt", addon);
-        char text[1024] = {0};
+        char text[2048] = {0};
         FILE *sf = _wfopen(g_settings, L"r");
         if (sf) { fread(text, 1, sizeof text - 1, sf); fclose(sf); }
         static const char *const MV_KEYS[2] = {"camera_only", "per_object"};
@@ -2283,10 +2676,12 @@ int install_bridgeprobe(HMODULE m, const wchar_t *dir, void (*log)(const char *f
         g_fg = (unsigned)settings_value(text, "frame_generation=", FG_KEYS, 4, 1);   // default 2x (limited to the GPU later)
         g_motion_on = settings_value(text, "motion_vectors=", MV_KEYS, 2, 0);            // default camera only
         g_fcap = settings_value(text, "frame_cap=", CAP_KEYS, 5, 1);                       // default auto
+        g_preset = settings_value(text, "dlss_preset=", PRESET_KEYS, 5, 0);                // default: NVIDIA's per mode
+        g_sharp = settings_value(text, "sharpness=", SHARP_KEYS, 4, 1);                     // default low
         g_live = 1;
         g_dev_di8_created = fgp_di8_created;   // the panel hides the game's mouse buttons while the cursor is over it
-        log("DLSS add-on found: super resolution %s, frame generation %s, motion vectors %s, frame cap %s (%ls)", SR_KEYS[g_sr], FG_KEYS[g_fg],
-            MV_KEYS[g_motion_on], CAP_KEYS[g_fcap], sf ? L"settings.txt" : L"defaults");
+        log("DLSS add-on found: super resolution %s, frame generation %s, motion vectors %s, frame cap %s, preset %s, sharpness %s (%ls)", SR_KEYS[g_sr],
+            FG_KEYS[g_fg], MV_KEYS[g_motion_on], CAP_KEYS[g_fcap], PRESET_KEYS[g_preset], SHARP_KEYS[g_sharp], sf ? L"settings.txt" : L"defaults");
         if (!sf) settings_save();   // the file to edit, with its comments, from the first start on
     }
     if (f) {   // helper64.exe path, Streamline dir, frames to generate (0..3), options ("fakeamd": treat the GPU as not NVIDIA)
@@ -2309,6 +2704,16 @@ int install_bridgeprobe(HMODULE m, const wchar_t *dir, void (*log)(const char *f
             char t[16];
             snprintf(t, sizeof t, "cap%s", CAP_KEYS[k]);
             if (k != 1 && has_word(l[3], t)) g_fcap = k;
+        }
+        for (int k = 0; k < 4; k++) {   // sharpoff / sharpmedium / sharphigh; none: low
+            char t[16];
+            snprintf(t, sizeof t, "sharp%s", SHARP_KEYS[k]);
+            if (k != 1 && has_word(l[3], t)) g_sharp = k;
+        }
+        for (int k = 1; k < 5; k++) {   // presetj / presetk / presetl / presetm; none: default
+            char t[16];
+            snprintf(t, sizeof t, "preset%s", PRESET_KEYS[k]);
+            if (has_word(l[3], t)) g_preset = k;
         }
         if (g_live) g_dev_di8_created = fgp_di8_created;   // the panel hides the game's mouse buttons while the cursor is over it
         log("frame bridge %s: helper %s, Streamline %s, frame generation %ux, super resolution %s", g_live ? "armed" : "NOT armed (bad fgbridge_on.txt)",

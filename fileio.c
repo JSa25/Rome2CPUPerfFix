@@ -13,6 +13,7 @@
 #include <windows.h>
 #include <string.h>
 #include <wchar.h>
+#include "iathook.h"
 
 #define BUFSZ 65536
 #define MAXH 64
@@ -125,6 +126,7 @@ HANDLE WINAPI fio_CreateFileW(LPCWSTR name, DWORD access, DWORD share, LPSECURIT
         InterlockedIncrement(&g_fio_unbuffered_packs);
     }
     HANDLE h = r_CreateFileW(name, access, share, sa, disp, flags, tmpl);
+    if (h != INVALID_HANDLE_VALUE && find(h)) untrack(h, 0);  // closed past our CloseHandle hook: Windows reused the value
     if (h != INVALID_HANDLE_VALUE && name && g_userdir_len && _wcsnicmp(name, g_userdir, g_userdir_len) == 0 &&
         !(access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA)) &&
         !(flags & (FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING)) && GetFileType(h) == FILE_TYPE_DISK)
@@ -299,29 +301,6 @@ BOOL WINAPI fio_DuplicateHandle(HANDLE sp, HANDLE src, HANDLE tp, LPHANDLE out, 
     return r_DuplicateHandle(sp, src, tp, out, access, inherit, opts);
 }
 
-// Points the IAT entry of `name` (imported from KERNEL32.dll by module m) at `to`; returns the old target or NULL.
-static void *iat_hook(HMODULE m, const char *name, void *to) {
-    unsigned char *b = (unsigned char *)m;
-    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(b + ((IMAGE_DOS_HEADER *)b)->e_lfanew);
-    IMAGE_DATA_DIRECTORY *dd = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (!dd->VirtualAddress) return NULL;
-    for (IMAGE_IMPORT_DESCRIPTOR *d = (IMAGE_IMPORT_DESCRIPTOR *)(b + dd->VirtualAddress); d->Name; d++) {
-        if (_stricmp((char *)(b + d->Name), "KERNEL32.dll") != 0 || !d->OriginalFirstThunk) continue;
-        IMAGE_THUNK_DATA *names = (IMAGE_THUNK_DATA *)(b + d->OriginalFirstThunk), *iat = (IMAGE_THUNK_DATA *)(b + d->FirstThunk);
-        for (; names->u1.AddressOfData; names++, iat++) {
-            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
-            if (strcmp((char *)((IMAGE_IMPORT_BY_NAME *)(b + names->u1.AddressOfData))->Name, name) != 0) continue;
-            void *old = (void *)iat->u1.Function;
-            DWORD prot;
-            if (!old || !VirtualProtect(&iat->u1.Function, sizeof(void *), PAGE_READWRITE, &prot)) return NULL;
-            iat->u1.Function = (DWORD_PTR)to;
-            VirtualProtect(&iat->u1.Function, sizeof(void *), prot, &prot);
-            return old;
-        }
-    }
-    return NULL;
-}
-
 // The real functions (also used by the tests, which call fio_* directly).
 void fio_init(const wchar_t *userdir) {
     HMODULE k = GetModuleHandleW(L"kernel32.dll");
@@ -357,9 +336,9 @@ int install_fileio(HMODULE m, void (*log)(const char *fmt, ...)) {
                    (void *)fio_CloseHandle, (void *)fio_DuplicateHandle, (void *)fio_WriteFile, (void *)fio_SetEndOfFile};
     void *old[8];
     for (int i = 0; i < 8; i++) {
-        old[i] = iat_hook(m, names[i], to[i]);
+        old[i] = iat_hook(m, "KERNEL32.dll", names[i], to[i]);
         if (!old[i]) {
-            for (int j = 0; j < i; j++) iat_hook(m, names[j], old[j]);  // undo
+            for (int j = 0; j < i; j++) iat_hook(m, "KERNEL32.dll", names[j], old[j]);  // undo
             log("file I/O fix: import %s not found - not installed", names[i]);
             return 0;
         }

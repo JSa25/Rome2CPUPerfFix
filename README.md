@@ -19,7 +19,11 @@ the game side of the separate DLSS add-on "Upscaling and Framegen for Rome II" (
 Frame Generation): it only starts when the add-on's `FrameBridge` folder is in the game folder, otherwise none of it
 runs. The add-on's 64-bit helper is its own repository: https://github.com/JSa25/TotalWarUpscalingFramegen
 Version 1.4 fixes naval battles with the add-on below native resolution: the ships' selection markers and wake foam,
-and the water's reflections.
+and the water's reflections. Version 1.5 brings the add-on's DLSS closer to a native integration (the pixel shaders'
+camera follows the sub-pixel jitter, NVIDIA's mip bias below native size, AMD FidelityFX RCAS sharpening of the DLSS
+output, the DLSS preset choice), fixes the tone mapper's exposure, the land water's reflections, the terrain's
+virtual-texture page requests and shadow maps below native size, supports the GOG version, and adds `rome2fix.ini`
+for switching parts off.
 
 ## What each file does
 
@@ -103,3 +107,25 @@ build.bat test "C:\...\steamapps\common\Total War Rome II\empire.retail.dll"
 ## License
 
 See [LICENSE](LICENSE).
+
+## Third-party notices
+
+The DLSS sharpening pass in `fgbridge.c` follows AMD FidelityFX Robust Contrast Adaptive Sharpening (RCAS), used under
+the MIT licence:
+
+```
+Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
+rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit
+persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the
+Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```

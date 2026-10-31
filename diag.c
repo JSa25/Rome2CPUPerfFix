@@ -19,6 +19,7 @@ static wchar_t g_dlog[MAX_PATH];
 static DWORD g_main_tid, g_self_base;
 volatile DWORD g_uikeep_tid;  // uikeep.c: the thread that is keeping or deleting a menu picture right now, else 0
 static volatile LONG g_records, g_busy;
+int g_crash_logging = 1;  // rome2fix.ini [mod] crash_logging (proxy.c)
 static char g_buf[8192];  // the handler's only buffer: static, so a stack overflow record needs no stack
 
 static void dwrite(const char *s, int n) {
@@ -73,6 +74,9 @@ static const char *code_name(DWORD c) {
     }
 }
 
+// p advanced by a snprintf result, kept inside the buffer: a cut-short write returns the length it wanted
+static char *adv(char *p, char *end, int n) { return n < 0 ? p : n < end - p ? p + n : end - 1; }
+
 static LONG CALLBACK on_exception(EXCEPTION_POINTERS *e) {
     DWORD code = e->ExceptionRecord->ExceptionCode;
     const char *what = code_name(code);
@@ -83,40 +87,40 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *e) {
     SYSTEMTIME t;
     GetLocalTime(&t);
     DWORD tid = GetCurrentThreadId();
-    p += snprintf(p, end - p, "[%02d:%02d:%02d.%03d] EXCEPTION %d: 0x%08lX %s at ", t.wHour, t.wMinute, t.wSecond,
-                  t.wMilliseconds, (int)nrec, code, what);
+    p = adv(p, end, snprintf(p, end - p, "[%02d:%02d:%02d.%03d] EXCEPTION %d: 0x%08lX %s at ", t.wHour, t.wMinute, t.wSecond,
+                  t.wMilliseconds, (int)nrec, code, what));
     DWORD at = (DWORD)(UINT_PTR)e->ExceptionRecord->ExceptionAddress, at_base = 0;
     const char *at_name = image_of(at, &at_base);
-    p += where(p, end - p, at);
-    p += snprintf(p, end - p, ", %s thread %lu (first chance: the game may still handle it)\n",
-                  tid == g_main_tid ? "main" : "worker", tid);
+    p = adv(p, end, where(p, end - p, at));
+    p = adv(p, end, snprintf(p, end - p, ", %s thread %lu (first chance: the game may still handle it)\n",
+                  tid == g_main_tid ? "main" : "worker", tid));
     // the same in plain words: whose code it happened in
     int ours = at_base && at_base == g_self_base, game = at_name && same_ascii(at_name, "empire.retail.dll");
-    p += snprintf(p, end - p, "  -> %s%s. If the game closed or froze right now, this is why; if it kept running, it "
+    p = adv(p, end, snprintf(p, end - p, "  -> %s%s. If the game closed or froze right now, this is why; if it kept running, it "
                   "recovered.\n", ours ? "inside this mod (please report it)" : game ? "in the game's own code, not in this mod"
-                  : "not in this mod, in ", ours || game ? "" : at_name ? at_name : "code outside any DLL");
+                  : "not in this mod, in ", ours || game ? "" : at_name ? at_name : "code outside any DLL"));
     if (g_uikeep_tid && g_uikeep_tid == tid)
-        p += snprintf(p, end - p, "  -> it happened while the menu texture fix was keeping or deleting a menu picture. "
-                      "To switch that fix off, create an empty uikeep_off.txt in the game folder, and please report it.\n");
+        p = adv(p, end, snprintf(p, end - p, "  -> it happened while the menu texture fix was keeping or deleting a menu picture. "
+                      "To switch that fix off, create an empty uikeep_off.txt in the game folder, and please report it.\n"));
     if ((code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) &&
         e->ExceptionRecord->NumberParameters >= 2) {
         ULONG_PTR k = e->ExceptionRecord->ExceptionInformation[0];
-        p += snprintf(p, end - p, "  %s address %08lX\n", k == 0 ? "read of" : k == 1 ? "write to" : "execute at",
-                      (DWORD)e->ExceptionRecord->ExceptionInformation[1]);
+        p = adv(p, end, snprintf(p, end - p, "  %s address %08lX\n", k == 0 ? "read of" : k == 1 ? "write to" : "execute at",
+                      (DWORD)e->ExceptionRecord->ExceptionInformation[1]));
     }
-    p += snprintf(p, end - p, "  eax=%08lX ebx=%08lX ecx=%08lX edx=%08lX esi=%08lX edi=%08lX ebp=%08lX esp=%08lX\n",
-                  c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Ebp, c->Esp);
+    p = adv(p, end, snprintf(p, end - p, "  eax=%08lX ebx=%08lX ecx=%08lX edx=%08lX esi=%08lX edi=%08lX ebp=%08lX esp=%08lX\n",
+                  c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Ebp, c->Esp));
     if (code != EXCEPTION_STACK_OVERFLOW) {
         // Stack scan: values on the stack that point into a loaded module, the likely return addresses.
         NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
         DWORD *sp = (DWORD *)(UINT_PTR)c->Esp, *top = (DWORD *)tib->StackBase;
         int found = 0;
-        p += snprintf(p, end - p, "  stack:");
+        p = adv(p, end, snprintf(p, end - p, "  stack:"));
         for (; sp < top && sp < (DWORD *)(UINT_PTR)c->Esp + 4096 && found < 24 && end - p > 80; sp++) {
             DWORD base;
             if (image_of(*sp, &base)) {
                 *p++ = ' ';
-                p += where(p, end - p, *sp);
+                p = adv(p, end, where(p, end - p, *sp));
                 found++;
             }
         }
@@ -150,7 +154,7 @@ void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const cha
     wcscpy(dir, log_path);
     wchar_t *sl = wcsrchr(dir, L'\\');
     if (sl) *sl = 0;
-    log("Rome 2 CPU Performance Fix %s loaded into %ls", MOD_VERSION, exe);
+    log("Rome 2 Engine Performance Fix %s loaded into %ls", MOD_VERSION, exe);
     if (!empire) {
         log("empire.retail.dll is not loaded and Windows could not be asked to report when it loads - nothing "
             "patched in this process");
@@ -226,6 +230,10 @@ void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const cha
     }
     log("other hook DLLs in the game folder:%s", fl ? found : " none");
 
+    if (!g_crash_logging) {
+        log("crash logging off (crash_logging=0 in rome2fix.ini)");
+        return;
+    }
     AddVectoredExceptionHandler(0, on_exception);  // last in the chain; it only logs
     log("crash logging on: exceptions are recorded here as EXCEPTION lines");
 }

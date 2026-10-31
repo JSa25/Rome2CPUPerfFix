@@ -17,6 +17,7 @@ int install_x87fix(HMODULE m, void (*log)(const char *fmt, ...));               
 void x87fix_frame(void);                                                               // x87fix.c
 int install_sortfix(HMODULE m, void (*log)(const char *fmt, ...));                     // sortfix.c (from the Attila mod)
 void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const char *fmt, ...));  // diag.c
+extern int g_crash_logging;                                                                      // diag.c
 void update_check(HMODULE self, void (*log)(const char *fmt, ...));                             // update.c
 int install_fileio(HMODULE m, void (*log)(const char *fmt, ...));                              // fileio.c
 int install_strfix(HMODULE m, void (*log)(const char *fmt, ...));                              // strfix.c
@@ -58,7 +59,7 @@ static void log_header(void) {
     if (!f) return;
     SYSTEMTIME t;
     GetLocalTime(&t);
-    fprintf(f, "\n======== Rome 2 CPU Performance Fix v%s - game started %04d-%02d-%02d %02d:%02d ========\n",
+    fprintf(f, "\n======== Rome 2 Engine Performance Fix v%s - game started %04d-%02d-%02d %02d:%02d ========\n",
             MOD_VERSION_STR, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute);
     fclose(f);
 }
@@ -144,27 +145,68 @@ static void log_status(const int st[7]) {
         wlog("STATUS: %d of %d fixes are on", on, NFIX);
     for (int i = 0; i < NFIX; i++)
         wlog("  %-4s %s%s", st[i] == FIX_ON ? "on" : st[i] == FIX_PARTLY ? "part" : "OFF", g_fix_names[i],
-             st[i] == FIX_SWITCHED_OFF ? " (switched off by its _off.txt file in the game folder)"
+             st[i] == FIX_SWITCHED_OFF ? " (switched off in rome2fix.ini, or by its _off.txt file)"
              : st[i] == FIX_PARTLY ? " (only part of it fits this game version)"
              : st[i] == FIX_INACTIVE ? " (does not fit this game version, so it stays off; details above)" : "");
+}
+
+// rome2fix.ini in the game folder: written once with the defaults when missing, never changed by the mod after that.
+static const char g_ini_defaults[] =
+    "; Rome 2 Engine Performance Fix settings. 1 = on, 0 = off. Restart the game after a change.\r\n"
+    "; The mod writes this file once with the defaults and never changes it. Delete it to get the defaults back.\r\n"
+    "; (The older way still works too: an empty <name>_off.txt file in the game folder switches that fix off.)\r\n"
+    "\r\n"
+    "[fixes]\r\n"
+    "; FPS\r\n"
+    "tile_feedback_scan=1\r\n"
+    "x87_rounding=1\r\n"
+    "render_list_sorts=1\r\n"
+    "; loading\r\n"
+    "file_reading=1\r\n"
+    "string_functions=1\r\n"
+    "missing_file_cache=1\r\n"
+    "\r\n"
+    "[mod]\r\n"
+    "; copy a newer version from the Steam Workshop into the game folder at startup\r\n"
+    "self_update=1\r\n"
+    "; record crashes in rome2fix.log (EXCEPTION lines)\r\n"
+    "crash_logging=1\r\n"
+    "\r\n"
+    "; The DLSS add-on has its own settings: FrameBridge\\settings.txt (F11 in game).\r\n";
+
+static void ini_write_defaults(const wchar_t *path) {
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);  // only when missing
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w;
+    WriteFile(h, g_ini_defaults, sizeof g_ini_defaults - 1, &w, NULL);
+    CloseHandle(h);
 }
 
 // Installs everything into the game DLL m (mapped and relocated, its own startup code not run yet).
 static void install_all(HMODULE m) {
     int st[7] = {0};
-    diag_startup(m, g_log_path, wlog);  // version, process, game build, system, settings; crash records
-    update_check(g_self, wlog);         // a newer Workshop copy replaces this DLL for the next launch
-    // Off switches: empty files in the game folder.
-    wchar_t f[MAX_PATH];
+    // Switches: rome2fix.ini, or (older) empty <name>_off.txt files in the game folder.
+    wchar_t f[MAX_PATH], ini[MAX_PATH];
     wchar_t *name = wcsrchr(g_log_path, L'\\') - g_log_path + f + 1;
     wcscpy(f, g_log_path);
 #define PRESENT(n) (wcscpy(name, n), GetFileAttributesW(f) != INVALID_FILE_ATTRIBUTES)
+    wcscpy(ini, f);
+    wcscpy(ini + (name - f), L"rome2fix.ini");
+    ini_write_defaults(ini);
+#define INI(sec, key) (GetPrivateProfileIntW(sec, key, 1, ini) != 0)
+#define OFF(key, file) (!INI(L"fixes", key) || PRESENT(file))
+    g_crash_logging = INI(L"mod", L"crash_logging");
+    diag_startup(m, g_log_path, wlog);  // version, process, game build, system, settings; crash records
+    if (INI(L"mod", L"self_update"))
+        update_check(g_self, wlog);     // a newer Workshop copy replaces this DLL for the next launch
+    else
+        wlog("self-update off (self_update=0 in rome2fix.ini)");
 #ifdef PROFILING
     // Heap test (opt-in, heapfix_on.txt): must go in before the game's first allocation, which is still to come here.
     // mimalloc frees a thread's state when the thread ends, so thread notifications stay on while it is installed.
     if (!(PRESENT(L"heapfix_on.txt") && install_heapfix(m, wlog) > 0)) DisableThreadLibraryCalls(g_self);
 #endif
-    int tile_mode = PRESENT(L"tilescan_off.txt") ? 0 : 1, fpslog = 0;
+    int tile_mode = OFF(L"tile_feedback_scan", L"tilescan_off.txt") ? 0 : 1, fpslog = 0;
 #ifdef PROFILING
     if (tile_mode && PRESENT(L"tilescan_ab.txt")) tile_mode = 2;
     fpslog = PRESENT(L"fps_log.txt");
@@ -174,24 +216,24 @@ static void install_all(HMODULE m) {
     st[0] = !ts ? FIX_INACTIVE : tile_mode ? FIX_ON : FIX_SWITCHED_OFF;
     if (!ts)
         wlog("x87 fix not installed (needs the frame hook)");
-    else if (PRESENT(L"x87fix_off.txt")) {
-        wlog("x87fix_off.txt found - x87 rounding fix not installed");
+    else if (OFF(L"x87_rounding", L"x87fix_off.txt")) {
+        wlog("x87 rounding fix switched off (rome2fix.ini or x87fix_off.txt) - not installed");
         st[1] = FIX_SWITCHED_OFF;
     } else
         st[1] = (g_x87_on = install_x87fix(m, wlog) > 0);
     g_frame_check = frame_checks;
-    if (PRESENT(L"fileio_off.txt")) {
-        wlog("fileio_off.txt found - file I/O fix not installed");
+    if (OFF(L"file_reading", L"fileio_off.txt")) {
+        wlog("file I/O fix switched off (rome2fix.ini or fileio_off.txt) - not installed");
         st[3] = FIX_SWITCHED_OFF;
     } else
         st[3] = install_fileio(m, wlog) > 0;
-    if (PRESENT(L"strfix_off.txt")) {
-        wlog("strfix_off.txt found - string functions not replaced");
+    if (OFF(L"string_functions", L"strfix_off.txt")) {
+        wlog("string functions switched off (rome2fix.ini or strfix_off.txt) - not replaced");
         st[4] = FIX_SWITCHED_OFF;
     } else
         st[4] = install_strfix(m, wlog) > 0;
-    if (PRESENT(L"attrcache_off.txt")) {
-        wlog("attrcache_off.txt found - attribute cache not installed");
+    if (OFF(L"missing_file_cache", L"attrcache_off.txt")) {
+        wlog("missing-file cache switched off (rome2fix.ini or attrcache_off.txt) - not installed");
         st[5] = FIX_SWITCHED_OFF;
     } else {
         int verify = 0;
@@ -209,8 +251,8 @@ static void install_all(HMODULE m) {
         st[6] = install_uikeep(m, loadnames, wlog) > 0;
 #endif
     int sorts = 0;
-    if (PRESENT(L"sortfix_off.txt")) {
-        wlog("sortfix_off.txt found - render-list sorts not replaced");
+    if (OFF(L"render_list_sorts", L"sortfix_off.txt")) {
+        wlog("render-list sorts switched off (rome2fix.ini or sortfix_off.txt) - not replaced");
         st[2] = FIX_SWITCHED_OFF;
     } else
         sorts = install_sortfix(m, wlog);
@@ -299,7 +341,8 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
     g_self = h;
     DWORD n = GetModuleFileNameW(h, g_log_path, MAX_PATH);
     wchar_t *sl = wcsrchr(g_log_path, L'\\');
-    if (n == 0 || n >= MAX_PATH || !sl || sl - g_log_path > MAX_PATH - 20) return TRUE;  // no log path: do nothing
+    // room after the folder for the longest name built in it ("FrameBridge\settings.txt"); else no log path: do nothing
+    if (n == 0 || n >= MAX_PATH || !sl || sl - g_log_path > MAX_PATH - 40) return TRUE;
     wcscpy(sl + 1, L"rome2fix.log");
     log_header();
     HMODULE m = GetModuleHandleW(L"empire.retail.dll");

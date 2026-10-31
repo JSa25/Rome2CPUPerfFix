@@ -12,7 +12,7 @@
 //   mov [result],eax | movss [result],xmm0) ; pinsrd xmm0,ecx,0 ; pop. Same integer / same float bits
 //   (sign of zero, NaN, overflow -> 0x80000000 included) while MXCSR has DAZ off. The CW temporaries
 //   [esp+C] and [esp+T] are compiler scratch for this block (written only by it), so they are not written.
-// x87fix_frame() (per frame, main thread) puts the original bytes back for the down/up/frndint sites if
+// x87fix_frame() (per frame, main thread; other game threads suspended meanwhile) puts the original bytes back for the down/up/frndint sites if
 // the main thread's rounding control or DAZ ever changes, or if the watcher thread (every 10 s it briefly
 // suspends each game thread and reads its x87 control word and MXCSR) saw another thread with them. x87fix_test.c runs every matched site's
 // original bytes and replacement on edge values and random inputs.
@@ -130,23 +130,6 @@ static int x87_scan(const unsigned char *text, unsigned size, unsigned rva0) {
 // Set by the watcher thread when some game thread runs with non-default rounding control or DAZ.
 static volatile LONG g_x87_other_thread_bad;
 
-// Per frame on the main thread: the down/up/frndint replacements assume default rounding control and DAZ off.
-void x87fix_frame(void) {
-    if (g_x87_reverted || ((x87_cw() & 0xC00) == 0 && !(x87_mxcsr() & 0x40) && !g_x87_other_thread_bad)) return;
-    int n = 0;
-    for (int i = 0; i < g_x87_n; i++) {
-        struct x87site *s = &g_x87[i];
-        if (s->patched && !(s->mode == 3 && !s->frndint)) {
-            x87_write(g_x87_base + s->rva, s->orig, s->len);
-            s->patched = 0;
-            n++;
-        }
-    }
-    FlushInstructionCache(GetCurrentProcess(), NULL, 0);
-    g_x87_reverted = 1;
-    g_x87_log("x87 fix: non-default rounding control or DAZ seen on a game thread - %d rounding sites restored", n);
-}
-
 typedef LONG(NTAPI *query_thread_fn)(HANDLE, int, PVOID, ULONG, PULONG);
 
 // 1 if the thread was started inside the game's own code (empire.retail.dll or the exe): only those run
@@ -160,6 +143,55 @@ static int game_thread(HANDLE h) {
     HMODULE m = NULL;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, start, &m)) return 0;
     return m == (HMODULE)g_x87_base || m == GetModuleHandleW(NULL);
+}
+
+// Puts the original bytes of the down/up/frndint sites back while every other game thread is suspended, so none runs
+// half-rewritten code. 0 (nothing written) if a suspended thread stood inside a site: tried again next frame.
+static int x87_restore_paused(int *restored) {
+    HANDLE th[1024];
+    int nth = 0, clear = 1;
+    DWORD pid = GetCurrentProcessId(), me = GetCurrentThreadId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    THREADENTRY32 te = {.dwSize = sizeof te};
+    for (BOOL ok = Thread32First(snap, &te); ok && nth < 1024; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
+        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+        if (!h) continue;
+        if (!game_thread(h) || SuspendThread(h) == (DWORD)-1) { CloseHandle(h); continue; }
+        th[nth++] = h;
+        CONTEXT c = {.ContextFlags = CONTEXT_CONTROL};
+        if (!GetThreadContext(h, &c)) { clear = 0; break; }
+        DWORD rva = c.Eip - (DWORD)(UINT_PTR)g_x87_base;
+        for (int i = 0; i < g_x87_n && clear; i++)
+            if (g_x87[i].patched && rva - g_x87[i].rva < g_x87[i].len) clear = 0;
+        if (!clear) break;
+    }
+    CloseHandle(snap);
+    if (clear)
+        for (int i = 0; i < g_x87_n; i++) {
+            struct x87site *s = &g_x87[i];
+            if (s->patched && !(s->mode == 3 && !s->frndint)) {
+                x87_write(g_x87_base + s->rva, s->orig, s->len);
+                s->patched = 0;
+                (*restored)++;
+            }
+        }
+    if (clear) FlushInstructionCache(GetCurrentProcess(), NULL, 0);
+    for (int i = 0; i < nth; i++) {
+        ResumeThread(th[i]);
+        CloseHandle(th[i]);
+    }
+    return clear;
+}
+
+// Per frame on the main thread: the down/up/frndint replacements assume default rounding control and DAZ off.
+void x87fix_frame(void) {
+    if (g_x87_reverted || ((x87_cw() & 0xC00) == 0 && !(x87_mxcsr() & 0x40) && !g_x87_other_thread_bad)) return;
+    int n = 0;
+    if (!x87_restore_paused(&n)) return;
+    g_x87_reverted = 1;
+    g_x87_log("x87 fix: non-default rounding control or DAZ seen on a game thread - %d rounding sites restored", n);
 }
 
 // Every 10 s: briefly suspend each game thread and read its x87 control word and MXCSR.
@@ -196,8 +228,8 @@ static DWORD WINAPI x87_watch(LPVOID unused) {
 }
 
 static int cpu_has_sse41(void) {
-    int ecx;
-    __asm__ volatile("cpuid" : "=c"(ecx) : "a"(1) : "ebx", "edx");
+    int eax = 1, ecx;  // cpuid overwrites eax too: "+a" tells the compiler
+    __asm__ volatile("cpuid" : "+a"(eax), "=c"(ecx) : : "ebx", "edx");
     return (ecx >> 19) & 1;
 }
 

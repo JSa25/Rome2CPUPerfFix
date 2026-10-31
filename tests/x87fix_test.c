@@ -48,6 +48,9 @@ static DWORD WINAPI bad_thread(LPVOID p) {
     return 0;
 }
 
+// started in this exe, so the watcher's game_thread() counts it: runs the code at p (a parked "jmp $" in a site)
+static DWORD WINAPI run_at(LPVOID p) { ((void (*)(void))p)(); return 0; }
+
 static unsigned rng = 777;
 static unsigned rnd(void) { rng = rng * 1664525u + 1013904223u; return rng; }
 
@@ -124,13 +127,28 @@ int main(int argc, char **argv) {
     CHECK(patched == found);
     x87fix_frame();
     CHECK(!g_x87_reverted);
+    // a game thread parked inside a site to be restored ("jmp $" over its first bytes): the restore must wait for it
+    int park = -1;
+    for (int i = 0; i < found && park < 0; i++)
+        if (!(g_x87[i].mode == 3 && !g_x87[i].frndint)) park = i;
+    CHECK(park >= 0);
+    img[g_x87[park].rva] = 0xEB;
+    img[g_x87[park].rva + 1] = 0xFE;
+    FlushInstructionCache(GetCurrentProcess(), NULL, 0);
+    HANDLE parked = CreateThread(NULL, 0, run_at, img + g_x87[park].rva, 0, NULL);
+    CHECK(parked);
     // another thread switches its rounding control: the watcher (every 10 s) flags it, the next frame restores
     HANDLE bad = CreateThread(NULL, 0, bad_thread, NULL, 0, NULL);
     CHECK(bad);
     Sleep(11000);
+    CHECK(g_x87_other_thread_bad);
     x87fix_frame();
-    CHECK(!g_x87_reverted || g_x87_other_thread_bad);
+    CHECK(!g_x87_reverted && g_x87[park].patched);  // a thread stands inside a site: nothing written
+    TerminateThread(parked, 0);
+    WaitForSingleObject(parked, INFINITE);
+    x87fix_frame();
     CHECK(g_x87_reverted);
+    printf("x87 restore waited for a thread inside a site, then restored with the game threads paused\n");
     g_stop_bad = 1;
     for (int i = 0; i < found; i++) {
         struct x87site *s = &g_x87[i];

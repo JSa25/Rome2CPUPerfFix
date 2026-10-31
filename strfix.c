@@ -101,6 +101,7 @@ static struct str_site g_str[NSITES] = {  // rva/fnv: the build found by strfix_
 static const DWORD g_str_builds[NBUILDS][NSITES][2] = {
     {{0xF41F0, 0x01A19E9Au}, {0xF9AC0, 0xB302A678u}, {0xF0380, 0x16DC4500u}, {0x7E61B0, 0xBC18112Fu}},
     {{0xF2250, 0x01A19E9Au}, {0xF6A10, 0xB302A678u}, {0xEF270, 0x16DC4500u}, {0x7E09C0, 0xF7CF331Fu}},
+    {{0xF41F0, 0x01A19E9Au}, {0xF9AC0, 0xB302A678u}, {0xF0380, 0x16DC4500u}, {0x7E61B0, 0xBC18112Fu}},
 };
 
 static DWORD fnv_masked(const unsigned char *b, DWORD n, DWORD skip1, DWORD skip2, DWORD skip3) {

@@ -27,6 +27,7 @@
 static const struct ts_build { DWORD entry, push, hash_a, hash_b; } g_ts_builds[NBUILDS] = {
     {0x1594020u, 0xE89B0u, 0xFE3AA4B9u, 0x2F13EBF9u},
     {0x156DCF0u, 0xEAEF0u, 0x8E692C80u, 0xA3DF4B93u},
+    {0x1593DD0u, 0xE89B0u, 0x2CFE5C83u, 0xDA089BBFu},
 };
 
 typedef struct { uint16_t *counts; uint32_t width, height, unused; } Layer;
@@ -37,12 +38,6 @@ static push_fn g_push;
 void *g_tail_a, *g_tail_b;  // read by the thunks
 static uint32_t g_ts_pixels __attribute__((unused)), g_ts_runs, g_ts_calls;  // stats (logged by the profiling build), main thread only
 static void (*g_log)(const char *fmt, ...);
-
-static uint32_t fnv1a(const unsigned char *p, size_t n) {
-    uint32_t h = 0x811C9DC5u;
-    while (n--) h = (h ^ *p++) * 0x01000193u;
-    return h;
-}
 
 // Applies `run` consecutive hits of one entry exactly as the original per-pixel loop would.
 static void hit(Grid *g, uint32_t v, uint32_t run, int fmt_b) {

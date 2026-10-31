@@ -10,7 +10,9 @@ Created with the help of AI.
 Source code: https://github.com/JSa25/Rome2CPUPerfFix
 
 Game versions: the normal Steam version of Rome 2 (Emperor Edition, September
-2026) and, since 1.2, the "pantheon" beta (October 2026). Every patch first checks
+2026), since 1.2 the "pantheon" beta (October 2026), and since 1.5 the GOG
+version (copy dinput8.dll into the game folder by hand there; the automatic
+updates come from the Steam Workshop, so GOG has none). Every patch first checks
 the exact game bytes it replaces. If they don't match (another game version or
 another engine mod), that patch turns itself off and the game runs unmodified.
 The first lines of rome2fix.log say which game version you have and whether it is
@@ -121,17 +123,26 @@ Remember: the mod won't appear in the launcher's mod list. That's normal.
 
 Turning single fixes off
 ------------------------
-Create an empty file with one of these names in the game folder to disable that
-fix (useful if you suspect one of them), then restart the game:
+Since 1.5 the mod writes rome2fix.ini into the game folder at the first start.
+Set a line to 0 to switch that part off (useful if you suspect one of them),
+then restart the game; 1 switches it back on. The mod never changes the file
+after writing it; delete it to get the defaults back.
 
-  tilescan_off.txt     tile streaming scan
-  x87fix_off.txt       x87 rounding
-  sortfix_off.txt      render-list sorts (both)
-  attrcache_off.txt    loose-file check cache (loading)
-  fileio_off.txt       save and .pack file reading (loading)
-  strfix_off.txt       string comparisons (loading)
+  [fixes]
+  tile_feedback_scan   tile streaming scan
+  x87_rounding         x87 rounding
+  render_list_sorts    render-list sorts (both)
+  file_reading         save and .pack file reading (loading)
+  string_functions     string comparisons (loading)
+  missing_file_cache   loose-file check cache (loading)
+  [mod]
+  self_update          copy a newer version from the Steam Workshop at startup
+  crash_logging        record crashes in rome2fix.log
 
-The STATUS lines in rome2fix.log show which fixes are on.
+The older way still works too: an empty tilescan_off.txt, x87fix_off.txt,
+sortfix_off.txt, attrcache_off.txt, fileio_off.txt or strfix_off.txt in the
+game folder switches that fix off. The STATUS lines in rome2fix.log show which
+fixes are on.
 
 
 Reporting a problem
@@ -175,10 +186,48 @@ Rome II": NVIDIA DLSS Super Resolution and DLSS Frame Generation on NVIDIA RTX
 graphics cards. It does nothing unless that add-on's FrameBridge folder is in
 the game folder (its install.bat puts it there). The add-on's own README has
 the details; the engine fix keeps it up to date from the add-on's Workshop item.
+1.5 brings a sharper, more native-looking DLSS picture and the add-on's new
+F11 settings (DLSS preset, sharpness) together with add-on version 2.
 
+
+Third-party notices
+-------------------
+The DLSS add-on's sharpening (in dinput8.dll) follows AMD FidelityFX Robust
+Contrast Adaptive Sharpening (RCAS), used under the MIT licence:
+
+Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
+rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit
+persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the
+Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+The rest of this mod's code is by JGdaCaesar, all rights reserved; its source
+is published for review at github.com/JSa25/Rome2CPUPerfFix.
 
 Changelog
 ---------
+Version 1.5: with the DLSS add-on: sharper image (the game's lighting now
+           follows DLSS's sub-pixel jitter, as games with DLSS built in do;
+           new Sharpness setting, default Low), DLSS preset choice (J, K, L,
+           M), finer texture detail below native resolution, and fixes for
+           too bright a picture and lighter shadows below native resolution,
+           dark lakes, coasts and rivers, and blurry terrain at the edges of
+           the view. Supports the GOG version. rome2fix.ini to switch parts
+           off. Fixes from a code review: a very long game folder path, safer
+           undo of the x87 patches, and the game no longer freezes for 5 s
+           when the DLSS helper stops responding. The log and the F11 panel
+           now say when the DLSS add-on is too old for a setting.
+           SHA-256 of dinput8.dll:
+           bdeb9740fce552afd217b9b55e460fa2ea72b9d6c9b953620391200abb85fca3
 Version 1.4: naval battles with the DLSS add-on below native resolution
            (Quality ... Ultra Performance): ship selection markers and wake
            foam sit on the ships again, and the water's reflections (sky,

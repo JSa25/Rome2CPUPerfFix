@@ -159,6 +159,15 @@ int main(int argc, char **argv) {
     strcpy(onp + (sl - logp) + 1, "heapfix_on.txt");
     DeleteFileA(onp);
     if (heap) fclose(fopen(onp, "w"));
+    // rome2fix.ini: read (self-update off, the fixes' missing keys default to on) and never overwritten by the mod
+    char inip[MAX_PATH];
+    static const char ini_text[] = "[mod]\r\nself_update=0\r\n";
+    strcpy(inip, logp);
+    strcpy(inip + (sl - logp) + 1, "rome2fix.ini");
+    FILE *fi = fopen(inip, "wb");
+    CHECK(fi);
+    fputs(ini_text, fi);
+    fclose(fi);
 
     void *taken = VirtualAlloc((void *)0x10000000, 0x100000, MEM_RESERVE, PAGE_NOACCESS);
     CHECK(taken == (void *)0x10000000);
@@ -184,7 +193,15 @@ int main(int argc, char **argv) {
     fputs(g_log, stdout);
     CHECK(has("was loaded before empire.retail.dll"));
     CHECK(has("empire.retail.dll is loading now - installing the fixes"));
-    CHECK(has("Rome 2 CPU Performance Fix v"));
+    CHECK(has("Rome 2 Engine Performance Fix v"));
+    CHECK(has("self-update off (self_update=0 in rome2fix.ini)") && has("crash logging on"));
+    char inibuf[256] = {0};
+    fi = fopen(inip, "rb");
+    CHECK(fi);
+    fread(inibuf, 1, sizeof inibuf - 1, fi);
+    fclose(fi);
+    CHECK(!strcmp(inibuf, ini_text));
+    DeleteFileA(inip);
     CHECK(has("tile feedback scan replaced"));
     CHECK(has("x87 fix: 1196 of 1196") || has("x87 fix: 1213 of 1213"));  // 2026-09-17 build / pantheon beta
     CHECK(has("draw-list sort replaced") && has("render-list sort (+0x44/+0x40) replaced"));

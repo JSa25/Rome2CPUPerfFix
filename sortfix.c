@@ -25,8 +25,8 @@ static struct sort_site {
     unsigned char tramp[16];   // the overwritten prologue + jmp back: the original sort
     DWORD builds[NBUILDS][2];  // {rva, fnv} per known build (the functions differ only in their call targets)
 } g_sorts[2] = {
-    {0x14A8370, 0x89B4A107u, 0x6C, 0x68, "draw-list sort", {0}, {{0x14A8370, 0x89B4A107u}, {0x1481B70, 0xF11FB1D5u}}},
-    {0x14A7930, 0xEE40594Fu, 0x44, 0x40, "render-list sort (+0x44/+0x40)", {0}, {{0x14A7930, 0xEE40594Fu}, {0x1481130, 0xDB6F7BCCu}}},
+    {0x14A8370, 0x89B4A107u, 0x6C, 0x68, "draw-list sort", {0}, {{0x14A8370, 0x89B4A107u}, {0x1481B70, 0xF11FB1D5u}, {0x14A8170, 0x89B4A107u}}},
+    {0x14A7930, 0xEE40594Fu, 0x44, 0x40, "render-list sort (+0x44/+0x40)", {0}, {{0x14A7930, 0xEE40594Fu}, {0x1481130, 0xDB6F7BCCu}, {0x14A7730, 0xEE40594Fu}}},
 };
 
 static unsigned long long key_at(const void *p, const struct sort_site *s) {
@@ -90,12 +90,6 @@ static void sort_by_keys(void **first, void **last, int ideal, void *ctx, const 
 
 void __cdecl draw_sort(void **first, void **last, int ideal, void *ctx) { sort_by_keys(first, last, ideal, ctx, &g_sorts[0]); }
 void __cdecl list_sort(void **first, void **last, int ideal, void *ctx) { sort_by_keys(first, last, ideal, ctx, &g_sorts[1]); }
-
-static DWORD fnv1a(const unsigned char *b, DWORD n) {
-    DWORD h = 0x811C9DC5u;
-    while (n--) h = (h ^ *b++) * 0x01000193u;
-    return h;
-}
 
 // Points each sort at the known build whose bytes match at m (left as it is when none does).
 void sortfix_find(HMODULE m) {
