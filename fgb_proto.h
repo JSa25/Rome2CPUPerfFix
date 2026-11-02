@@ -13,9 +13,11 @@
 
 #define FGB_PROTO 4
 #define FGB_QUIT 0xFFFFFFFFu
-#define FGB_CAP_PRESET 1u   /* sr_preset is applied (add-on version 2) */
-#define FGB_CAP_HUD_POST 2u /* hud_post is applied (add-on version 4) */
-#define FGB_CAP_VSYNC 8u    /* vsync_off is applied (add-on version 5; Attila's 7); 4u is kept for Attila's AMD FSR work */
+#define FGB_CAP_PRESET 1u   /* sr_preset is applied (Rome 2 add-on version 2, Attila add-on version 5) */
+#define FGB_CAP_HUD_POST 2u /* hud_post is applied (Rome 2 add-on version 4, Attila add-on version 6) */
+#define FGB_CAP_FSR 4u      /* tech is applied: AMD FSR upscaling / frame generation where NVIDIA's are missing or not wanted (Attila add-on version 8) */
+#define FGB_CAP_VSYNC 8u    /* vsync_off is applied (Rome 2 add-on version 5, Attila add-on version 7) */
+#define FGB_CAP_RESTART 16u /* the helper starts at frame done (not 0): the game may stop it and start another (F11 switch) */
 
 typedef struct {
     uint32_t proto, width, height, format, hwnd, luid_lo;
@@ -40,16 +42,22 @@ typedef struct {
                                            side that does not know it leaves it 0 */
     volatile uint32_t sr_preset;   /* game: DLSS preset for every mode, NVIDIA's number (10..13 = J..M); 0 = NVIDIA's
                                       default per mode. Was padding: an older game side leaves it 0, an older helper
-                                      ignores it */
+                                      ignores it (same place as in Rome 2's block) */
     volatile uint32_t helper_caps; /* helper, before helper_ok: what it supports (FGB_CAP_*). Was padding: an older helper
                                       leaves it 0, so the game can tell the player to update the add-on */
     volatile uint32_t hud_post;    /* game: bit n % 32 set = frame n's HUD-less colour after DLSS SR is the full-size
                                       _hudless (ReShade's effects on it, Rome 2), not the SR output. Was padding */
-    uint32_t pad1[3];              /* kept for Attila's AMD FSR fields (same layout in both games) */
+    uint32_t tech;                 /* game: 0 = NVIDIA only (an older game side), 1 = auto (DLSS / DLSS-G where the GPU has
+                                      them, AMD FSR for the rest), 2 = AMD FSR for both, 3 = DLSS upscaling + AMD FSR frame generation. Was padding: an older helper
+                                      ignores it, so the game checks FGB_CAP_FSR */
+    volatile uint32_t sr_backend, fg_backend;   /* helper, before helper_ok: 0 none, 1 NVIDIA (DLSS / DLSS-G), 2 AMD FSR.
+                                                   Was padding: an older helper leaves 0 (read as NVIDIA when helper_ok) */
     volatile uint32_t vsync_off;   /* game: 1 = the helper presents without V-Sync (the player's choice: no cap at the screen's
                                       refresh rate, frames may tear). Was padding: an older game side leaves 0 (V-Sync on),
                                       an older helper ignores it */
-    uint32_t pad2;
+    volatile uint32_t driver_vsync; /* helper, before helper_ok: NVIDIA's driver Vertical sync for the helper, which overrides
+                                      vsync_off (AGENT_LOG 157): 1 the application decides, 2 forced on, 3 forced off, 4 Fast
+                                      Sync; 0 unknown. Was padding: an older helper leaves 0 */
     float vp[16], prev_vp[16];     /* game: view-projection of frame n and n-1 (row-major, clip = M x [x y z 1]) */
 } FgbShared;
 _Static_assert(sizeof(FgbShared) == 256, "bridge block layout");

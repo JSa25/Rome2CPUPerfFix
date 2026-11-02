@@ -182,6 +182,14 @@ static void ini_write_defaults(const wchar_t *path) {
     CloseHandle(h);
 }
 
+// An ini switch: off only for 0 / off / false / no (GetPrivateProfileInt read "on", "yes", "true" as 0 = off); missing,
+// empty or anything else = on, the default.
+int ini_on(const wchar_t *sec, const wchar_t *key, const wchar_t *ini) {
+    wchar_t v[16];
+    GetPrivateProfileStringW(sec, key, L"1", v, 16, ini);
+    return _wcsicmp(v, L"0") && _wcsicmp(v, L"off") && _wcsicmp(v, L"false") && _wcsicmp(v, L"no");
+}
+
 // Installs everything into the game DLL m (mapped and relocated, its own startup code not run yet).
 static void install_all(HMODULE m) {
     int st[7] = {0};
@@ -193,14 +201,14 @@ static void install_all(HMODULE m) {
     wcscpy(ini, f);
     wcscpy(ini + (name - f), L"rome2fix.ini");
     ini_write_defaults(ini);
-#define INI(sec, key) (GetPrivateProfileIntW(sec, key, 1, ini) != 0)
+#define INI(sec, key) ini_on(sec, key, ini)
 #define OFF(key, file) (!INI(L"fixes", key) || PRESENT(file))
     g_crash_logging = INI(L"mod", L"crash_logging");
     diag_startup(m, g_log_path, wlog);  // version, process, game build, system, settings; crash records
     if (INI(L"mod", L"self_update"))
         update_check(g_self, wlog);     // a newer Workshop copy replaces this DLL for the next launch
     else
-        wlog("self-update off (self_update=0 in rome2fix.ini)");
+        wlog("self-update off (self_update=0 in rome2fix.ini)");  // also for off / false / no
 #ifdef PROFILING
     // Heap test (opt-in, heapfix_on.txt): must go in before the game's first allocation, which is still to come here.
     // mimalloc frees a thread's state when the thread ends, so thread notifications stay on while it is installed.

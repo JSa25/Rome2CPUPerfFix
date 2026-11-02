@@ -21,11 +21,13 @@ static const GUID iid_device5 = {0x8ffde202, 0xa0e7, 0x45df, {0x9e, 0x01, 0xe8, 
 static const GUID iid_context4 = {0x917600da, 0xf58c, 0x4c33, {0x98, 0xd8, 0x3e, 0x15, 0xb3, 0x90, 0xfa, 0x24}};
 static const GUID iid_fence = {0xaffde9d1, 0x1df7, 0x4bb7, {0x8a, 0x34, 0x0f, 0x46, 0x25, 0x1d, 0xab, 0x80}};
 
-// depth -> R32F and camera motion vectors from depth: world = inv(vp) x ndc, previous pixel = prev_vp x world.
+// depth -> R32F and camera motion vectors from depth: previous pixel = (prev_vp x inv(vp)) x ndc, the product made on the
+// CPU in double (fgb_make_vectors): the two steps in float on the GPU moved a still picture 0.1-0.35 px at far depth
+// with the camera ~1000 units from the origin (Rome 2 battle, sweep 2026-11-02), and FSR smeared and lost its history.
 // A viewport shifted left / up by the jitter leaves the last column / row of the render undrawn (measured on an RTX 5090:
 // every pixel of it, at any jitter below 0): its depth is taken from the one before (jit_edge_fill does the colour)
 static const char *cs_src =
-    "cbuffer B : register(b0) { row_major float4x4 inv_vp; row_major float4x4 prev_vp; float2 size; float2 jit; };\n"
+    "cbuffer B : register(b0) { row_major float4x4 reproj; row_major float4x4 pad_; float2 size; float2 jit; };\n"
     "Texture2D<float> dep : register(t0);\n"
     "RWTexture2D<float> d32 : register(u0);\n"
     "RWTexture2D<float2> mv : register(u1);\n"
@@ -38,8 +40,7 @@ static const char *cs_src =
     "  d32[id.xy] = z;\n"
     "  float2 cur = float2(id.xy) + 0.5 - jit;\n"   // where this pixel's surface is without the jitter
     "  float2 ndc = float2(cur.x / size.x * 2 - 1, 1 - cur.y / size.y * 2);\n"
-    "  float4 w = mul(inv_vp, float4(ndc, z, 1)); w /= w.w;\n"
-    "  float4 p = mul(prev_vp, float4(w.xyz, 1)); p.xy /= p.w;\n"
+    "  float4 p = mul(reproj, float4(ndc, z, 1)); p.xy /= p.w;\n"
     "  float2 prev = float2((p.x * 0.5 + 0.5) * size.x, (0.5 - p.y * 0.5) * size.y);\n"
     "  mv[id.xy] = prev - cur; }\n";
 
@@ -48,6 +49,8 @@ static ID3D11DeviceContext *g_ctx;
 static ID3D11DeviceContext4 *g_ctx4;
 static ID3D11Fence *g_fence, *g_fsr, *g_fdone;   // game: 2n+1 / 2n+2; helper SR queue: n+1; helper present queue: n+1
 static ID3D11Texture2D *g_final, *g_hud, *g_d32, *g_mv, *g_srout[2], *g_dcopy;
+static UINT g_gpu_vendor;          // the game's adapter (fgb_start): the panel's choices
+static wchar_t g_gpu_name[128];
 static ID3D11UnorderedAccessView *g_d32_uav, *g_mv_uav;
 static ID3D11ShaderResourceView *g_dcopy_srv;
 static ID3D11ComputeShader *g_cs;
@@ -55,21 +58,29 @@ static ID3D11Buffer *g_cb;
 static HANDLE g_handles[9], g_map, g_wake, g_wake2, g_helper;   // wake: the helper SR thread, wake2: its present thread
 static FgbShared *g_sh;
 static HWND g_hwnd;           // the game's window (the helper presents into it)
-static uint32_t g_vsync_off;  // the player turned V-Sync off (fgb_set_vsync)
 static UINT g_w, g_h, g_dw, g_dh;
 static uint32_t g_n;          // the frame being built
 static int g_hud_done, g_waited, g_live, g_hud_post;   // g_hud_post: this frame's HUD-less image after SR is the game's (fgb_hud_post)
+static uint32_t g_vsync_off;   // the player turned V-Sync off (fgb_set_vsync)
 static float g_prev_vp[16];
+// the latency cap: at the end of frame n the CPU waits for the GPU to finish frame n - 1 (fence 2n), so the game queues at
+// most one frame (as the driver's "max frame latency 1"; user 2026-11-02: "the camera becomes sluggish" when the GPU is
+// the limit). fgb_set_latency_cap; cost and waits in fgb_latency_stats.
+static int g_lat_cap = 1;
+static HANDLE g_lat_ev;
+static double g_lat_ms;
+static unsigned g_lat_waits, g_lat_frames;
 static int g_have_prev;
 static unsigned g_pace_timeouts;
 static int g_sr;              // DLSS SR on
 static UINT g_rw, g_rh;       // render size (the top-left of the targets)
+static float g_jx, g_jy;      // this frame's jitter (render pixels, x right, y down)
 static uint32_t g_preset;     // DLSS preset (NVIDIA's number, 0 = its default per mode)
-// Sharpening of the DLSS output (games with DLSS built in ship one: NVIDIA took it out of DLSS): AMD FidelityFX's RCAS
-// (robust contrast-adaptive sharpening, MIT licence) as a compute pass, from the output into g_sharp, then into the back
-// buffer and back into the shared output (frame generation tells the UI from the scene by comparing that with the final
-// image: a sharpened final against an unsharpened copy would look like UI everywhere). g_sharpness: RCAS's con.x
-// (exp2(-stops)), 0 off.
+// Sharpening of the DLSS output (games with DLSS built in ship one: NVIDIA took it out of DLSS; Rome 2 DLSS_LOG 45 / 46):
+// AMD FidelityFX's RCAS (robust contrast-adaptive sharpening, MIT licence) as a compute pass, from the output into
+// g_sharp, then into the back buffer and back into the shared output (frame generation tells the UI from the scene by
+// comparing that with the final image: a sharpened final against an unsharpened copy would look like UI everywhere).
+// g_sharpness: RCAS's con.x (exp2(-stops)), 0 off.
 static ID3D11ComputeShader *g_sharp_cs;
 static ID3D11Texture2D *g_sharp;
 static ID3D11UnorderedAccessView *g_sharp_uav;
@@ -77,6 +88,74 @@ static ID3D11ShaderResourceView *g_srout_srv[2];
 static ID3D11Buffer *g_sharp_cb;
 static float g_sharpness;
 static unsigned g_sharp_frames;
+// The per-object pass leaves holes inside moving units: shields, lances and dithered parts keep the camera's motion
+// (in-game capture, AGENT_LOG 161), and AMD FSR's upscaler smears there (DLSS forgives it). After the pass, a pixel
+// without motion of its own takes the nearest one with it (rings 1, 2, 3, 4, 8, 12 pixels, 8 directions) at nearly the
+// same depth: linear depth within 3 % (1 - d is proportional to 1 / z for this depth). cam: the camera-only vectors from
+// before the pass, obj: after it.
+static const char fill_src[] =
+    "Texture2D<float2> cam : register(t0);\n"
+    "Texture2D<float2> obj : register(t1);\n"
+    "RWTexture2D<float2> dst : register(u0);\n"
+    "RWTexture2D<float> dep : register(u1);\n"
+    "RWTexture2D<unorm float> rct : register(u2);\n"
+    "cbuffer c : register(b0) { uint2 size; float tol; float unitk; }\n"
+    "bool own(int2 q) { return any(abs(obj[q] - cam[q]) > 0.05); }\n"
+    "[numthreads(8, 8, 1)] void cs(uint3 id : SV_DispatchThreadID) {\n"
+    "  int2 p = int2(id.xy);\n"
+    "  if (id.x >= size.x || id.y >= size.y) return;\n"
+    "  if (own(p)) { if (unitk > 0) rct[p] = max(rct[p], unitk); return; }\n"
+    "  float zp = 1 - dep[p];\n"
+    "  if (zp <= 0) return;\n"
+    "  const int2 dir[8] = { int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1), int2(1, 1), int2(-1, -1), int2(1, -1), int2(-1, 1) };\n"
+    "  const int ring[6] = { 1, 2, 3, 4, 8, 12 };\n"
+    "  [loop] for (int r = 0; r < 6; r++) {\n"
+    "    float best = tol; float2 v = 0;\n"
+    "    [unroll] for (int k = 0; k < 8; k++) {\n"
+    "      int2 q = p + dir[k] * ring[r];\n"
+    "      if (q.x < 0 || q.y < 0 || q.x >= (int)size.x || q.y >= (int)size.y || !own(q)) continue;\n"
+    "      float e = abs((1 - dep[q]) / zp - 1);\n"
+    "      if (e < best) { best = e; v = obj[q]; }\n"
+    "    }\n"
+    "    if (best < tol) { dst[p] = v; if (unitk > 0) rct[p] = max(rct[p], unitk); return; }\n"
+    "  }\n"
+    "}\n";
+static ID3D11ComputeShader *g_fill_cs;
+static ID3D11Texture2D *g_mvcam, *g_mvobj;
+static ID3D11ShaderResourceView *g_mvcam_srv, *g_mvobj_srv;
+static ID3D11Buffer *g_fill_cb;
+static unsigned g_fill_frames;
+static float g_fill_unitk = 0.5f;   // moving units in FSR's reactive mask (bridgetest unitk=)
+// AMD FSR's reactive mask (AGENT_LOG 163; AMD's guide: objects without usable motion - particles, smoke, alpha-blended
+// parts - marked up to 0.9 so FSR leans on the current frame there). Attila draws its transparent effects in one stage
+// (+0x1C99FB8) into the HDR scene after lighting: the scene is copied at that stage's entry (opaque only) and compared
+// at the next stage's entry; where the effects changed it, the mask rises with the change relative to the brightness.
+static const char react_src[] =
+    "Texture2D<float3> opq : register(t0);\n"
+    "Texture2D<float3> cur : register(t1);\n"
+    "RWTexture2D<unorm float> dst : register(u0);\n"
+    "cbuffer c : register(b0) { uint2 size; float scale, cap; float floor_; float3 pad; }\n"
+    "[numthreads(8, 8, 1)] void cs(uint3 id : SV_DispatchThreadID) {\n"
+    "  if (id.x >= size.x || id.y >= size.y) return;\n"
+    "  float3 a = opq[id.xy], b = cur[id.xy], d = abs(b - a);\n"
+    "  float l = max(max(max(a.r, a.g), a.b), max(max(b.r, b.g), b.b));\n"
+    "  float r = max(max(d.r, d.g), d.b) / (l + 0.05);\n"
+    "  dst[id.xy] = min(cap, saturate(scale * (r - floor_) / (1 - floor_)));\n"
+    "}\n"
+;
+static ID3D11Texture2D *g_react, *g_opq, *g_cur;   // the mask (shared with the helper), the scene before / after the effects
+static ID3D11UnorderedAccessView *g_react_uav;
+static ID3D11RenderTargetView *g_react_rtv;   // bridgetest react
+static ID3D11ShaderResourceView *g_opq_srv, *g_cur_srv;
+static ID3D11ComputeShader *g_react_cs;
+static ID3D11Buffer *g_react_cb;
+// the mask's floor (AGENT_LOG 183): relative changes below it are not marked - Attila's haze over the distance changed
+// the whole background a little and FSR Quality lost half its detail there; fgb_set_react_floor (fsrtest.txt "rfloor=")
+static float g_react_floor;
+void fgb_set_react_floor(float f) { g_react_floor = f < 0 ? 0 : f > 0.95f ? 0.95f : f; }
+static ID3D11Resource *g_react_hdr;   // the scene texture seen at the stage entry
+static HANDLE g_react_handle;
+static unsigned g_react_begun = ~0u, g_react_frame = ~0u, g_react_frames;
 static const char sharp_src[] =
     "Texture2D<float4> src : register(t0);\n"
     "RWTexture2D<float4> dst : register(u0);\n"
@@ -94,35 +173,57 @@ static const char sharp_src[] =
     "  float lobe = max(-0.1875, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * k.x;\n"
     "  dst[p] = float4((lobe * (b + d + f + hh) + e4.rgb) / (4.0 * lobe + 1.0), e4.a);\n"
     "}\n";
-static float g_jx, g_jy;      // this frame's jitter (render pixels, x right, y down)
 static unsigned g_sr_frames, g_sr_timeouts, g_sr_slow;   // g_sr_slow: DLSS outputs that came after over 250 ms (logged, first 20)
 static double g_sr_wait_ms, g_sr_wait_max;
 static void (*g_log)(const char *fmt, ...);
 static DWORD WINAPI watchdog(void *arg);
+static volatile unsigned g_gen;   // the helper's generation: a watchdog ends when another helper took over (F11 switch)
+static int g_reset_next;   // the next frame without DLSS / FSR history (after an F11 switch)
+static wchar_t g_cmd[3 * MAX_PATH + 64];   // the helper's command line (kept for a restart)
 static volatile DWORD g_present_tid;   // the thread that presents (the game's main thread), for the watchdog
 
 int fgb_active(void) { return g_live && g_sh && !g_sh->error && WaitForSingleObject(g_helper, 0) == WAIT_TIMEOUT; }
 
-static int inverse4(const float *m, float *out) {   // Gauss-Jordan, row-major
-    float a[4][8];
+static int inverse4(const double *m, double *out) {   // Gauss-Jordan, row-major
+    double a[4][8];
     for (int r = 0; r < 4; r++)
         for (int c = 0; c < 8; c++) a[r][c] = c < 4 ? m[r * 4 + c] : (c - 4 == r);
     for (int c = 0; c < 4; c++) {
         int p = c;
-        for (int r = c + 1; r < 4; r++) if (fabsf(a[r][c]) > fabsf(a[p][c])) p = r;
-        if (fabsf(a[p][c]) < 1e-12f) return 0;
-        for (int k = 0; k < 8; k++) { float t = a[c][k]; a[c][k] = a[p][k]; a[p][k] = t; }
-        float d = a[c][c];
+        for (int r = c + 1; r < 4; r++) if (fabs(a[r][c]) > fabs(a[p][c])) p = r;
+        if (fabs(a[p][c]) < 1e-12) return 0;
+        for (int k = 0; k < 8; k++) { double t = a[c][k]; a[c][k] = a[p][k]; a[p][k] = t; }
+        double d = a[c][c];
         for (int k = 0; k < 8; k++) a[c][k] /= d;
         for (int r = 0; r < 4; r++) {
             if (r == c) continue;
-            float f = a[r][c];
+            double f = a[r][c];
             for (int k = 0; k < 8; k++) a[r][k] -= f * a[c][k];
         }
     }
     for (int r = 0; r < 4; r++)
         for (int c = 0; c < 4; c++) out[r * 4 + c] = a[r][c + 4];
     return 1;
+}
+
+// one fence per signaller (a fence's value must only grow): this context, the helper's SR queue, its present queue; made
+// again for a helper started by an F11 switch: when the old helper's D3D12 device goes, Windows completes its shared fences
+// for good (UINT64_MAX), and every GPU wait between the game and the new helper would pass at once (AGENT_LOG 166). f: the
+// frame the new helper starts at (game fence 2f, helper fences f)
+static wchar_t g_fence_names[3][64];
+static int make_fences(uint32_t f) {
+    ID3D11Device5 *d5 = NULL;
+    if (FAILED(ID3D11Device_QueryInterface(g_dev, &iid_device5, (void **)&d5))) return 0;
+    ID3D11Fence **fences[3] = {&g_fence, &g_fsr, &g_fdone};
+    int ok = 1;
+    for (int i = 0; i < 3 && ok; i++) {
+        if (*fences[i]) { ID3D11Fence_Release(*fences[i]); *fences[i] = NULL; }
+        if (g_handles[i]) { CloseHandle(g_handles[i]); g_handles[i] = NULL; }
+        ok = SUCCEEDED(ID3D11Device5_CreateFence(d5, i ? f : 2ull * f, D3D11_FENCE_FLAG_SHARED, &iid_fence, (void **)fences[i])) &&
+             SUCCEEDED(ID3D11Fence_CreateSharedHandle(*fences[i], NULL, GENERIC_ALL, g_fence_names[i], &g_handles[i]));
+    }
+    ID3D11Device5_Release(d5);
+    return ok;
 }
 
 static ID3D11Texture2D *shared_tex(UINT w, UINT h, DXGI_FORMAT f, UINT bind, const wchar_t *name, HANDLE *keep) {
@@ -147,6 +248,49 @@ void fgb_set_fg_test_limit(uint32_t limit) { g_fg_test_limit = limit; }
 // dev test (fgbridge_on.txt "fakeamd"): the game's GPU is treated as not NVIDIA
 static int g_test_not_nvidia;
 void fgb_set_test_not_nvidia(int on) { g_test_not_nvidia = on; }
+// AMD FSR (FSR_PLAN F5): FgbShared::tech, 0 NVIDIA only, 1 auto (DLSS / DLSS-G where the GPU has them, AMD FSR for the
+// rest), 2 AMD FSR for both (settings.txt technology=fsr, fgbridge_on.txt forcefsr; any GPU that is not NVIDIA)
+static uint32_t g_tech = 1;
+void fgb_set_tech(unsigned tech) { g_tech = tech; }
+// what runs: 0 none, 1 NVIDIA, 2 AMD FSR (a helper without FGB_CAP_FSR leaves 0 there: NVIDIA's)
+unsigned fgb_sr_backend(void) { return g_sh && g_sh->helper_ok ? (g_sh->sr_backend ? g_sh->sr_backend : 1) : 0; }
+unsigned fgb_fg_backend(void) { return g_sh && g_sh->helper_ok && g_sh->fg_max ? (g_sh->fg_backend ? g_sh->fg_backend : 1) : 0; }
+// AMD's files in the add-on (the helper's folder): without them the bridge stays NVIDIA only
+static int amd_files(const wchar_t *helper_exe) {
+    wchar_t p[MAX_PATH];
+    const wchar_t *s = wcsrchr(helper_exe, L'\\');
+    int n = s ? (int)(s - helper_exe) : 0;
+    if (_snwprintf(p, MAX_PATH, L"%.*ls%lsamd_fidelityfx_loader_dx12.dll", n, helper_exe, n ? L"\\" : L"") < 0) return 0;
+    return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES;
+}
+
+// the helper: helper64.exe bridge <pid> <streamline dir> <log dir>, killed with this process (job object); waits up to
+// 10 s for it to be ready (fgb_start, fgb_restart)
+static int launch_helper(void) {
+    HANDLE job = CreateJobObjectW(NULL, NULL);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {0};
+    li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li);
+    STARTUPINFOW si = {sizeof si};
+    PROCESS_INFORMATION pi;
+    if (!CreateProcessW(NULL, g_cmd, NULL, NULL, FALSE, CREATE_SUSPENDED | CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) { g_log("frame bridge: helper not started (%lu) - off", GetLastError()); CloseHandle(job); return 0; }
+    AssignProcessToJobObject(job, pi.hProcess);
+    ResumeThread(pi.hThread);
+    CloseHandle(pi.hThread);
+    g_helper = pi.hProcess;
+    g_gen++;
+    // 10 s by the clock (Sleep(1) lasts 15.6 ms at Windows' default timer, so counting sleeps could take ~2.5 min)
+    for (ULONGLONG t0 = GetTickCount64(); !g_sh->helper_ok && !g_sh->error && GetTickCount64() - t0 < 10000 &&
+                                          WaitForSingleObject(g_helper, 0) == WAIT_TIMEOUT;)
+        Sleep(1);
+    if (!g_sh->helper_ok) {   // a slow start must not leave the helper running with the game's window
+        TerminateProcess(g_helper, 1);
+        WaitForSingleObject(g_helper, 1000);
+        g_log("frame bridge: helper did not start Streamline - off (see its log)");
+        return 0;
+    }
+    return 1;
+}
 
 int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UINT h, DXGI_FORMAT fmt, const wchar_t *helper_exe,
               const wchar_t *sl_dir, const wchar_t *log_dir, uint32_t fg_frames, void (*log)(const char *fmt, ...)) {
@@ -161,6 +305,13 @@ int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UI
     if (ad) IDXGIAdapter_Release(ad);
     if (xd) IDXGIDevice_Release(xd);
     if (FAILED(ahr)) { log("frame bridge: the game's GPU could not be identified - off"); return 0; }
+    g_gpu_vendor = adesc.VendorId;
+    lstrcpynW(g_gpu_name, adesc.Description, 128);
+    if ((adesc.VendorId != 0x10DE || g_test_not_nvidia) && g_tech && amd_files(helper_exe)) {
+        log("frame bridge: the game runs on a GPU that is not NVIDIA (vendor 0x%04X%s) - AMD FSR for upscaling and frame generation",
+            adesc.VendorId, g_test_not_nvidia ? ", test" : "");
+        g_tech = 2;
+    } else
     if (adesc.VendorId != 0x10DE || g_test_not_nvidia) {
         log("frame bridge: the game runs on a GPU that is not NVIDIA (vendor 0x%04X%s) - off, the game renders as usual", adesc.VendorId,
             g_test_not_nvidia ? ", test" : "");
@@ -177,13 +328,9 @@ int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UI
     static const wchar_t *const what[11] = {L"map", L"wake", L"fence", L"fsr", L"fdone", L"final", L"hudless", L"depth", L"mvec",
                                             L"srout0", L"srout1"};
     for (int i = 0; i < 11; i++) _snwprintf(n[i], 64, L"Local\\fgb_%lu_%ls", (unsigned long)pid, what[i]);
-    // one fence per signaller (a fence's value must only grow): this context, the helper's SR queue, its present queue
-    ID3D11Fence **fences[3] = {&g_fence, &g_fsr, &g_fdone};
-    int ok = 1;
-    for (int i = 0; i < 3 && ok; i++)
-        ok = SUCCEEDED(ID3D11Device5_CreateFence(d5, 0, D3D11_FENCE_FLAG_SHARED, &iid_fence, (void **)fences[i])) &&
-             SUCCEEDED(ID3D11Fence_CreateSharedHandle(*fences[i], NULL, GENERIC_ALL, n[2 + i], &g_handles[i]));
     ID3D11Device5_Release(d5);
+    for (int i = 0; i < 3; i++) lstrcpynW(g_fence_names[i], n[2 + i], 64);
+    int ok = make_fences(0);
     UINT ro = D3D11_BIND_SHADER_RESOURCE, rw = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
     ok = ok && (g_final = shared_tex(w, h, fmt, ro, n[5], &g_handles[3])) && (g_hud = shared_tex(w, h, fmt, ro, n[6], &g_handles[4])) &&
          (g_d32 = shared_tex(w, h, DXGI_FORMAT_R32_FLOAT, rw, n[7], &g_handles[5])) &&
@@ -217,7 +364,35 @@ int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UI
         if (sb) ID3D10Blob_Release(sb);
         if (!sok) { g_sharp_cs = NULL; log("frame bridge: sharpening not available (back buffer format %u)", fmt); }
     }
+    {   // the hole fill after the per-object pass (fill_src): the two copies of the vectors it reads
+        D3D11_TEXTURE2D_DESC md = {w, h, 1, 1, DXGI_FORMAT_R16G16_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+        D3D11_BUFFER_DESC fbd = {16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+        ID3DBlob *fb = NULL;
+        int fok = SUCCEEDED(comp(fill_src, strlen(fill_src), "fgbfill", NULL, NULL, "cs", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &fb, NULL)) &&
+                  SUCCEEDED(ID3D11Device_CreateComputeShader(dev, ID3D10Blob_GetBufferPointer(fb), ID3D10Blob_GetBufferSize(fb), NULL, &g_fill_cs)) &&
+                  SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &md, NULL, &g_mvcam)) && SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &md, NULL, &g_mvobj)) &&
+                  SUCCEEDED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)g_mvcam, NULL, &g_mvcam_srv)) &&
+                  SUCCEEDED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)g_mvobj, NULL, &g_mvobj_srv)) &&
+                  SUCCEEDED(ID3D11Device_CreateBuffer(dev, &fbd, NULL, &g_fill_cb));
+        if (fb) ID3D10Blob_Release(fb);
+        if (!fok) { g_fill_cs = NULL; log("frame bridge: motion vector hole fill not available"); }
+    }
 
+    {   // the reactive mask for AMD FSR (react_src): shared as "react"; an older helper does not open it
+        wchar_t rn[64];
+        _snwprintf(rn, 64, L"Local\\fgb_%lu_react", (unsigned long)pid);
+        D3D11_BUFFER_DESC rbd = {32, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+        ID3DBlob *rb = NULL;
+        int rok = (g_react = shared_tex(w, h, DXGI_FORMAT_R8_UNORM, rw | D3D11_BIND_RENDER_TARGET, rn, &g_react_handle)) &&
+                  SUCCEEDED(ID3D11Device_CreateUnorderedAccessView(dev, (ID3D11Resource *)g_react, NULL, &g_react_uav)) &&
+                  SUCCEEDED(ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)g_react, NULL, &g_react_rtv)) &&
+                  SUCCEEDED(comp(react_src, strlen(react_src), "fgbreact", NULL, NULL, "cs", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &rb, NULL)) &&
+                  SUCCEEDED(ID3D11Device_CreateComputeShader(dev, ID3D10Blob_GetBufferPointer(rb), ID3D10Blob_GetBufferSize(rb), NULL, &g_react_cs)) &&
+                  SUCCEEDED(ID3D11Device_CreateBuffer(dev, &rbd, NULL, &g_react_cb));
+        if (rb) ID3D10Blob_Release(rb);
+        if (!rok) { g_react_cs = NULL; log("frame bridge: AMD FSR reactive mask not available"); }
+        else { float z[4] = {0}; ID3D11DeviceContext_ClearUnorderedAccessViewFloat(ctx, g_react_uav, z); }
+    }
     // each named object must be new: one made first by another process under our name would be read and written by us
     int taken = 0;
     g_map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(FgbShared), n[0]);
@@ -238,34 +413,14 @@ int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UI
     g_sh->fg_frames = fg_frames;
     g_sh->render_w = g_rw; g_sh->render_h = g_rh; g_sh->sr_on = g_sr; g_sh->sr_preset = g_preset; g_sh->vsync_off = g_vsync_off;
     g_sh->fg_test_limit = g_fg_test_limit;
+    g_sh->tech = g_tech;
     g_sh->proto = FGB_PROTO;
 
-    // the helper: helper64.exe bridge <pid> <streamline dir> <log dir>, killed with this process (job object)
-    wchar_t cmd[3 * MAX_PATH + 64];
-    _snwprintf(cmd, sizeof cmd / sizeof *cmd, L"\"%ls\" bridge %lu \"%ls\" \"%ls\"", helper_exe, (unsigned long)pid, sl_dir, log_dir);
-    HANDLE job = CreateJobObjectW(NULL, NULL);
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {0};
-    li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li);
-    STARTUPINFOW si = {sizeof si};
-    PROCESS_INFORMATION pi;
-    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_SUSPENDED | CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) { log("frame bridge: helper not started (%lu) - off", GetLastError()); return 0; }
-    AssignProcessToJobObject(job, pi.hProcess);
-    ResumeThread(pi.hThread);
-    CloseHandle(pi.hThread);
-    g_helper = pi.hProcess;
-    // 10 s by the clock: Sleep(1) can last 15.6 ms, so counting sleeps could wait minutes
-    for (ULONGLONG t0 = GetTickCount64(); !g_sh->helper_ok && !g_sh->error && GetTickCount64() - t0 < 10000 &&
-                                          WaitForSingleObject(g_helper, 0) == WAIT_TIMEOUT;) Sleep(1);
-    if (!g_sh->helper_ok) {
-        TerminateProcess(g_helper, 1);   // a helper still starting would go on with the game's window
-        CloseHandle(g_helper);
-        g_helper = NULL;
-        log("frame bridge: helper did not start Streamline - off (see its log)");
-        return 0;
-    }
+    // the helper (launch_helper)
+    _snwprintf(g_cmd, sizeof g_cmd / sizeof *g_cmd, L"\"%ls\" bridge %lu \"%ls\" \"%ls\"", helper_exe, (unsigned long)pid, sl_dir, log_dir);
+    if (!launch_helper()) return 0;
     g_live = 1;
-    HANDLE wd = CreateThread(NULL, 0, watchdog, NULL, 0, NULL);
+    HANDLE wd = CreateThread(NULL, 0, watchdog, (void *)(UINT_PTR)g_gen, 0, NULL);
     if (wd) CloseHandle(wd);
     if (fg_frames > g_sh->fg_max) {   // NVIDIA's rules for this GPU (the helper asked Streamline)
         log("frame bridge: frame generation %ux asked, this GPU allows %ux at most - using that", fg_frames + 1, g_sh->fg_max + 1);
@@ -273,24 +428,33 @@ int fgb_start(ID3D11Device *dev, ID3D11DeviceContext *ctx, HWND hwnd, UINT w, UI
     }
     log("frame bridge on: %ux%u format %u, frame generation %ux (this GPU allows %s)", w, h, fmt, g_sh->fg_frames + 1,
         !g_sh->fg_max ? "none" : g_sh->fg_max == 1 ? "2x" : g_sh->fg_max == 2 ? "up to 3x" : "up to 4x");
+    static const char *const be[3] = {"none", "NVIDIA DLSS", "AMD FSR"};
+    log("frame bridge: upscaling %s, frame generation %s%s", be[fgb_sr_backend() % 3], be[fgb_fg_backend() % 3],
+        g_tech && !(g_sh->helper_caps & FGB_CAP_FSR) ? " (the add-on's helper is older and has no AMD FSR)" : "");
     return 1;
 }
 
 void fgb_set_fg(uint32_t frames_to_generate) { if (g_sh) g_sh->fg_frames = frames_to_generate > g_sh->fg_max ? g_sh->fg_max : frames_to_generate; }
-unsigned fgb_fg_max(void) { return g_sh ? g_sh->fg_max : 0; }
-int fgb_helper_has_presets(void) { return g_sh && (g_sh->helper_caps & FGB_CAP_PRESET); }   // an older add-on's helper: 0   // generated frames this GPU allows (0 = none)
-// the frame cap: NVIDIA Reflex's limiter in the helper, microseconds per shown frame (0 = none)
-void fgb_set_frame_limit(uint32_t us) { if (g_sh) g_sh->frame_limit_us = us; }
+unsigned fgb_fg_max(void) { return g_sh ? g_sh->fg_max : 0; }   // generated frames this GPU allows (0 = none)
+
+// per-object motion (fgmotion.c): draws over the camera motion vectors, after the camera pass and before the inputs are
+// published; gets the game's depth and this frame's jitter
+static int (*g_motion_pass)(ID3D11Resource *depth, float jx, float jy);
+void fgb_set_motion(int (*pass)(ID3D11Resource *depth, float jx, float jy)) { g_motion_pass = pass; }
+ID3D11Texture2D *fgb_mv_texture(void) { return g_mv; }
+void fgb_set_frame_limit(uint32_t us) { if (g_sh) g_sh->frame_limit_us = us; }   // NVIDIA Reflex frame limit (0 none)
+// DLSS preset for every mode, NVIDIA's number (10..13 = J..M, 0 its default per mode); the helper applies it from the next frame
+void fgb_set_preset(unsigned preset) { g_preset = preset; if (g_sh) g_sh->sr_preset = preset; }
+int fgb_helper_has_presets(void) { return g_sh && (g_sh->helper_caps & FGB_CAP_PRESET); }   // an older add-on's helper: 0
 // V-Sync of the helper's presents (on by default: its frames never get windowed G-Sync, and without V-Sync they tear);
 // off = the player's choice (g_vsync_off, above). An older helper keeps V-Sync on.
 void fgb_set_vsync(int on) { g_vsync_off = !on; if (g_sh) g_sh->vsync_off = g_vsync_off; }
 int fgb_helper_has_vsync(void) { return g_sh && (g_sh->helper_caps & FGB_CAP_VSYNC); }
-
-// per-object motion (fgmotion.c): draws over the camera motion vectors, after the camera pass and before the inputs are
-// published; gets the game's depth and this frame's jitter
-static void (*g_motion_pass)(ID3D11Resource *depth, float jx, float jy);
-void fgb_set_motion(void (*pass)(ID3D11Resource *depth, float jx, float jy)) { g_motion_pass = pass; }
-ID3D11Texture2D *fgb_mv_texture(void) { return g_mv; }
+// NVIDIA's driver Vertical sync for the helper (it overrides the choice above): FgbShared::driver_vsync, 0 unknown
+int fgb_driver_vsync(void) { return g_sh && g_sh->helper_ok ? (int)g_sh->driver_vsync : 0; }
+// Sharpening of the DLSS output: RCAS's con (exp2(-stops)), 0 off. Takes effect from the next frame.
+void fgb_set_sharpness(float con) { g_sharpness = con; }
+unsigned fgb_sharp_frames(void) { return g_sharp_frames; }   // frames sharpened so far
 unsigned fgb_shown(void) { return g_sh ? g_sh->shown : 0; }   // frames the helper has shown (generated ones included)
 
 // DLSS SR on / off and the render size (<= the output size; equal = DLAA). Takes effect from the next frame.
@@ -298,16 +462,6 @@ void fgb_set_sr(int on, UINT render_w, UINT render_h) {
     g_sr = on;
     g_rw = on ? render_w : g_w; g_rh = on ? render_h : g_h;
     if (g_sh) { g_sh->render_w = g_rw; g_sh->render_h = g_rh; g_sh->sr_on = on; }
-}
-
-// The DLSS preset (NVIDIA's number: 0 its default per mode, 10..13 J..M). Takes effect from the next frame.
-// Sharpening of the DLSS output: RCAS's con (exp2(-stops)), 0 off. Takes effect from the next frame.
-void fgb_set_sharpness(float con) { g_sharpness = con; }
-unsigned fgb_sharp_frames(void) { return g_sharp_frames; }   // frames sharpened so far
-
-void fgb_set_preset(uint32_t preset) {
-    g_preset = preset;
-    if (g_sh) g_sh->sr_preset = preset;
 }
 
 static float halton(unsigned i, unsigned b) {
@@ -340,13 +494,19 @@ UINT fgb_render_h(void) { return g_rh; }
 // GPU time per frame (AGENT_LOG 109: 120-135 fps without the add-on, ~75 with it, zoomed in on a clump of soldiers, with
 // per-object motion on or off): timestamps around the wait for the helper, the HUD-less step, the Present step and the
 // frame end, read back 6 frames later without waiting (not ready = counted as not read).
-enum { TQ_DIS, TQ_W0, TQ_W1, TQ_H1, TQ_P0, TQ_END, TQ_N };
+enum { TQ_DIS, TQ_W0, TQ_W1, TQ_H1, TQ_P0, TQ_END, TQ_M0, TQ_MW, TQ_M1, TQ_N };   // M0 / M1: around the per-object motion pass, MW: after its trees and plants
 static ID3D11Query *g_tq[8][TQ_N];
 static int g_tq_set[8], g_tq_failed;
 static UINT64 g_tq_prev_end;
 static uint32_t g_tq_prev_f = (uint32_t)-2;
 static double g_gpu_ms[4];   // frame interval, stalled waiting for the helper, HUD-less step, Present step
+static double g_gpu_cum[4];  // the same, totals since the start (fgb_gpu_totals: callers take differences)
+static unsigned g_gpu_cumn[4];
 static unsigned g_gpu_n[4], g_gpu_lost;
+static double g_mp_gpu, g_mp_cpu;   // the motion pass with its hole fill, totals since the start (ms; fgb_motion_cost)
+static unsigned g_mp_gpu_n, g_mp_cpu_n;
+static double g_mp_wind;   // of g_mp_gpu: the trees and plants (M0..MW; the rest is the models and the hole fill)
+static unsigned g_mp_wind_n;
 static unsigned g_wait_queued, g_wait_frames;   // wait_previous: GPU waits queued, frames
 
 static void tq(int k) {
@@ -374,12 +534,22 @@ static void tq_read(uint32_t f) {
         if (set & 1 << k) ok = ID3D11DeviceContext_GetData(g_ctx, (ID3D11Asynchronous *)g_tq[s][k], &t[k], 8, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
     if (!ok) { g_gpu_lost++; return; }
     double ms = 1000.0 / (double)dj.Frequency;
-    if (g_tq_prev_f == f - 1) { g_gpu_ms[0] += (double)(t[TQ_END] - g_tq_prev_end) * ms; g_gpu_n[0]++; }
+    if (g_tq_prev_f == f - 1) { g_gpu_ms[0] += (double)(t[TQ_END] - g_tq_prev_end) * ms; g_gpu_n[0]++; g_gpu_cum[0] += (double)(t[TQ_END] - g_tq_prev_end) * ms; g_gpu_cumn[0]++; }
     g_tq_prev_end = t[TQ_END];
     g_tq_prev_f = f;
     if ((set & 3 << TQ_W0) == 3 << TQ_W0) { g_gpu_ms[1] += (double)(t[TQ_W1] - t[TQ_W0]) * ms; g_gpu_n[1]++; }
-    if (set & 1 << TQ_H1) { g_gpu_ms[2] += (double)(t[TQ_H1] - t[TQ_W1]) * ms; g_gpu_n[2]++; }
+    if (set & 1 << TQ_H1) { g_gpu_ms[2] += (double)(t[TQ_H1] - t[TQ_W1]) * ms; g_gpu_n[2]++; g_gpu_cum[2] += (double)(t[TQ_H1] - t[TQ_W1]) * ms; g_gpu_cumn[2]++; }
     if (set & 1 << TQ_P0) { g_gpu_ms[3] += (double)(t[TQ_END] - t[TQ_P0]) * ms; g_gpu_n[3]++; }
+    if ((set & 1 << TQ_M0) && (set & 1 << TQ_M1)) { g_mp_gpu += (double)(t[TQ_M1] - t[TQ_M0]) * ms; g_mp_gpu_n++; }
+    if ((set & 1 << TQ_M0) && (set & 1 << TQ_MW)) { g_mp_wind += (double)(t[TQ_MW] - t[TQ_M0]) * ms; g_mp_wind_n++; }
+}
+void fgb_motion_wind_cost(double *gpu_ms, unsigned *n) { *gpu_ms = g_mp_wind; *n = g_mp_wind_n; }   // totals, as fgb_motion_cost
+void fgb_gpu_totals(double *interval_ms, unsigned *intervals, double *hud_ms, unsigned *huds) {   // totals: GPU frame interval, HUD-less step
+    *interval_ms = g_gpu_cum[0]; *intervals = g_gpu_cumn[0]; *hud_ms = g_gpu_cum[2]; *huds = g_gpu_cumn[2];
+}
+// the per-object motion pass: GPU ms (frames timed), main-thread ms (frames), totals since the start - callers take differences
+void fgb_motion_cost(double *gpu_ms, unsigned *gpu_n, double *cpu_ms, unsigned *cpu_n) {
+    *gpu_ms = g_mp_gpu; *gpu_n = g_mp_gpu_n; *cpu_ms = g_mp_cpu; *cpu_n = g_mp_cpu_n;
 }
 
 // per frame averages since the last call: GPU frame interval, stall on the helper, HUD-less step, Present step (ms)
@@ -427,8 +597,8 @@ void fgb_cpu_stats(double *hud_ms, double *present_ms, double *pace_ms, unsigned
 static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, const float vp[16]);
 static void depth_upscale(void);
 // after the render's copy into dst: with the viewport shifted left (jx < 0) / up (jy < 0) the render's last column / row
-// was never drawn (the clear colour: DLSS kept it and smeared it into lines along the right edge while the camera moved,
-// white on the campaign map); it gets the one before it from src
+// was never drawn (the clear colour: DLSS kept it and smeared it into lines along the right edge while the camera moved;
+// Rome 2's player report, measured here too); it gets the one before it from src
 static void jit_edge_fill(ID3D11DeviceContext *ctx, ID3D11Resource *dst, ID3D11Resource *src, UINT rw, UINT rh, float jx, float jy) {
     UINT dx = jx < 0 && rw > 1, dy = jy < 0 && rh > 1;
     if (dx) {
@@ -444,13 +614,6 @@ static void jit_edge_fill(ID3D11DeviceContext *ctx, ID3D11Resource *dst, ID3D11R
         ID3D11DeviceContext_CopySubresourceRegion(ctx, dst, 0, rw - 1, rh - 1, 0, src, 0, &b);
     }
 }
-// after the SR round trip and ReShade's effects on its output (bridgeprobe.c): the back buffer, still without the UI, is
-// frame generation's HUD-less image (a helper without FGB_CAP_HUD_POST keeps its SR output: the effects only in the final)
-void fgb_hud_post(ID3D11Resource *backbuffer) {
-    if (!fgb_active() || !g_hud_done || !(g_sh->helper_caps & FGB_CAP_HUD_POST)) return;
-    ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_hud, backbuffer);
-    g_hud_post = 1;
-}
 void fgb_hudless(ID3D11Resource *backbuffer, ID3D11Resource *depth, const float vp[16]) {
     LARGE_INTEGER t0;
     QueryPerformanceCounter(&t0);
@@ -458,19 +621,143 @@ void fgb_hudless(ID3D11Resource *backbuffer, ID3D11Resource *depth, const float 
     if (g_tq_set[g_n % 8] & 1 << TQ_W1) tq(TQ_H1);
     g_hud_ms += ms_since(t0);
 }
-static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, const float vp[16]) {
-    if (!fgb_active()) return;
+// after the SR round trip and ReShade's effects on its output (bridgeprobe.c): the back buffer, still without the UI, is
+// frame generation's HUD-less image (a helper without FGB_CAP_HUD_POST keeps its SR output: the effects only in the final)
+void fgb_hud_post(ID3D11Resource *backbuffer) {
+    if (!fgb_active() || !g_hud_done || !(g_sh->helper_caps & FGB_CAP_HUD_POST)) return;
+    ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_hud, backbuffer);
+    g_hud_post = 1;
+}
+// the hole fill around the per-object pass (fill_src): begin keeps the camera-only vectors, end fills the holes. Also
+// called by bridgetest (boxmv) around its own object vectors.
+void fgb_fill_begin(void) {
+    if (g_tq_set[g_n % 8] & 1 << TQ_M0) tq(TQ_MW);   // the motion pass's trees and plants are done (fgb_motion_wind_cost)
+    if (g_fill_cs) ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_mvcam, (ID3D11Resource *)g_mv); }
+
+void fgb_fill_end(UINT rw, UINT rh) {
+    if (!g_fill_cs) return;
+    ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_mvobj, (ID3D11Resource *)g_mv);
+    struct { UINT w, h; float tol, unitk; } k = {rw, rh, 0.03f, g_react_uav && fgb_sr_backend() == 2 ? g_fill_unitk : 0};
+    ID3D11DeviceContext_UpdateSubresource(g_ctx, (ID3D11Resource *)g_fill_cb, 0, NULL, &k, 0, 0);
+    // the game's compute bindings in the slots used, put back afterwards
+    ID3D11ComputeShader *ocs = NULL; ID3D11ClassInstance *oci[1]; UINT onci = 1;
+    ID3D11ShaderResourceView *osrv[2] = {0}; ID3D11UnorderedAccessView *ouav[3] = {0}; ID3D11Buffer *ocb = NULL;
+    ID3D11DeviceContext_CSGetShader(g_ctx, &ocs, oci, &onci);
+    ID3D11DeviceContext_CSGetShaderResources(g_ctx, 0, 2, osrv);
+    ID3D11DeviceContext_CSGetUnorderedAccessViews(g_ctx, 0, 3, ouav);
+    ID3D11DeviceContext_CSGetConstantBuffers(g_ctx, 0, 1, &ocb);
+    ID3D11ShaderResourceView *srv[2] = {g_mvcam_srv, g_mvobj_srv};
+    ID3D11UnorderedAccessView *uav[3] = {g_mv_uav, g_d32_uav, g_react_uav};
+    ID3D11DeviceContext_CSSetShader(g_ctx, g_fill_cs, NULL, 0);
+    ID3D11DeviceContext_CSSetShaderResources(g_ctx, 0, 2, srv);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(g_ctx, 0, 3, uav, NULL);
+    ID3D11DeviceContext_CSSetConstantBuffers(g_ctx, 0, 1, &g_fill_cb);
+    ID3D11DeviceContext_Dispatch(g_ctx, (rw + 7) / 8, (rh + 7) / 8, 1);
+    ID3D11ShaderResourceView *nsrv[2] = {0};
+    ID3D11DeviceContext_CSSetShaderResources(g_ctx, 0, 2, nsrv);
+    ID3D11DeviceContext_CSSetShader(g_ctx, ocs, onci ? oci : NULL, onci);
+    ID3D11DeviceContext_CSSetShaderResources(g_ctx, 0, 2, osrv);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(g_ctx, 0, 3, ouav, NULL);
+    ID3D11DeviceContext_CSSetConstantBuffers(g_ctx, 0, 1, &ocb);
+    if (ocs) ID3D11ComputeShader_Release(ocs);
+    for (UINT i = 0; i < onci; i++) if (oci[i]) ID3D11ClassInstance_Release(oci[i]);
+    for (int i = 0; i < 2; i++) if (osrv[i]) ID3D11ShaderResourceView_Release(osrv[i]);
+    for (int i = 0; i < 3; i++) if (ouav[i]) ID3D11UnorderedAccessView_Release(ouav[i]);
+    if (ocb) ID3D11Buffer_Release(ocb);
+    g_fill_frames++;
+    if (k.unitk > 0) g_react_frame = g_n;   // the mask holds this frame's units: the HUD-less step keeps it
+}
+unsigned fgb_fill_frames(void) { return g_fill_frames; }   // frames whose holes were filled so far
+// the reactive mask around Attila's transparent-effects stage (bridgeprobe.c bp_enter); only while AMD FSR upscales
+static int react_copy(ID3D11Texture2D **t, ID3D11ShaderResourceView **srv, ID3D11Resource *src) {
+    D3D11_TEXTURE2D_DESC d;
+    ID3D11Texture2D_GetDesc((ID3D11Texture2D *)src, &d);
+    if (*t) { D3D11_TEXTURE2D_DESC o; ID3D11Texture2D_GetDesc(*t, &o);
+        if (o.Width != d.Width || o.Height != d.Height || o.Format != d.Format) { ID3D11ShaderResourceView_Release(*srv); ID3D11Texture2D_Release(*t); *t = NULL; *srv = NULL; } }
+    if (!*t) {
+        if (d.SampleDesc.Count != 1 || d.ArraySize != 1) return 0;
+        d.MipLevels = 1; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE; d.CPUAccessFlags = 0; d.MiscFlags = 0;
+        if (FAILED(ID3D11Device_CreateTexture2D(g_dev, &d, NULL, t))) { *t = NULL; return 0; }
+        if (FAILED(ID3D11Device_CreateShaderResourceView(g_dev, (ID3D11Resource *)*t, NULL, srv))) { ID3D11Texture2D_Release(*t); *t = NULL; return 0; }
+    }
+    ID3D11DeviceContext_CopySubresourceRegion(g_ctx, (ID3D11Resource *)*t, 0, 0, 0, 0, src, 0, NULL);
+    return 1;
+}
+void fgb_react_begin(ID3D11Resource *hdr) {
+    if (!g_react_cs || !fgb_active() || fgb_sr_backend() != 2 || !hdr) return;
+    if (!react_copy(&g_opq, &g_opq_srv, hdr)) return;
+    if (g_react_hdr) ID3D11Resource_Release(g_react_hdr);
+    g_react_hdr = hdr; ID3D11Resource_AddRef(hdr);
+    g_react_begun = g_n;
+}
+void fgb_react_end(void) {
+    if (g_react_begun != g_n || !g_react_hdr || !react_copy(&g_cur, &g_cur_srv, g_react_hdr)) return;
+    wait_previous();   // the helper may still read the previous frame's mask
+    UINT rw = g_sr ? g_rw : g_w, rh = g_sr ? g_rh : g_h;
+    struct { UINT w, h; float scale, cap, floor_, pad[3]; } k = {rw, rh, 1.0f, 0.9f, g_react_floor, {0, 0, 0}};
+    ID3D11DeviceContext_UpdateSubresource(g_ctx, (ID3D11Resource *)g_react_cb, 0, NULL, &k, 0, 0);
+    ID3D11ComputeShader *ocs = NULL; ID3D11ClassInstance *oci[1]; UINT onci = 1;
+    ID3D11ShaderResourceView *osrv[2] = {0}; ID3D11UnorderedAccessView *ouav = NULL; ID3D11Buffer *ocb = NULL;
+    ID3D11DeviceContext_CSGetShader(g_ctx, &ocs, oci, &onci);
+    ID3D11DeviceContext_CSGetShaderResources(g_ctx, 0, 2, osrv);
+    ID3D11DeviceContext_CSGetUnorderedAccessViews(g_ctx, 0, 1, &ouav);
+    ID3D11DeviceContext_CSGetConstantBuffers(g_ctx, 0, 1, &ocb);
+    ID3D11ShaderResourceView *srv[2] = {g_opq_srv, g_cur_srv};
+    ID3D11DeviceContext_CSSetShader(g_ctx, g_react_cs, NULL, 0);
+    ID3D11DeviceContext_CSSetShaderResources(g_ctx, 0, 2, srv);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(g_ctx, 0, 1, &g_react_uav, NULL);
+    ID3D11DeviceContext_CSSetConstantBuffers(g_ctx, 0, 1, &g_react_cb);
+    ID3D11DeviceContext_Dispatch(g_ctx, (rw + 7) / 8, (rh + 7) / 8, 1);
+    ID3D11ShaderResourceView *nsrv[2] = {0};
+    ID3D11DeviceContext_CSSetShaderResources(g_ctx, 0, 2, nsrv);
+    ID3D11DeviceContext_CSSetShader(g_ctx, ocs, onci ? oci : NULL, onci);
+    ID3D11DeviceContext_CSSetShaderResources(g_ctx, 0, 2, osrv);
+    ID3D11DeviceContext_CSSetUnorderedAccessViews(g_ctx, 0, 1, &ouav, NULL);
+    ID3D11DeviceContext_CSSetConstantBuffers(g_ctx, 0, 1, &ocb);
+    if (ocs) ID3D11ComputeShader_Release(ocs);
+    for (UINT i = 0; i < onci; i++) if (oci[i]) ID3D11ClassInstance_Release(oci[i]);
+    for (int i = 0; i < 2; i++) if (osrv[i]) ID3D11ShaderResourceView_Release(osrv[i]);
+    if (ouav) ID3D11UnorderedAccessView_Release(ouav);
+    if (ocb) ID3D11Buffer_Release(ocb);
+    g_react_frame = g_n;
+    g_react_frames++;
+}
+unsigned fgb_react_frames(void) { return g_react_frames; }   // frames with a mask made so far
+// What this GPU can run of NVIDIA's (the F11 panel's choices and recommendation): DLSS upscaling on an RTX, DLSS frame
+// generation on an RTX 40 / 50. While the NVIDIA path runs, the helper's own answer (fg_max) decides; otherwise the name.
+// shortcut: the name test misses workstation cards named without a 4-digit number (RTX A6000, Ada ones), fine for
+// GeForce players; ask the helper if a player with one reports it.
+static int fgb_fg_backend_nv(void) { return g_sh && g_sh->fg_backend <= 1; }   // 0 (older helper) or 1: NVIDIA's
+void fgb_gpu_caps(int *dlss_sr, int *dlss_fg) {
+    const wchar_t *r = g_gpu_vendor == 0x10DE ? wcsstr(g_gpu_name, L"RTX") : NULL;
+    *dlss_sr = r != NULL;
+    *dlss_fg = 0;
+    if (r) {
+        const wchar_t *d = r + 3;
+        while (*d == L' ') d++;
+        *dlss_fg = d[0] >= L'4' && d[0] <= L'9' && d[1] >= L'0' && d[1] <= L'9' && d[2] >= L'0' && d[2] <= L'9' && d[3] >= L'0' && d[3] <= L'9';
+    }
+    if (g_sh && g_sh->helper_ok && g_sh->fg_max && fgb_fg_backend_nv()) *dlss_fg = 1;
+}
+const wchar_t *fgb_gpu_name(void) { return g_gpu_name; }
+// This frame's depth copy for DLSS and motion vectors (camera, then the per-object pass): once per frame, at the first
+// call - fgb_motion_vectors() (another mod's early effects, right after the scene's geometry) or the HUD-less point.
+// Returns 1 if they are made. Before writing, the GPU waits until the helper has read the previous frame's.
+static unsigned g_mv_frame = ~0u;
+static D3D11_TEXTURE2D_DESC g_dfail;   // the depth buffer the copy failed for: not tried (and logged) again every frame
+int fgb_make_vectors(ID3D11Resource *depth, const float vp[16]) {
+    if (!fgb_active()) return 0;
+    if (g_mv_frame == g_n) return 1;
+    // depth: own copy (the game's depth may be bound as the depth target right now), read as R24 by the compute pass
+    D3D11_TEXTURE2D_DESC dd;
+    ID3D11Texture2D_GetDesc((ID3D11Texture2D *)depth, &dd);
+    if (!memcmp(&dd, &g_dfail, sizeof dd)) goto novec;
     wait_previous();
     int sr = g_sr;
     UINT rw = sr ? g_rw : g_w, rh = sr ? g_rh : g_h;
     float jx = sr ? g_jx : 0, jy = sr ? g_jy : 0;
-    D3D11_BOX box = {0, 0, 0, rw, rh, 1};
-    ID3D11DeviceContext_CopySubresourceRegion(g_ctx, (ID3D11Resource *)g_hud, 0, 0, 0, 0, backbuffer, 0, &box);
-    jit_edge_fill(g_ctx, (ID3D11Resource *)g_hud, backbuffer, rw, rh, jx, jy);
-    // depth: own copy (the game's depth is bound as the depth target right now), read as R24 by the compute pass
-    D3D11_TEXTURE2D_DESC dd;
-    ID3D11Texture2D_GetDesc((ID3D11Texture2D *)depth, &dd);
     if (!g_dcopy || dd.Width != g_dw || dd.Height != g_dh) {
+        D3D11_TEXTURE2D_DESC game = dd;
         if (g_dcopy_srv) ID3D11ShaderResourceView_Release(g_dcopy_srv);
         if (g_dcopy) ID3D11Texture2D_Release(g_dcopy);
         g_dcopy = NULL; g_dcopy_srv = NULL;
@@ -479,19 +766,24 @@ static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, cons
         sd.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sd.Texture2D.MipLevels = 1;
         if (dd.Format != DXGI_FORMAT_R24G8_TYPELESS || FAILED(ID3D11Device_CreateTexture2D(g_dev, &dd, NULL, &g_dcopy)) ||
             FAILED(ID3D11Device_CreateShaderResourceView(g_dev, (ID3D11Resource *)g_dcopy, &sd, &g_dcopy_srv))) {
-            g_log("frame bridge: depth format %u not supported - no motion vectors", dd.Format);
-            return;
+            if (g_dcopy) ID3D11Texture2D_Release(g_dcopy);
+            g_dcopy = NULL;
+            g_dfail = game;
+            g_log("frame bridge: depth format %u with %u samples not supported - no motion vectors", game.Format, game.SampleDesc.Count);
+            goto novec;
         }
         g_dw = dd.Width; g_dh = dd.Height;
     }
     ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_dcopy, depth);
-    float inv[16];
-    if (!inverse4(vp, inv)) return;
+    double vd[16], inv[16];
+    for (int i = 0; i < 16; i++) vd[i] = vp[i];
+    if (!inverse4(vd, inv)) goto novec;
     D3D11_MAPPED_SUBRESOURCE m;
-    if (FAILED(ID3D11DeviceContext_Map(g_ctx, (ID3D11Resource *)g_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
+    if (FAILED(ID3D11DeviceContext_Map(g_ctx, (ID3D11Resource *)g_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) goto novec;
     float *c = m.pData;
-    memcpy(c, inv, 64);
-    memcpy(c + 16, g_have_prev ? g_prev_vp : vp, 64);
+    const float *pv = g_have_prev ? g_prev_vp : vp;
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) { double t = 0; for (int k = 0; k < 4; k++) t += pv[i * 4 + k] * inv[k * 4 + j]; c[i * 4 + j] = (float)t; }
     c[32] = (float)rw; c[33] = (float)rh; c[34] = jx; c[35] = jy;
     ID3D11DeviceContext_Unmap(g_ctx, (ID3D11Resource *)g_cb, 0);
     // the game's compute bindings in the slots we use, put back afterwards
@@ -516,11 +808,39 @@ static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, cons
     if (osrv) ID3D11ShaderResourceView_Release(osrv);
     for (int i = 0; i < 2; i++) if (ouav[i]) ID3D11UnorderedAccessView_Release(ouav[i]);
     if (ocb) ID3D11Buffer_Release(ocb);
-    if (g_motion_pass) g_motion_pass(depth, jx, jy);
+    if (g_motion_pass) {
+        LARGE_INTEGER q0, q1, qf;
+        QueryPerformanceCounter(&q0);
+        if (g_tq_set[g_n % 8] & 1 << TQ_DIS) tq(TQ_M0);
+        if (g_motion_pass(depth, jx, jy)) fgb_fill_end(rw, rh);   // the pass calls fgb_fill_begin after its wind draws
+        if (g_tq_set[g_n % 8] & 1 << TQ_M0) tq(TQ_M1);
+        QueryPerformanceCounter(&q1); QueryPerformanceFrequency(&qf);
+        g_mp_cpu += (double)(q1.QuadPart - q0.QuadPart) * 1000 / qf.QuadPart; g_mp_cpu_n++;
+    }
+    if (0) {
+novec:;
+        static const float zero[4] = {0};
+        ID3D11DeviceContext_ClearUnorderedAccessViewFloat(g_ctx, g_mv_uav, zero);
+    }
     memcpy(g_sh->vp, vp, 64);
     memcpy(g_sh->prev_vp, g_have_prev ? g_prev_vp : vp, 64);
     memcpy(g_prev_vp, vp, 64);
     g_have_prev = 1;
+    g_mv_frame = g_n;
+    return 1;
+}
+
+static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, const float vp[16]) {
+    if (!fgb_active()) return;
+    wait_previous();
+    if (g_react_uav && g_react_frame != g_n) { float z[4] = {0}; ID3D11DeviceContext_ClearUnorderedAccessViewFloat(g_ctx, g_react_uav, z); }   // no effects stage this frame
+    int sr = g_sr;
+    UINT rw = sr ? g_rw : g_w, rh = sr ? g_rh : g_h;
+    float jx = sr ? g_jx : 0, jy = sr ? g_jy : 0;
+    D3D11_BOX box = {0, 0, 0, rw, rh, 1};
+    ID3D11DeviceContext_CopySubresourceRegion(g_ctx, (ID3D11Resource *)g_hud, 0, 0, 0, 0, backbuffer, 0, &box);
+    jit_edge_fill(g_ctx, (ID3D11Resource *)g_hud, backbuffer, rw, rh, jx, jy);
+    if (!fgb_make_vectors(depth, vp)) return;
     g_hud_done = 1;
     if (!sr) return;
     // DLSS SR round trip: inputs ready (2n+1) -> the helper's DLSS output n % 2 (SR fence n+1) -> into the back buffer, then the UI
@@ -536,13 +856,13 @@ static void fgb_hudless_(ID3D11Resource *backbuffer, ID3D11Resource *depth, cons
     QueryPerformanceCounter(&q0);
     QueryPerformanceFrequency(&qf);
     // A slow frame is not a dead helper: the helper waits for its earlier DLSS passes on the GPU, so a GPU stall (the
-    // driver compiling ReShade's shaders when its effects load: 50 ms here on a light preset; a player lost DLSS "after
-    // ReShade loaded") delays it. 1.7 gave up after 250 ms; now only when the helper has exited or failed, or after 3 s
-    // (as the watchdog).
+    // driver compiling ReShade's shaders when its effects load; Rome 2 1.8: a player lost DLSS "after ReShade loaded")
+    // delays it. 6.9.0 gave up after 250 ms; now only when the helper has failed or exited, or after 3 s (as the watchdog).
     for (int i = 0; __atomic_load_n(&g_sh->sr_done, __ATOMIC_ACQUIRE) < g_n + 1; i++) {
         QueryPerformanceCounter(&q1);
         double waited = (q1.QuadPart - q0.QuadPart) * 1000.0 / qf.QuadPart;
-        if (g_sh->error || ((i & 63) == 0 && (waited > 3000 || WaitForSingleObject(g_helper, 0) != WAIT_TIMEOUT))) {
+        // checked every 64 spins, and every pass once it sleeps (Sleep(1) can last 15.6 ms: 64 of them were a second)
+        if (g_sh->error || (((i & 63) == 0 || waited > 20) && (waited > 3000 || WaitForSingleObject(g_helper, 0) != WAIT_TIMEOUT))) {
             g_sr_timeouts++;
             g_log("frame bridge: no DLSS output from the helper for frame %u (%.0f ms, helper %s) - bridge off", g_n, waited,
                   g_sh->error ? "failed" : WaitForSingleObject(g_helper, 0) != WAIT_TIMEOUT ? "gone" : "running");
@@ -702,16 +1022,28 @@ void fgb_present(ID3D11Resource *backbuffer) {
     wait_previous();
     tq(TQ_P0);
     if (!g_hud_done) ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_hud, backbuffer);   // no HUD-less point this frame
-    // frame generation's HUD-less image after SR: the game's own (fgb_hud_post) or the helper's SR output
-    uint32_t bit = 1u << (g_n % 32);
-    g_sh->hud_post = g_hud_post && g_hud_done ? g_sh->hud_post | bit : g_sh->hud_post & ~bit;
     ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_final, backbuffer);
     tq(TQ_END);
     if (!g_tq_failed && g_tq[g_n % 8][TQ_DIS]) ID3D11DeviceContext_End(g_ctx, (ID3D11Asynchronous *)g_tq[g_n % 8][TQ_DIS]);
     if (g_n >= 6) tq_read(g_n - 6);
     ID3D11DeviceContext4_Signal(g_ctx4, g_fence, 2ull * g_n + 2);
     ID3D11DeviceContext_Flush(g_ctx);
-    g_sh->reset = !g_hud_done;
+    if (g_lat_cap && g_n) {
+        g_lat_frames++;
+        if (ID3D11Fence_GetCompletedValue(g_fence) < 2ull * g_n && (g_lat_ev || (g_lat_ev = CreateEventW(NULL, FALSE, FALSE, NULL))) &&
+            SUCCEEDED(ID3D11Fence_SetEventOnCompletion(g_fence, 2ull * g_n, g_lat_ev))) {
+            LARGE_INTEGER tl;
+            QueryPerformanceCounter(&tl);
+            WaitForSingleObject(g_lat_ev, 100);   // a GPU that stopped (device lost) must not hang the game
+            g_lat_ms += ms_since(tl);
+            g_lat_waits++;
+        }
+    }
+    g_sh->reset = !g_hud_done || g_reset_next;
+    g_reset_next = 0;
+    // frame generation's HUD-less image after SR: the game's own (fgb_hud_post) or the helper's SR output
+    uint32_t bit = 1u << (g_n % 32);
+    g_sh->hud_post = g_hud_post && g_hud_done ? g_sh->hud_post | bit : g_sh->hud_post & ~bit;
     // a frame without the scene (menu, pause, loading): the next one counts the camera as not moved, not as moved
     // since the last scene frame, seconds ago (one frame of huge wrong motion vectors: a smear after every menu)
     if (!g_hud_done) g_have_prev = 0;
@@ -734,6 +1066,10 @@ void fgb_present(ID3D11Resource *backbuffer) {
 }
 
 unsigned fgb_frames(void) { return g_n; }
+void fgb_set_latency_cap(int on) { g_lat_cap = on; }
+void fgb_latency_stats(double *wait_ms, unsigned *waits, unsigned *frames) {   // totals since the start: callers take differences
+    *wait_ms = g_lat_ms; *waits = g_lat_waits; *frames = g_lat_frames;
+}
 unsigned fgb_pace_timeouts(void) { return g_pace_timeouts; }
 
 // The game's GPU waits on the helper's fences (wait_previous, the DLSS pickup in fgb_hudless) end only when the helper
@@ -804,10 +1140,11 @@ static void log_thread_stack(DWORD tid, const char *what) {
     g_log("frame bridge watchdog: %s; main thread at%s", what, n ? out : " ? (no context)");
 }
 static DWORD WINAPI watchdog(void *arg) {
-    (void)arg;
+    unsigned gen = (unsigned)(UINT_PTR)arg;
     uint32_t done0 = 0, n0 = 0;
     int stuck = 0, still = 0;
-    while (g_live && WaitForSingleObject(g_helper, 250) == WAIT_TIMEOUT) {   // every 250 ms while the helper runs
+    while (g_live && gen == g_gen && WaitForSingleObject(g_helper, 250) == WAIT_TIMEOUT) {   // every 250 ms while the helper runs
+        if (gen != g_gen) break;   // another helper took over (F11 switch): its own watchdog runs
         uint32_t f = __atomic_load_n(&g_sh->frames, __ATOMIC_ACQUIRE), d = __atomic_load_n(&g_sh->done, __ATOMIC_ACQUIRE);
         uint32_t n = __atomic_load_n(&g_n, __ATOMIC_RELAXED);
         if (f == FGB_QUIT) break;
@@ -828,6 +1165,64 @@ static DWORD WINAPI watchdog(void *arg) {
         }
     }
     return 0;
+}
+
+// The F11 switch of upscaler / frame generation while the game runs (AGENT_LOG 165): at the end of a Present, once the
+// helper has finished every frame handed over, it is stopped and a new one started on the same shared objects with the
+// new technology; it goes on from the frame the old one stopped at (FGB_CAP_RESTART). The game waits for it (about a
+// second; the picture holds meanwhile). 1 switched, 0 not possible (an older helper: from the next game start), -1 the
+// new helper did not start (the bridge is off then, as after a helper crash).
+static HWND g_sw_wnd;   // the window of a helper started by an F11 switch (fgb_restart)
+static LRESULT CALLBACK fb_child_proc(HWND h, UINT m, WPARAM w, LPARAM l);
+int fgb_can_restart(void) { return fgb_active() && (g_sh->helper_caps & FGB_CAP_RESTART); }
+// the helper's fences at all ones: Windows completes a lost D3D12 device's shared fences for good (a GPU reset of the
+// helper, AGENT_LOG 166 / 173; RenoDX hit it too); every wait between game and helper would pass, frames out of order
+int fgb_fences_lost(void) {
+    return fgb_active() && g_fsr && g_fdone && (ID3D11Fence_GetCompletedValue(g_fsr) == UINT64_MAX || ID3D11Fence_GetCompletedValue(g_fdone) == UINT64_MAX);
+}
+int fgb_restart(unsigned tech) {
+    if (!fgb_can_restart()) return 0;
+    uint32_t f = __atomic_load_n(&g_sh->frames, __ATOMIC_ACQUIRE);
+    for (ULONGLONG t0 = GetTickCount64(); __atomic_load_n(&g_sh->done, __ATOMIC_ACQUIRE) < f && GetTickCount64() - t0 < 2000;) Sleep(1);
+    ID3D11DeviceContext_Flush(g_ctx);
+    g_gen++;   // the watchdog of the old helper ends
+    __atomic_store_n(&g_sh->frames, FGB_QUIT, __ATOMIC_RELEASE);
+    SetEvent(g_wake);
+    SetEvent(g_wake2);
+    if (WaitForSingleObject(g_helper, 5000) == WAIT_TIMEOUT) TerminateProcess(g_helper, 1);
+    CloseHandle(g_helper);
+    // a fresh window for the new helper's swapchain: on the game window Windows refuses another process' swapchain once the
+    // old helper had one there (0x80070005 for a plain flip swapchain too, AGENT_LOG 166). A child over the client area,
+    // click-through like the fallback's. shortcut: it keeps its size if the game window changes size; follow WM_SIZE if a
+    // player who switches and then resizes reports a cut picture
+    if (g_sw_wnd) { DestroyWindow(g_sw_wnd); g_sw_wnd = NULL; }
+    {
+        WNDCLASSW wc = {0};
+        wc.lpfnWndProc = fb_child_proc; wc.hInstance = GetModuleHandleW(NULL); wc.lpszClassName = L"fgb_switch";
+        RegisterClassW(&wc);
+        RECT rc = {0};
+        GetClientRect(g_hwnd, &rc);
+        g_sw_wnd = CreateWindowExW(WS_EX_NOPARENTNOTIFY, L"fgb_switch", L"", WS_CHILD | WS_VISIBLE, 0, 0, rc.right, rc.bottom, g_hwnd, NULL,
+                                   wc.hInstance, NULL);
+        if (!g_sw_wnd) { g_log("frame bridge: switch window not made (%lu)", GetLastError()); g_live = 0; release_gpu_waits(); return -1; }
+        g_sh->hwnd = (uint32_t)(UINT_PTR)g_sw_wnd;
+    }
+    g_sh->helper_ok = 0; g_sh->error = 0; g_sh->helper_caps = 0; g_sh->fg_max = 0; g_sh->driver_vsync = 0;
+    g_sh->sr_backend = g_sh->fg_backend = 0;
+    g_tech = tech; g_sh->tech = tech;
+    if (!make_fences(f)) { g_log("frame bridge: switch fences not made - off"); g_live = 0; return -1; }
+    g_sh->done = f;   // the new helper starts here
+    __atomic_store_n(&g_sh->frames, f, __ATOMIC_RELEASE);
+    g_reset_next = 1;   // no DLSS / FSR history across the switch
+    if (!wcsstr(g_cmd, L" append")) wcscat(g_cmd, L" append");   // the new helper's log goes on after the old one's
+    if (!launch_helper()) { g_live = 0; release_gpu_waits(); return -1; }
+    HANDLE wd = CreateThread(NULL, 0, watchdog, (void *)(UINT_PTR)g_gen, 0, NULL);
+    if (wd) CloseHandle(wd);
+    if (g_sh->fg_frames > g_sh->fg_max) g_sh->fg_frames = g_sh->fg_max;
+    static const char *const be[3] = {"none", "NVIDIA DLSS", "AMD FSR"};
+    g_log("frame bridge: switched - upscaling %s, frame generation %s (frame generation up to %ux)", be[fgb_sr_backend() % 3],
+          be[fgb_fg_backend() % 3], g_sh->fg_max + 1);
+    return 1;
 }
 
 void fgb_stop(void) {
@@ -904,10 +1299,31 @@ void *fgb_unhooked(void *fn) {
 }
 
 void fgb_test_kill_helper(void) { if (g_helper) TerminateProcess(g_helper, 1); }   // bridgetest killhelper
+#ifdef FGB_TESTS
+void fgb_test_lose_fences(void) {   // bridgetest lose=F: the helper's fences at all ones, as a lost GPU device leaves them
+    ID3D11DeviceContext4_Signal(g_ctx4, g_fsr, UINT64_MAX);
+    ID3D11DeviceContext4_Signal(g_ctx4, g_fdone, UINT64_MAX);
+    ID3D11DeviceContext_Flush(g_ctx);
+}
+#endif
+#ifdef FGB_TESTS   // test-only: undocumented ntdll calls that malware scanners flag (the Workshop held 6.5.2 / 6.6.1 for review)
 void fgb_test_freeze_helper(void) {   // bridgetest freezehelper: alive but finishing nothing (the 2026-10-28 hang)
     LONG(NTAPI *suspend)(HANDLE) = (LONG(NTAPI *)(HANDLE))(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSuspendProcess");
     if (g_helper && suspend) suspend(g_helper);
 }
+static DWORD WINAPI resume_later(void *ms) {
+    Sleep((DWORD)(UINT_PTR)ms);
+    LONG(NTAPI *resume)(HANDLE) = (LONG(NTAPI *)(HANDLE))(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtResumeProcess");
+    if (g_helper && resume) resume(g_helper);
+    return 0;
+}
+void fgb_test_pause_helper(unsigned ms) {   // bridgetest slowhelper: a GPU stall that delays the helper's DLSS output
+    fgb_test_freeze_helper();
+    HANDLE t = CreateThread(NULL, 0, resume_later, (void *)(UINT_PTR)ms, 0, NULL);
+    if (t) CloseHandle(t);
+}
+unsigned fgb_test_sr_slow(void) { return g_sr_slow; }
+#endif
 
 // ---- After the bridge, while the game's swapchain sits on a hidden window (the helper died, the back buffer changed
 // size, or a new swapchain after a settings change): each frame is copied into a swapchain of our own, so the game does

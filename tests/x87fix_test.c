@@ -51,6 +51,33 @@ static DWORD WINAPI bad_thread(LPVOID p) {
 // started in this exe, so the watcher's game_thread() counts it: runs the code at p (a parked "jmp $" in a site)
 static DWORD WINAPI run_at(LPVOID p) { ((void (*)(void))p)(); return 0; }
 
+// game threads (started in this exe) that load DLLs or idle, and x87_restore_paused in a loop (from the Attila mod)
+static DWORD WINAPI loader_thread(LPVOID p) {
+    (void)p;
+    for (;;) {
+        HMODULE m = LoadLibraryExW(L"dbghelp.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (m) FreeLibrary(m);
+    }
+}
+static DWORD WINAPI idle_thread(LPVOID p) { (void)p; for (;;) Sleep(1); }
+static volatile LONG g_restore_rounds;
+static DWORD WINAPI restore_loop(LPVOID p) {
+    (void)p;
+    for (int n = 0; g_restore_rounds < 300; g_restore_rounds++) x87_restore_paused(&n);
+    return 0;
+}
+static VOID CALLBACK hang_check(PVOID p, BOOLEAN fired) {
+    (void)p; (void)fired;
+    static LONG last = -1;
+    if (g_restore_rounds == last) {   // WriteFile, TerminateProcess: the CRT and exit() could wait on a suspended thread
+        static const char msg[] = "FAIL: the restore hung (a thread suspended inside LoadLibrary held the loader)\n";
+        DWORD w;
+        WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), msg, sizeof msg - 1, &w, NULL);
+        TerminateProcess(GetCurrentProcess(), 1);
+    }
+    last = g_restore_rounds;
+}
+
 static unsigned rng = 777;
 static unsigned rnd(void) { rng = rng * 1664525u + 1013904223u; return rng; }
 
@@ -149,6 +176,15 @@ int main(int argc, char **argv) {
     x87fix_frame();
     CHECK(g_x87_reverted);
     printf("x87 restore waited for a thread inside a site, then restored with the game threads paused\n");
+    // the restore while a game thread loads DLLs: it must not look up modules with one suspended inside LoadLibrary
+    fflush(stdout);
+    HANDLE tm = NULL;   // the hang check runs on a thread-pool thread: not a game thread, so the restore never suspends it
+    CHECK(CreateTimerQueueTimer(&tm, NULL, hang_check, NULL, 2000, 2000, 0));
+    HANDLE ld = CreateThread(NULL, 0, loader_thread, NULL, 0, NULL), idle = CreateThread(NULL, 0, idle_thread, NULL, 0, NULL);
+    HANDLE rs = CreateThread(NULL, 0, restore_loop, NULL, 0, NULL);
+    CHECK(ld && idle && rs);
+    WaitForSingleObject(rs, INFINITE);
+    printf("restore: %ld suspend rounds while a game thread loads DLLs, no hang\n", (long)g_restore_rounds);
     g_stop_bad = 1;
     for (int i = 0; i < found; i++) {
         struct x87site *s = &g_x87[i];

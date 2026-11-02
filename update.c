@@ -17,12 +17,7 @@ static const char MARKER[] = "Rome2CPUPerfFix-version:";
 __attribute__((used)) static const char g_marker[] = "Rome2CPUPerfFix-version:" STR(MOD_VERSION_NUM);
 
 // The version marker in a file, or 0 (missing, unreadable, not a PE file, or no marker).
-static int file_version(const wchar_t *path) {
-    static char buf[2 << 20];
-    FILE *f = _wfopen(path, L"rb");
-    if (!f) return 0;
-    size_t n = fread(buf, 1, sizeof buf, f);
-    fclose(f);
+static int marker_in(const char *buf, size_t n) {
     if (n < 0x400 || buf[0] != 'M' || buf[1] != 'Z') return 0;
     for (size_t i = 0; i + sizeof MARKER <= n; i++)  // room for the prefix and at least one digit
         if (buf[i] == 'R' && memcmp(buf + i, MARKER, sizeof MARKER - 1) == 0) {
@@ -32,6 +27,17 @@ static int file_version(const wchar_t *path) {
             if (v) return v;  // the bare prefix (MARKER itself) is in the file too; skip it
         }
     return 0;
+}
+static int file_version(const wchar_t *path) {
+    enum { CAP = 2 << 20 };
+    FILE *f = _wfopen(path, L"rb");
+    if (!f) return 0;
+    char *buf = HeapAlloc(GetProcessHeap(), 0, CAP);   // only while reading (was a static 2 MB kept all session; Attila's ultrareview)
+    size_t n = buf ? fread(buf, 1, CAP, f) : 0;
+    fclose(f);
+    int v = buf ? marker_in(buf, n) : 0;
+    if (buf) HeapFree(GetProcessHeap(), 0, buf);
+    return v;
 }
 
 // self = this DLL's path, ws = the Workshop copy. Returns 1 if the game folder now holds the newer version.

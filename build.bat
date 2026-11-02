@@ -5,13 +5,17 @@ setlocal
 cd /d "%~dp0"
 if "%CC%"=="" set "CC=i686-w64-mingw32-clang"
 if "%CXX%"=="" set "CXX=i686-w64-mingw32-clang++"
+if "%WINDRES%"=="" set "WINDRES=i686-w64-mingw32-windres"
 if not exist build mkdir build
 
 rem --no-insert-timestamp keeps the build reproducible: the same compiler gives the same file
 rem bridgeprobe.c fgbridge.c fgpanel.c r2motion.c: the DLSS add-on's frame bridge, started only by <game>\FrameBridge
 rem rslink.cpp: the bridge's ReShade link (C++, ReShade's add-on API headers in reshade\; no C++ runtime linked)
 "%CXX%" -std=c++17 -O2 -Wall -Wextra -isystem reshade -fno-exceptions -fno-rtti -fno-threadsafe-statics -c -o build\rslink.o rslink.cpp || exit /b 1
-"%CC%" -O2 -Wall -Wextra -shared -s -static -Wl,--no-insert-timestamp -o build\dinput8.dll proxy.c tilescan.c x87fix.c sortfix.c diag.c update.c fileio.c strfix.c attrcache.c logtrim.c bridgeprobe.c fgbridge.c fgpanel.c r2motion.c build\rslink.o dinput8.def -lgdi32 || exit /b 1
+rem dinput8.rc: the version resource (Properties > Details)
+"%WINDRES%" -O coff -o build\dinput8_res.o dinput8.rc || exit /b 1
+rem not stripped (-s): the stripped 2.0 DLL was flagged by Microsoft's cloud ML (Wacatac), unstripped passes (VirusTotal 2026-11-02)
+"%CC%" -O2 -Wall -Wextra -shared -static -Wl,--no-insert-timestamp -o build\dinput8.dll proxy.c tilescan.c x87fix.c sortfix.c diag.c update.c fileio.c strfix.c attrcache.c logtrim.c bridgeprobe.c fgbridge.c fgpanel.c r2motion.c build\rslink.o build\dinput8_res.o dinput8.def -lgdi32 || exit /b 1
 echo built build\dinput8.dll
 
 if /i not "%~1"=="test" exit /b 0

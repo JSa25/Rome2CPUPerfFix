@@ -101,12 +101,28 @@ void fgb_hudless(ID3D11Resource *bb, ID3D11Resource *depth, const float vp[16]) 
 }
 // the motion pass (r2motion.c, linked): fgbridge.c runs it after its camera motion; here into a cleared texture, read
 // back at the Rome 2-like model (r2_check below)
-static void (*s_motion)(ID3D11Resource *depth, float jx, float jy);
+static int (*s_motion)(ID3D11Resource *depth, float jx, float jy);
 static ID3D11Texture2D *s_mv, *s_mv_st;
 static ID3D11RenderTargetView *s_mv_rtv;
 static int s_mv_checks, s_mv_bad;
 static int r2_check(void);
-void fgb_set_motion(void (*pass)(ID3D11Resource *depth, float jx, float jy)) { s_motion = pass; }
+void fgb_set_motion(int (*pass)(ID3D11Resource *depth, float jx, float jy)) { s_motion = pass; }
+// Attila 6.10.0's additions (driver V-Sync, AMD FSR, the live switch, the F11 counter / technology rows): NVIDIA, nothing stuck
+int fgb_driver_vsync(void) { return 1; }
+unsigned fgb_sr_backend(void) { return 1; }
+unsigned fgb_fg_backend(void) { return 1; }
+void fgb_set_tech(unsigned tech) { (void)tech; }
+int fgb_restart(unsigned tech) { (void)tech; return 0; }
+int fgb_can_restart(void) { return 0; }
+int fgb_fences_lost(void) { return 0; }
+void fgb_fill_begin(void) {}
+void fgb_react_begin(ID3D11Resource *hdr) { (void)hdr; }
+void fgb_react_end(void) {}
+unsigned fgb_react_frames(void) { return 0; }
+void fgp_set_vsync_driver(int v) { (void)v; }
+void fgp_set_fps_counter(int corner) { (void)corner; }
+void fgp_set_fg(int fg) { (void)fg; }
+void fgp_set_tech(int sr, int fg) { (void)sr; (void)fg; }
 ID3D11Texture2D *fgb_mv_texture(void) {
     if (!s_mv) {
         D3D11_TEXTURE2D_DESC d = {W, H, 1, 1, DXGI_FORMAT_R16G16_FLOAT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};   // as fgbridge.c's
@@ -152,6 +168,13 @@ void *fgb_vt_original(void **vt, size_t slot) { (void)vt; (void)slot; return NUL
 void *fgb_unhooked(void *fn) { return fn; }
 void fgb_set_test_not_nvidia(int on) { (void)on; }
 void fgb_cpu_stats(double *hud_ms, double *present_ms, double *pace_ms, unsigned *frames) { *hud_ms = *present_ms = *pace_ms = 0; *frames = 0; }
+void fgb_gpu_stats(double ms[4], unsigned *frames, unsigned *lost) { ms[0] = ms[1] = ms[2] = ms[3] = 0; *frames = *lost = 0; }
+void fgb_wait_stats(unsigned *queued, unsigned *frames) { *queued = *frames = 0; }
+void fgb_motion_cost(double *gpu_ms, unsigned *gpu_n, double *cpu_ms, unsigned *cpu_n) { *gpu_ms = *cpu_ms = 0; *gpu_n = *cpu_n = 0; }
+void fgb_motion_wind_cost(double *gpu_ms, unsigned *n) { *gpu_ms = 0; *n = 0; }
+void fgb_set_latency_cap(int on) { (void)on; }
+void fgb_gpu_totals(double *interval_ms, unsigned *intervals, double *hud_ms, unsigned *huds) { *interval_ms = *hud_ms = 0; *intervals = *huds = 0; }
+void fgb_latency_stats(double *wait_ms, unsigned *waits, unsigned *frames) { *wait_ms = 0; *waits = *frames = 0; }
 static int s_sr, s_panel_init, s_panel_frames;
 void fgb_set_sr(int on, UINT w, UINT h) { s_sr = on; s_rw = on ? w : W; s_rh = on ? h : H; }
 unsigned fgb_shown(void) { return 0; }
@@ -353,9 +376,10 @@ int main(int argc, char **argv) {
         fclose(h);
         swprintf(q, MAX_PATH, L"%ls\\settings.txt", fb);
         DeleteFileW(q);
-        // a first start (no settings.txt): Quality, frame generation 2x, camera-only motion, and the file written with them
-        CHECK(install_bridgeprobe(GetModuleHandleW(NULL), dir, tlog) && g_live && g_sr == 2 && g_fg == 1 && !g_motion_on, "add-on defaults: live %d, SR %d, FG %u, motion %d",
-              g_live, g_sr, g_fg, g_motion_on);
+        // a first start (no settings.txt): Quality, frame generation 2x, motion Full (per object), sharpness low, and the file
+        // written with them
+        CHECK(install_bridgeprobe(GetModuleHandleW(NULL), dir, tlog) && g_live && g_sr == 2 && g_fg == 1 && g_motion_on && g_sharp == 1,
+              "add-on defaults: live %d, SR %d, FG %u, motion %d, sharpness %d", g_live, g_sr, g_fg, g_motion_on, g_sharp);
         CHECK(!wcscmp(g_logdir, fb) && !wcscmp(g_settings, q) && wcsstr(g_helper, L"FrameBridge\\helper64.exe") && !wcscmp(g_sl, fb),
               "add-on paths: logs %ls, settings %ls, helper %ls, Streamline %ls", g_logdir, g_settings, g_helper, g_sl);
         char text[2048] = {0};
@@ -363,9 +387,20 @@ int main(int argc, char **argv) {
         CHECK(sf, "settings.txt not written at the first start");
         fread(text, 1, sizeof text - 1, sf);
         fclose(sf);
-        CHECK(strstr(text, "\nsuper_resolution=quality\n") && strstr(text, "\nframe_generation=2x\n") && strstr(text, "\nmotion_vectors=camera_only\n") &&
+        CHECK(strstr(text, "\nsuper_resolution=quality\n") && strstr(text, "\nframe_generation=2x\n") && strstr(text, "\nmotion_vectors=per_object\n") &&
               strstr(text, "\nframe_cap=auto\n") && strstr(text, "\ndlss_preset=default\n") && strstr(text, "\nsharpness=low\n") && strstr(text, "addon=on") && strstr(text, "# super_resolution:") &&
-              !g_preset, "settings.txt at the first start:\n%s", text);
+              strstr(text, "\nfps_counter=off\n") && strstr(text, "\ntechnology=auto\n") && strstr(text, "\nversion=3\n") && !g_preset,
+              "settings.txt at the first start:\n%s", text);
+        // a file from add-on 5 or older (version=2): camera_only was the old default, moved to Full once (low sharpness stays);
+        // the same values in a version=3 file are the player's and stay
+        FARPROC(WINAPI *gpa0)(HMODULE, LPCSTR) = r_gpa;   // installing again hooks GetProcAddress over our own hook: put back after
+        for (int v = 2; v <= 3; v++, r_gpa = gpa0) {
+            FILE *of = _wfopen(q, L"w");
+            fprintf(of, "super_resolution=quality\nframe_generation=2x\nmotion_vectors=camera_only\nsharpness=low\naddon=on\nversion=%d\n", v);
+            fclose(of);
+            CHECK(install_bridgeprobe(GetModuleHandleW(NULL), dir, tlog) && g_motion_on == (v == 2) && g_sharp == 1,
+                  "settings version=%d: motion %d, sharpness %d", v, g_motion_on, g_sharp);
+        }
         // what the F11 panel saves, read back the same; a player's own file with other values
         g_sr = 4; g_fg = 0; g_motion_on = 0; g_fcap = 4;
         panel_preset(4);   // M: NVIDIA's 13 to the helper, saved with the rest
@@ -446,8 +481,8 @@ int main(int argc, char **argv) {
     }
 #ifndef REAL_BRIDGE
     CHECK(s_started == 1 && s_hwnd == hwnd, "the helper is not started once, presenting into the game's window");
-    if (nofg) {   // no frame generation: no motion pass set up, its panel row greyed "Needs frame generation"
-        CHECK(!g_motion && s_panel_motion == -2 && s_limit_us == 0, "no frame generation: motion pass %d, panel row %d, frame limit %u us",
+    if (nofg) {   // no frame generation (RTX 20 / 30): the motion pass still set up and on (Full; AMD FSR needs it too), no frame cap
+        CHECK(g_motion && s_panel_motion == 1 && s_limit_us == 0, "no frame generation: motion pass %d, panel row %d, frame limit %u us",
               g_motion, s_panel_motion, s_limit_us);
         printf("bridge live test (no frame generation) passed\n");
         return 0;

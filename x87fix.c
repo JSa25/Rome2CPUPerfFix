@@ -18,6 +18,7 @@
 // original bytes and replacement on edge values and random inputs.
 #include <windows.h>
 #include <tlhelp32.h>
+#include "builds.h"
 #include <string.h>
 
 #define X87_MAX_SITES 2048
@@ -130,59 +131,32 @@ static int x87_scan(const unsigned char *text, unsigned size, unsigned rva0) {
 // Set by the watcher thread when some game thread runs with non-default rounding control or DAZ.
 static volatile LONG g_x87_other_thread_bad;
 
-typedef LONG(NTAPI *query_thread_fn)(HANDLE, int, PVOID, ULONG, PULONG);
-
-// 1 if the thread was started inside the game's own code (empire.retail.dll or the exe): only those run
-// the patched blocks. Others set their own FPU state and never run them (XAudio2's thread runs with
-// DAZ/FTZ on: MXCSR 9FE0 seen in game; thread-pool, Steam, EOS, driver threads).
-static int game_thread(HANDLE h) {
-    static query_thread_fn q;
-    if (!q) q = (query_thread_fn)(void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread");
-    void *start = NULL;
-    if (!q || q(h, 9 /* ThreadQuerySetWin32StartAddress */, &start, sizeof start, NULL) != 0) return 0;
-    HMODULE m = NULL;
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, start, &m)) return 0;
-    return m == (HMODULE)g_x87_base || m == GetModuleHandleW(NULL);
-}
-
 // Puts the original bytes of the down/up/frndint sites back while every other game thread is suspended, so none runs
-// half-rewritten code. 0 (nothing written) if a suspended thread stood inside a site: tried again next frame.
-static int x87_restore_paused(int *restored) {
-    HANDLE th[1024];
-    int nth = 0, clear = 1;
-    DWORD pid = GetCurrentProcessId(), me = GetCurrentThreadId();
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap == INVALID_HANDLE_VALUE) return 0;
-    THREADENTRY32 te = {.dwSize = sizeof te};
-    for (BOOL ok = Thread32First(snap, &te); ok && nth < 1024; ok = Thread32Next(snap, &te)) {
-        if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
-        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
-        if (!h) continue;
-        if (!game_thread(h) || SuspendThread(h) == (DWORD)-1) { CloseHandle(h); continue; }
-        th[nth++] = h;
-        CONTEXT c = {.ContextFlags = CONTEXT_CONTROL};
-        if (!GetThreadContext(h, &c)) { clear = 0; break; }
-        DWORD rva = c.Eip - (DWORD)(UINT_PTR)g_x87_base;
-        for (int i = 0; i < g_x87_n && clear; i++)
-            if (g_x87[i].patched && rva - g_x87[i].rva < g_x87[i].len) clear = 0;
-        if (!clear) break;
-    }
-    CloseHandle(snap);
-    if (clear)
-        for (int i = 0; i < g_x87_n; i++) {
-            struct x87site *s = &g_x87[i];
-            if (s->patched && !(s->mode == 3 && !s->frndint)) {
-                x87_write(g_x87_base + s->rva, s->orig, s->len);
-                s->patched = 0;
-                (*restored)++;
-            }
+// half-rewritten code (paused_write, builds.h). 0 (nothing written) if a suspended thread stood inside a site: tried
+// again next frame.
+static int g_x87_restored;
+static int x87_busy(UINT_PTR eip) {
+    DWORD rva = (DWORD)eip - (DWORD)(UINT_PTR)g_x87_base;
+    for (int i = 0; i < g_x87_n; i++)
+        if (g_x87[i].patched && rva - g_x87[i].rva < g_x87[i].len) return 1;
+    return 0;
+}
+static void x87_restore(void) {
+    for (int i = 0; i < g_x87_n; i++) {
+        struct x87site *s = &g_x87[i];
+        if (s->patched && !(s->mode == 3 && !s->frndint)) {
+            x87_write(g_x87_base + s->rva, s->orig, s->len);
+            s->patched = 0;
+            g_x87_restored++;
         }
-    if (clear) FlushInstructionCache(GetCurrentProcess(), NULL, 0);
-    for (int i = 0; i < nth; i++) {
-        ResumeThread(th[i]);
-        CloseHandle(th[i]);
     }
-    return clear;
+    FlushInstructionCache(GetCurrentProcess(), NULL, 0);
+}
+static int x87_restore_paused(int *restored) {
+    g_x87_restored = 0;
+    int ok = paused_write((HMODULE)g_x87_base, x87_busy, x87_restore);
+    *restored += g_x87_restored;
+    return ok;
 }
 
 // Per frame on the main thread: the down/up/frndint replacements assume default rounding control and DAZ off.
@@ -207,7 +181,7 @@ static DWORD WINAPI x87_watch(LPVOID unused) {
             if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
             HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
             if (!h) continue;
-            if (!game_thread(h)) { CloseHandle(h); continue; }
+            if (!game_thread(h, (HMODULE)g_x87_base)) { CloseHandle(h); continue; }
             CONTEXT ctx = {.ContextFlags = CONTEXT_FLOATING_POINT | CONTEXT_EXTENDED_REGISTERS};
             if (SuspendThread(h) != (DWORD)-1) {
                 BOOL got = GetThreadContext(h, &ctx);

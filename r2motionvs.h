@@ -10,7 +10,8 @@
 #pragma once
 
 static const char r2motion_hlsl[] =
-    "cbuffer motion : register(b0) { float2 size; float2 pad; };\n"
+    // dt: seconds since the last pass, cull_px: skip instances whose own motion stays under it (0: draw all; r2m_set_cull)
+    "cbuffer motion : register(b0) { float2 size; float dt; float cull_px; };\n"
     // byte copies of the game's blocks: camera_VS_PS (view_projection at row 9) of this frame and the previous one, and
     // variant_animation_size (x: rows - 1, y: 1 / rows, z: columns - 1, w: 1 / (columns - 1)) of this frame / the previous
     "cbuffer camera : register(b1) { float4 c_pad[9]; float4 vp[4]; };\n"
@@ -31,7 +32,7 @@ static const char r2motion_hlsl[] =
     "#ifdef OWN\n"
     "  float4 own : TEXCOORD2;\n"
     "#endif\n"
-    "};\n"
+    "  float clipd : SV_CullDistance0; };\n"
     // one bone at texel index i3 (= 3 x bone) in row v: rows x, y, z dot p (the game: u = i w; u1 = i w + w; u2 = u1 + w)
     "float3 bone(Texture2D<float4> t, float i3, float w, float v, float4 p) {\n"
     "  float u0 = i3 * w; float u1 = i3 * w + w; float u2 = u1 + w;\n"
@@ -52,18 +53,47 @@ static const char r2motion_hlsl[] =
     "  return i.bi.x * bone(t, k.x, sz.w, v, p) + r;\n"
     "#endif\n"
     "}\n"
+    // render pixels per metre at o (an object reaching r metres towards the camera; near the camera: never skipped)
+    "float px_per_m(float3 o, float r, float4 m0, float4 m1, float4 m3) {\n"
+    "  float w = dot(float4(o, 1), m3) - r;\n"
+    "  if (w <= 0.5) return 1e9;\n"
+    "  return 0.5 * max(size.x * length(m0.xyz), size.y * length(m1.xyz)) / w; }\n"
+    // an instance whose own motion this frame stays under cull_px: every vertex behind the camera, nothing drawn - its
+    // pixels keep the camera's motion from depth, which is then right within cull_px
+    "VOut culled() { VOut o; o.pos = float4(0, 0, 0, -1); o.cur = o.pos; o.prev = o.pos; o.clipd = -1;\n"
+    "#ifdef OWN\n"
+    "  o.own = o.pos;\n"
+    "#endif\n"
+    "  return o; }\n"
+    // a vertex's own motion in render pixels: its last pose and place (q) and this frame's (c), both through this frame's
+    // camera; the cull distance below drops a triangle whose three corners all moved less than cull_px (its pixels keep the
+    // camera's motion, right within cull_px: they moved less than the corners; a clip distance would cut triangles and their depth
+    // would no longer equal the game's)
+    "float own_px(float4 q, float4 c) {\n"
+    "  if (q.w <= 0 || c.w <= 0) return 1e9;\n"
+    "  return length((q.xy / q.w - c.xy / c.w) * 0.5 * size); }\n"
     "float4 place(float3 s, float4 r0, float4 r1, float4 r2, float4 m[4]) {\n"
     "  float4 q = float4(s, 1); float4 w = float4(dot(q, r0), dot(q, r1), dot(q, r2), 1);\n"
     "  return float4(dot(w, m[0]), dot(w, m[1]), dot(w, m[2]), dot(w, m[3])); }\n"
+    // own motion bound: the place's move, its turn over 3 m (rider and horse), limbs and weapons at up to 6 m/s
     "VOut vs(VIn i) {\n"
+    "  if (cull_px > 0) {\n"
+    "    if (i.p3.y < 0) return culled();\n"   // no history: the pass would write the camera's motion
+    "    float3 d = float3(i.w0.w - i.p0.w, i.w1.w - i.p1.w, i.w2.w - i.p2.w);\n"
+    "    float3 a = i.w0.xyz - i.p0.xyz, b = i.w1.xyz - i.p1.xyz, c = i.w2.xyz - i.p2.xyz;\n"
+    "    float m = length(d) + 3.0 * sqrt(dot(a, a) + dot(b, b) + dot(c, c)) + 6.0 * dt;\n"
+    "    if (m * px_per_m(float3(i.w0.w, i.w1.w, i.w2.w), 3.0, vp[0], vp[1], vp[3]) < cull_px) return culled();\n"
+    "  }\n"
     "  VOut o;\n"
     "  o.cur = place(skin(anim, asz, i, i.t3.x), i.w0, i.w1, i.w2, vp);\n"
+    "  o.clipd = cull_px < 0 ? -1 : 1;\n"
     "#ifdef OWN\n"
     "  if (i.p3.y < 0) { o.prev = place(skin(anim, asz, i, i.t3.x), i.w0, i.w1, i.w2, prev_vp); o.own = o.cur; }\n"
     "  else { float3 s = skin(prev_anim, prev_asz, i, i.p3.x); o.prev = place(s, i.p0, i.p1, i.p2, prev_vp); o.own = place(s, i.p0, i.p1, i.p2, vp); }\n"
     "#else\n"
     "  if (i.p3.y < 0) o.prev = place(skin(anim, asz, i, i.t3.x), i.w0, i.w1, i.w2, prev_vp);\n"
-    "  else o.prev = place(skin(prev_anim, prev_asz, i, i.p3.x), i.p0, i.p1, i.p2, prev_vp);\n"
+    "  else { float3 s = skin(prev_anim, prev_asz, i, i.p3.x); o.prev = place(s, i.p0, i.p1, i.p2, prev_vp);\n"
+    "    if (cull_px > 0) o.clipd = own_px(place(s, i.p0, i.p1, i.p2, vp), o.cur) - cull_px; }\n"
     "#endif\n"
     "  o.pos = o.cur;\n"
     "  return o; }\n"

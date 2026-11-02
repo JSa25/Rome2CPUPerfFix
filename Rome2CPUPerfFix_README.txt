@@ -182,8 +182,8 @@ Compatibility and notes
 DLSS add-on (separate download)
 -------------------------------
 Since 1.3 this DLL can run the separate add-on "Upscaling and Framegen for
-Rome II": NVIDIA DLSS Super Resolution and DLSS Frame Generation on NVIDIA RTX
-graphics cards. It does nothing unless that add-on's FrameBridge folder is in
+Rome II": NVIDIA DLSS and (since 2.0) AMD FSR upscaling and frame generation,
+on NVIDIA, AMD and Intel graphics cards. It does nothing unless that add-on's FrameBridge folder is in
 the game folder (its install.bat puts it there). The add-on's own README has
 the details; the engine fix keeps it up to date from the add-on's Workshop item.
 1.5 brings a sharper, more native-looking DLSS picture and the add-on's new
@@ -194,10 +194,16 @@ ReShade gets the game's real depth, so depth effects (DOF, AO, fog) line up
 without setting anything. Nothing changes for ReShade without the add-on.
 1.9 adds a V-Sync On / Off setting (F11, with add-on version 5) and fixes thin
 white lines along the right edge with DLAA while the camera moves.
+2.0 brings AMD FSR, motion data for swaying trees and plants, and the F11 FPS
+counter and recommended setup, together with add-on version 6.
 
 
 Third-party notices
 -------------------
+The ReShade link (in dinput8.dll) is built with ReShade's add-on API headers,
+Copyright (C) 2021 Patrick Mours, used under the MIT licence (the same text as
+below, with his name in place of AMD's).
+
 The DLSS add-on's sharpening (in dinput8.dll) follows AMD FidelityFX Robust
 Contrast Adaptive Sharpening (RCAS), used under the MIT licence:
 
@@ -221,6 +227,31 @@ is published for review at github.com/JSa25/Rome2CPUPerfFix.
 
 Changelog
 ---------
+Version 2.0:
+           - with the DLSS add-on (version 6): AMD FSR upscaling and frame
+           generation for AMD, Intel and older NVIDIA cards, and F11's
+           Upscaler / Frame Gen Tech choice (switches at once).
+           - with the add-on: motion data for swaying trees and plants;
+           Motion Vectors Full is the default for everyone, and what
+           barely moves in a frame is skipped, so it costs less.
+           - with the add-on: F11 FPS counter, recommended setup with a
+           Defaults button, and the V-Sync row shows a V-Sync forced by
+           the graphics driver.
+           - with the add-on: sharper motion data far away (no smearing
+           on sky and distant land), textures stay sharp with upscaling in
+           more places, and a helper that stops answering no longer holds
+           the game up.
+           - a rare freeze at game start is fixed: the x87 fix could pause
+           a game thread while it held Windows' DLL loader lock.
+           - rome2fix.ini: "yes" (and other words) no longer switch a fix
+           off; only 0, off, false and no do.
+           - from a code review: a rare failed load or crash when one file
+           closed while another opened; rome2fix.log now stays short
+           after a very long session too; the crash that closes the game
+           is always recorded in it; small fixes in the add-on's F11
+           panel, ReShade link and motion data.
+           SHA-256 of dinput8.dll:
+           2d9e3b0c1ad0a5d74998d10ad77e8fa266a1f756c14a1e1581ad274ebe7b4554
 Version 1.9: with the DLSS add-on:
            -fix1: thin white lines along the right edge of the screen with
            DLAA while the camera moved (and the bottom edge the same way).

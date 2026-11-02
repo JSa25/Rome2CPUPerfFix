@@ -202,6 +202,7 @@ int main(void) {
     D3D11_DEPTH_STENCIL_VIEW_DESC dvd = {DXGI_FORMAT_D24_UNORM_S8_UINT, D3D11_DSV_DIMENSION_TEXTURE2D, 0, {{0}}};
     CHECK(SUCCEEDED(ID3D11Device_CreateDepthStencilView(dev, (ID3D11Resource *)ds, &dvd, &dsv)), "depth view");
     CHECK(r2m_init(dev, ctx, mv, tlog), "r2m_init");
+    r2m_set_cull(0);   // the redraw itself first (the skip of models without own motion: checked at the end)
 
     // the stand-in game's shaders: the pass's skinning, written to SV_Position; an occluder near the camera
     static const char game[] =
@@ -332,6 +333,16 @@ int main(void) {
     frame(f3, 2, tx, 0, 0, 0, 1);
     ok &= expect("after a frame without the pass (no history)", &A3, tx, 0, 0, &A3, tx, 1);
     ok &= own_expect("after a frame without the pass", &A3, &A3, tx, 0, 0, 1);
+    // the skip (r2m_set_cull): a model without history is not redrawn - in the game the camera's motion is in the target
+    // already, the redraw would write the same; a moved one still is
+    r2m_set_view(0);
+    r2m_set_cull(0.125f);
+    frame(f0, 6, 0, 0.3f, -0.2f, 0, 1);
+    frame(f1, 7, tx, jx, jy, 1, 1);
+    { Inst Nc = N; ok &= expect("skip on: new model not redrawn", &N, tx, jx, jy, &Nc, 0, 1); }
+    ok &= expect("skip on: moved model still redrawn", &A1, tx, jx, jy, &A, 0, 0);
+    ok &= expect("skip on: unmoved model not redrawn", &Q, tx, jx, jy, &Q, 0, 1);
+    r2m_set_cull(0);
     r2m_report(tlog);
     CHECK(ok, "motion values");
     CHECK(ID3D11Device_GetDeviceRemovedReason(dev) == S_OK, "device removed");

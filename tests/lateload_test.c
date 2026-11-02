@@ -161,7 +161,7 @@ int main(int argc, char **argv) {
     if (heap) fclose(fopen(onp, "w"));
     // rome2fix.ini: read (self-update off, the fixes' missing keys default to on) and never overwritten by the mod
     char inip[MAX_PATH];
-    static const char ini_text[] = "[mod]\r\nself_update=0\r\n";
+    static const char ini_text[] = "[mod]\r\nself_update=no\r\ncrash_logging=Yes\r\n";  // words too (was: "Yes" read as 0 = off)
     strcpy(inip, logp);
     strcpy(inip + (sl - logp) + 1, "rome2fix.ini");
     FILE *fi = fopen(inip, "wb");
@@ -194,7 +194,7 @@ int main(int argc, char **argv) {
     CHECK(has("was loaded before empire.retail.dll"));
     CHECK(has("empire.retail.dll is loading now - installing the fixes"));
     CHECK(has("Rome 2 Engine Performance Fix v"));
-    CHECK(has("self-update off (self_update=0 in rome2fix.ini)") && has("crash logging on"));
+    CHECK(has("self-update off (self_update=0 in rome2fix.ini)") && has("crash logging on") && !has("crash logging off"));
     char inibuf[256] = {0};
     fi = fopen(inip, "rb");
     CHECK(fi);

@@ -18,6 +18,11 @@
 #include <stdio.h>
 #include <string.h>
 #include "r2motionvs.h"
+// Swaying trees and plants (ATTILA_PARITY_PLAN phase 6, Attila's AGENT_LOG 178): their draws are recorded too and drawn
+// first with r2windvs.h - the game's wind at this frame's and the previous frame's time_in_sec, from GPU copies of the
+// game's own camera block and wind block (taken at the frame's first wind draw); no history of their own.
+#include "r2windvs.h"
+#define M_WDRAWS 2048   // wind draws per frame (benchmark: ~90)
 
 #define M_RECS 65536      // records per frame (G1 battle: ~5,200)
 #define M_DRAWS 4096      // animated main-view draws per frame (G1: up to 276)
@@ -64,8 +69,50 @@ typedef struct {
 } MDraw;
 static MDraw m_draws[M_DRAWS];
 static unsigned m_ndraws;
+// the game's layout is kept referenced (AddRef): a freed one's address could otherwise come back as another layout and
+// match an old entry, drawing an unrelated model with our skin or wind shader (Attila's ultrareview 2026-11-02); a full
+// table is logged once (models loaded after that get the camera's motion only)
+#define M_LAYOUTS 256
 typedef struct { const void *game; int type; ID3D11InputLayout *ours; } MLayout;
-static MLayout m_layouts[64];
+static MLayout m_layouts[M_LAYOUTS];
+static ID3DBlob *m_wvsb[3];                          // r2windvs.h: tree_a, tree_b, plant
+static ID3D11VertexShader *m_wvs[3], *m_wvs_own[3];
+static ID3D11Buffer *m_wcam[2], *m_wind;             // the game's camera block (432 bytes: up to time_in_sec) of this / the
+static int m_wc, m_wcam_have[2], m_wind_have, m_wprev_ok, m_passed;   // previous frame; its wind block (32)
+typedef struct {
+    ID3D11Buffer *vb[4], *ib; UINT st[4], of[4], ioff; DXGI_FORMAT ifmt; int indexed, kind; UINT count, inst, start, sinst; INT base;
+    ID3D11InputLayout *il;
+    unsigned fill;   // m_fill_serial when recorded
+} MWind;
+static MWind m_wd[M_WDRAWS];
+static unsigned m_nwd, m_stat_wdraws, m_stat_winst, m_stat_wrefill;
+// buffers the game refilled (Map DISCARD, UpdateSubresource) after a tree / plant draw was recorded: by the pass their
+// instance data is another batch's, so that draw is not redrawn (Attila's ultrareview 2026-11-02). Direct-mapped by
+// address: an entry taken over by another buffer only loses its note (the draw is redrawn as before), it never skips a
+// draw that was not refilled. Main thread only.
+#define M_FILLS 1024
+static struct { const void *res; unsigned serial; } m_fill[M_FILLS];
+static unsigned m_fill_serial;
+static unsigned fill_slot(const void *r) { return (unsigned)((UINT_PTR)r >> 4) % M_FILLS; }
+void r2m_refilled(const void *res) {
+    if (!m_nwd) return;   // nothing recorded this frame
+    unsigned s = fill_slot(res);
+    m_fill[s].res = res;
+    m_fill[s].serial = ++m_fill_serial;
+}
+static int refilled(const MWind *d) {
+    for (int k = 0; k < 4; k++) {
+        unsigned s = fill_slot(d->vb[k]);
+        if (d->vb[k] && m_fill[s].res == d->vb[k] && m_fill[s].serial > d->fill) return 1;
+    }
+    return 0;
+}
+// the frame's wind draws by their geometry (buffers, offsets, ranges): a draw identical to an earlier one is not recorded
+// again (the same pixels, the same motion); the same geometry under the other tree shader is counted (both kept)
+#define M_WHASH 4096
+static struct { unsigned gen, idx; } m_wh[M_WHASH];
+static unsigned m_wgen = 1, m_stat_wdup, m_stat_wxkind;
+void (*r2m_after_wind)(void);   // called after the wind draws, before the models (fgbridge.c's hole fill keeps that copy)
 static unsigned m_nlayouts;
 static unsigned m_stat_draws, m_stat_skipped, m_stat_recs, m_stat_found, m_stat_passes, m_stat_tex;
 
@@ -155,7 +202,20 @@ int r2m_init(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *mv, v
     if (psb) ID3D10Blob_Release(psb);
     if (cb1) ID3D10Blob_Release(cb1);
     if (cb2) ID3D10Blob_Release(cb2);
+    static const char *const wind_entry[3] = {"tree_a", "tree_b", "plant"};
+    for (int k = 0; ok && k < 3; k++)
+        ok = SUCCEEDED(comp(r2wind_hlsl, sizeof r2wind_hlsl - 1, "r2wind", NULL, NULL, wind_entry[k], "vs_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                            &m_wvsb[k], NULL)) &&
+             SUCCEEDED(ID3D11Device_CreateVertexShader(dev, ID3D10Blob_GetBufferPointer(m_wvsb[k]), ID3D10Blob_GetBufferSize(m_wvsb[k]), NULL, &m_wvs[k]));
+    ok = ok && (m_wcam[0] = cbuf(432)) && (m_wcam[1] = cbuf(432)) && (m_wind = cbuf(32));
 #ifdef PROFILING   // the debug view is in dev builds only
+    D3D_SHADER_MACRO wown[2] = {{"OWN", "1"}, {NULL, NULL}};
+    for (int k = 0; ok && k < 3; k++) {
+        ID3DBlob *b = NULL;
+        ok = SUCCEEDED(comp(r2wind_hlsl, sizeof r2wind_hlsl - 1, "r2wind", wown, NULL, wind_entry[k], "vs_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &b, NULL)) &&
+             SUCCEEDED(ID3D11Device_CreateVertexShader(dev, ID3D10Blob_GetBufferPointer(b), ID3D10Blob_GetBufferSize(b), NULL, &m_wvs_own[k]));
+        if (b) ID3D10Blob_Release(b);
+    }
     // the debug view's variants (OWN: + the own-motion target); the same inputs, so the same input layouts
     D3D_SHADER_MACRO own[2][3] = {{{"OWN", "1"}, {NULL, NULL}}, {{"SKIN4", "1"}, {"OWN", "1"}, {NULL, NULL}}};
     for (int k = 0; ok && k < 3; k++) {
@@ -192,32 +252,49 @@ int r2m_init(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11Texture2D *mv, v
 #endif
     if (!ok) { log("motion pass: shaders / buffers not made - off"); return 0; }
     m_on = 1;
-    log("motion pass ready: per-object motion of the animated models (GPU records, history matched on the GPU)");
+    log("motion pass ready: per-object motion of the animated models (GPU records, history matched on the GPU), trees and plants with their wind");
     return 1;
 }
 void r2m_set_enabled(int on) { m_enabled = on; }
+// instances whose own motion this frame stays under px render pixels are not redrawn (0: all; the shaders' cull_px); dev
+// measurement: < 0 = all the vertex work, no triangle drawn (what the redraw's vertex shaders cost by themselves)
+static float m_cull_px = 0.125f;
+void r2m_set_cull(float px) { m_cull_px = px < 0 ? -1 : px; }
+float r2m_cull(void) { return m_cull_px; }
+// dev (sweep soldiers= / trees=): leave the soldiers' or the trees' recording out (what each part costs outside the pass)
+static int m_rec_soldiers = 1, m_rec_trees = 1;
+void r2m_set_parts(int soldiers, int trees) { m_rec_soldiers = soldiers; m_rec_trees = trees; }
 #ifdef PROFILING
 void r2m_set_view(int on) { m_view = on; }   // (release builds: never on)
 #endif
 int r2m_ready(void) { return m_on; }
 
-// our input layout for a game layout: its elements + PREV0..3 (slot 2), against our VS for the type (0: 2 bones, 1: 4)
+// our input layout for a game layout: its elements + PREV0..3 (slot 2), against our VS for the type (0: 2 bones, 1: 4);
+// 2..4 (the wind's tree_a / tree_b / plant): the game's elements as they are
 static ID3D11InputLayout *layout_for(const void *game, const D3D11_INPUT_ELEMENT_DESC *e, UINT n, int type) {
     for (unsigned i = 0; i < m_nlayouts; i++) if (m_layouts[i].game == game && m_layouts[i].type == type) return m_layouts[i].ours;
-    if (m_nlayouts == 64 || n > 16) return NULL;
+    if (n > 16) return NULL;
+    if (m_nlayouts == M_LAYOUTS) {
+        static int said;
+        if (!said++) m_log("motion pass: %d input layouts recorded - models loaded from now get the camera's motion only", M_LAYOUTS);
+        return NULL;
+    }
     D3D11_INPUT_ELEMENT_DESC el[20];
     memcpy(el, e, n * sizeof *e);
     static const char prev[] = "PREV";
-    for (UINT k = 0; k < 4; k++) {
+    int wind = type >= 2;
+    for (UINT k = 0; !wind && k < 4; k++) {
         D3D11_INPUT_ELEMENT_DESC p = {prev, k, DXGI_FORMAT_R32G32B32A32_FLOAT, 2, 16 * k, D3D11_INPUT_PER_INSTANCE_DATA, 1};
         el[n + k] = p;
     }
     ID3D11InputLayout *il = NULL;
-    if (FAILED(ID3D11Device_CreateInputLayout(m_dev, el, n + 4, ID3D10Blob_GetBufferPointer(m_vsb[type]), ID3D10Blob_GetBufferSize(m_vsb[type]), &il))) {
+    ID3DBlob *vb = wind ? m_wvsb[type - 2] : m_vsb[type];
+    if (FAILED(ID3D11Device_CreateInputLayout(m_dev, el, n + (wind ? 0 : 4), ID3D10Blob_GetBufferPointer(vb), ID3D10Blob_GetBufferSize(vb), &il))) {
         m_log("motion pass: no input layout for the game's layout %p (type %d)", game, type);
         il = NULL;
     }
     MLayout l = {game, type, il};
+    ID3D11InputLayout_AddRef((ID3D11InputLayout *)game);
     m_layouts[m_nlayouts++] = l;
     return il;
 }
@@ -226,7 +303,7 @@ static ID3D11InputLayout *layout_for(const void *game, const D3D11_INPUT_ELEMENT
 // 1: 4 bones. e / n: the game's input layout elements (semantic names valid), game_il its object.
 void r2m_draw(ID3D11DeviceContext *c, int type, const void *game_il, const D3D11_INPUT_ELEMENT_DESC *e, UINT n, int indexed, UINT count,
               UINT inst, UINT start, INT base, UINT sinst) {
-    if (!m_on || !m_enabled) return;
+    if (!m_on || !m_enabled || !m_rec_soldiers) return;
     m_stat_draws++;
     ID3D11InputLayout *il = layout_for(game_il, e, n, type);
     ID3D11Buffer *vb[2] = {0}, *ib = NULL;
@@ -259,6 +336,79 @@ void r2m_draw(ID3D11DeviceContext *c, int type, const void *game_il, const D3D11
     ID3D11Buffer_Release(vb[1]);
 }
 
+// at a swaying main-view draw (kind 0 tree_a, 1 tree_b, 2 plant): its buffers as bound (the game's offsets, first instance
+// kept); the game's camera block and wind block copied at the frame's first one (the exact bytes its shader reads)
+void r2m_wind_draw(ID3D11DeviceContext *c, int kind, const void *game_il, const D3D11_INPUT_ELEMENT_DESC *e, UINT n, int indexed, UINT count,
+                   UINT inst, UINT start, INT base, UINT sinst) {
+    if (!m_on || !m_enabled || !m_rec_trees || m_nwd >= M_WDRAWS || kind < 0 || kind > 2) return;
+    if (!m_wind_have || !m_wcam_have[m_wc]) {
+        ID3D11Buffer *cb[2] = {0};
+        ID3D11DeviceContext_VSGetConstantBuffers(c, 0, 2, cb);
+        D3D11_BUFFER_DESC b0 = {0}, b1 = {0};
+        if (cb[0]) ID3D11Buffer_GetDesc(cb[0], &b0);
+        if (cb[1]) ID3D11Buffer_GetDesc(cb[1], &b1);
+        r2m_internal = 1;
+        if (b0.ByteWidth >= 432 && !m_wcam_have[m_wc]) {
+            D3D11_BOX bx = {0, 0, 0, 432, 1, 1};
+            ID3D11DeviceContext_CopySubresourceRegion(c, (ID3D11Resource *)m_wcam[m_wc], 0, 0, 0, 0, (ID3D11Resource *)cb[0], 0, &bx);
+            m_wcam_have[m_wc] = 1;
+        }
+        if (b1.ByteWidth >= 32 && !m_wind_have) {
+            D3D11_BOX bx = {0, 0, 0, 32, 1, 1};
+            ID3D11DeviceContext_CopySubresourceRegion(c, (ID3D11Resource *)m_wind, 0, 0, 0, 0, (ID3D11Resource *)cb[1], 0, &bx);
+            m_wind_have = 1;
+        }
+        r2m_internal = 0;
+        for (int k = 0; k < 2; k++) if (cb[k]) ID3D11Buffer_Release(cb[k]);
+        if (!m_wind_have || !m_wcam_have[m_wc]) return;
+    }
+    ID3D11InputLayout *il = layout_for(game_il, e, n, 2 + kind);
+    if (!il) return;
+    MWind *d = &m_wd[m_nwd];
+    memset(d, 0, sizeof *d);
+    ID3D11DeviceContext_IAGetVertexBuffers(c, 0, 4, d->vb, d->st, d->of);
+    if (indexed) ID3D11DeviceContext_IAGetIndexBuffer(c, &d->ib, &d->ifmt, &d->ioff);
+    d->indexed = indexed; d->kind = kind; d->count = count; d->inst = inst; d->start = start; d->base = base; d->sinst = sinst; d->il = il;
+    d->fill = m_fill_serial;
+    unsigned h = 2166136261u;
+    const unsigned key[16] = {(unsigned)(UINT_PTR)d->vb[0], (unsigned)(UINT_PTR)d->vb[1], (unsigned)(UINT_PTR)d->vb[2], (unsigned)(UINT_PTR)d->vb[3],
+                              d->of[0], d->of[1], d->of[2], d->of[3], (unsigned)(UINT_PTR)d->ib, d->ioff, count, inst, start, (unsigned)base, sinst,
+                              (unsigned)indexed};
+    for (int k = 0; k < 16; k++) h = (h ^ key[k]) * 16777619u;
+    for (unsigned s = h % M_WHASH;; s = (s + 1) % M_WHASH) {
+        if (m_wh[s].gen != m_wgen) { m_wh[s].gen = m_wgen; m_wh[s].idx = m_nwd; break; }
+        MWind *o = &m_wd[m_wh[s].idx];
+        if (memcmp(o->vb, d->vb, sizeof d->vb) || memcmp(o->of, d->of, sizeof d->of) || o->ib != d->ib || o->ioff != d->ioff || o->count != count ||
+            o->inst != inst || o->start != start || o->base != base || o->sinst != sinst || o->indexed != indexed) continue;
+        if (o->kind != kind) { m_stat_wxkind++; continue; }
+        o->fill = m_fill_serial;   // the same geometry drawn again: its buffers hold what this draw used
+        for (int k = 0; k < 4; k++) if (d->vb[k]) ID3D11Buffer_Release(d->vb[k]);
+        if (d->ib) ID3D11Buffer_Release(d->ib);
+        m_stat_wdup++;
+        return;
+    }
+    m_nwd++;
+    m_stat_wdraws++;
+    m_stat_winst += inst;
+}
+static void drop_wind(void) {
+    for (unsigned i = 0; i < m_nwd; i++) {
+        for (int k = 0; k < 4; k++) if (m_wd[i].vb[k]) ID3D11Buffer_Release(m_wd[i].vb[k]);
+        if (m_wd[i].ib) ID3D11Buffer_Release(m_wd[i].ib);
+    }
+    m_nwd = 0;
+    m_wgen++;   // the geometry table starts empty
+}
+// the wind's frame: this frame's blocks become the previous ones (only if this frame had them and ran the pass)
+static void wind_frame_end(void) {
+    m_wprev_ok = m_passed && m_wcam_have[m_wc];
+    m_wc = !m_wc;
+    m_wcam_have[m_wc] = 0;
+    m_wind_have = 0;
+    m_passed = 0;
+    drop_wind();
+}
+
 static void drop_draws(void) {
     for (unsigned i = 0; i < m_ndraws; i++) {
         ID3D11Buffer_Release(m_draws[i].vb);
@@ -272,14 +422,17 @@ static void drop_draws(void) {
 // at the HUD-less point (fgbridge.c's motion callback): match, draw, then this frame's data becomes the previous.
 // dsv: a view of the scene depth; vp: this frame's camera block (560 bytes, view_projection at 144); rw / rh: render size;
 // jx / jy: this frame's jitter (the viewport offset the scene was drawn with)
-void r2m_pass(ID3D11DepthStencilView *dsv, const float *cam, UINT rw, UINT rh, float jx, float jy, float min_depth, float max_depth) {
-    if (!m_on) return;
+// returns 1 when it drew (fgbridge.c then fills the holes around the models for AMD FSR)
+int r2m_pass(ID3D11DepthStencilView *dsv, const float *cam, UINT rw, UINT rh, float jx, float jy, float min_depth, float max_depth) {
+    if (!m_on) return 0;
     m_frame++;
-    if (!m_enabled || !m_ndraws || !dsv) { drop_draws(); m_prev_frame = ~0u; return; }
+    if (!m_enabled || (!m_ndraws && !m_nwd) || !dsv) { drop_draws(); drop_wind(); m_prev_frame = ~0u; return 0; }
     r2m_internal = 1;
     ID3DDeviceContextState *game = NULL;
     ID3D11DeviceContext1_SwapDeviceContextState(m_ctx1, m_state, &game);
     ID3D11DeviceContext *c = m_ctx;
+    int has_prev = 0;
+    if (m_ndraws) {   // the models: this frame's animation texture, blocks and the history matching
     // this frame's animation texture and camera / animation size blocks
     D3D11_TEXTURE2D_DESC td;
     ID3D11Texture2D_GetDesc((ID3D11Texture2D *)m_draws[0].anim, &td);
@@ -307,7 +460,7 @@ void r2m_pass(ID3D11DepthStencilView *dsv, const float *cam, UINT rw, UINT rh, f
     D3D11_BOX b4 = {0, 0, 0, m_nrec * 4, 1, 1};
     ID3D11DeviceContext_UpdateSubresource(c, (ID3D11Resource *)m_cls[m_cur], 0, &b4, cls32, 0, 0);
     // history: the previous frame's records into the grid, then each record matched (no previous pass: none)
-    int has_prev = m_prev_frame == m_frame - 1;
+    has_prev = m_prev_frame == m_frame - 1;
     unsigned cs[4] = {m_nrec, has_prev ? m_nprev : 0, 0, 0};
     ID3D11DeviceContext_UpdateSubresource(c, (ID3D11Resource *)m_cb_cs, 0, NULL, cs, 0, 0);
     UINT zero[4] = {0, 0, 0, 0};
@@ -325,8 +478,14 @@ void r2m_pass(ID3D11DepthStencilView *dsv, const float *cam, UINT rw, UINT rh, f
     ID3D11DeviceContext_Dispatch(c, (m_nrec + 63) / 64, 1, 1);
     ID3D11UnorderedAccessView *nuav[3] = {0};
     ID3D11DeviceContext_CSSetUnorderedAccessViews(c, 0, 3, nuav, NULL);
+    }
     // the draws: into the motion vectors where the game's depth is ours (EQUAL), through the scene's viewport
-    float msz[4] = {(float)rw, (float)rh, 0, 0};
+    static LARGE_INTEGER last;   // the soldiers' limb allowance: seconds since the last pass (0.1 at most)
+    LARGE_INTEGER now, qf;
+    QueryPerformanceCounter(&now); QueryPerformanceFrequency(&qf);
+    float dt = last.QuadPart ? (float)(now.QuadPart - last.QuadPart) / qf.QuadPart : 0.1f;
+    last = now;
+    float msz[4] = {(float)rw, (float)rh, dt > 0.1f ? 0.1f : dt, m_view ? 0 : m_cull_px};   // the debug view: every model
     ID3D11DeviceContext_UpdateSubresource(c, (ID3D11Resource *)m_cb_motion, 0, NULL, msz, 0, 0);
     ID3D11Buffer *cbs[5] = {m_cb_motion, m_cb_cam[m_cur], has_prev ? m_cb_cam[!m_cur] : m_cb_cam[m_cur], m_cb_asz[m_cur],
                             has_prev ? m_cb_asz[!m_cur] : m_cb_asz[m_cur]};
@@ -343,6 +502,22 @@ void r2m_pass(ID3D11DepthStencilView *dsv, const float *cam, UINT rw, UINT rh, f
     ID3D11DeviceContext_VSSetSamplers(c, 0, 1, &m_point);
     ID3D11DeviceContext_PSSetShader(c, m_view ? m_ps_own : m_ps, NULL, 0);
     ID3D11DeviceContext_IASetPrimitiveTopology(c, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    // the swaying trees and plants first (the game's buffers and first instance as they were)
+    ID3D11Buffer *wcbs[3] = {m_wcam[m_wc], m_wprev_ok ? m_wcam[!m_wc] : m_wcam[m_wc], m_wind};
+    ID3D11DeviceContext_VSSetConstantBuffers(c, 5, 3, wcbs);
+    for (unsigned i = 0; i < m_nwd; i++) {
+        MWind *d = &m_wd[i];
+        if (refilled(d)) { m_stat_wrefill++; continue; }
+        ID3D11DeviceContext_IASetInputLayout(c, d->il);
+        ID3D11DeviceContext_IASetVertexBuffers(c, 0, 4, d->vb, d->st, d->of);
+        ID3D11DeviceContext_VSSetShader(c, m_view ? m_wvs_own[d->kind] : m_wvs[d->kind], NULL, 0);
+        if (d->indexed) {
+            ID3D11DeviceContext_IASetIndexBuffer(c, d->ib, d->ifmt, d->ioff);
+            ID3D11DeviceContext_DrawIndexedInstanced(c, d->count, d->inst, d->start, d->base, d->sinst);
+        } else ID3D11DeviceContext_DrawInstanced(c, d->count, d->inst, d->start, d->sinst);
+    }
+    // the hole fill's "before" copy after the wind: only the models count as moving on their own (Attila AGENT_LOG 183)
+    if (r2m_after_wind) r2m_after_wind();
     for (unsigned i = 0; i < m_ndraws; i++) {
         MDraw *d = &m_draws[i];
         ID3D11Buffer *vbs[3] = {d->vb, m_rec[m_cur], m_prev};
@@ -360,17 +535,22 @@ void r2m_pass(ID3D11DepthStencilView *dsv, const float *cam, UINT rw, UINT rh, f
     r2m_internal = 0;
     m_stat_passes++;
     m_stat_recs += m_nrec;
-    // this frame's records, classes, texture and blocks are the previous ones next frame
-    m_nprev = m_nrec;
-    m_prev_frame = m_frame;
-    m_cur = !m_cur;
+    m_passed = 1;
+    // this frame's records, classes, texture and blocks are the previous ones next frame (a frame without models: none)
+    if (m_ndraws) {
+        m_nprev = m_nrec;
+        m_prev_frame = m_frame;
+        m_cur = !m_cur;
+    } else m_prev_frame = ~0u;
     drop_draws();
+    return 1;
 }
 
 // a frame that never got to the pass (no HUD-less point): its records are dropped and the next has no history
 // (called after every Present: the debug view's texture cleared, so it only ever shows the models of a frame the pass ran in)
 void r2m_frame_end(void) {
     if (m_ndraws) { drop_draws(); m_prev_frame = ~0u; }
+    wind_frame_end();
     if (!m_on || !m_view) return;
     float none[4] = {0, 0, 0, 0};
     r2m_internal = 1;
@@ -454,5 +634,11 @@ void r2m_report(void (*log)(const char *fmt, ...)) {
     if (!m_on) return;
     log("  motion pass: %u passes, %u animated draws recorded (%u skipped), %u records, texture changes %u", m_stat_passes, m_stat_draws,
         m_stat_skipped, m_stat_recs, m_stat_tex);
+    if (m_stat_passes)
+        log("  motion pass, swaying trees and plants: %.1f draws (%.0f instances) per pass redrawn with their wind; identical to an "
+            "earlier draw (not redrawn) %.1f, the same geometry under the other tree shader %.1f, buffers refilled before the "
+            "pass (not redrawn) %.1f", (double)m_stat_wdraws / m_stat_passes, (double)m_stat_winst / m_stat_passes,
+            (double)m_stat_wdup / m_stat_passes, (double)m_stat_wxkind / m_stat_passes, (double)m_stat_wrefill / m_stat_passes);
     m_stat_passes = m_stat_draws = m_stat_skipped = m_stat_recs = m_stat_found = m_stat_tex = 0;
+    m_stat_wdraws = m_stat_winst = m_stat_wdup = m_stat_wxkind = m_stat_wrefill = 0;
 }
