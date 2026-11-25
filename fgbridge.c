@@ -640,12 +640,16 @@ void fgb_hud_post(ID3D11Resource *backbuffer) {
 }
 // the hole fill around the per-object pass (fill_src): begin keeps the camera-only vectors, end fills the holes. Also
 // called by bridgetest (boxmv) around its own object vectors.
+// Only while AMD FSR upscales or generates frames (Attila audit 2026-11-20): the DLL always has FSR in it, so the fill ran
+// with NVIDIA DLSS as well - two full-size copies of the vectors and a compute pass a frame, for a picture that measured
+// no better with it (bridgetest box area: fill 28.88 dB, DLSS 29.22; Attila AGENT_LOG 162: DLSS 29.79 without, 28.70 with).
+static int fill_wanted(void) { return g_fill_cs && (fgb_sr_backend() == 2 || fgb_fg_backend() == 2); }
 void fgb_fill_begin(void) {
     if (g_tq_set[g_n % 8] & 1 << TQ_M0) tq(TQ_MW);   // the motion pass's trees and plants are done (fgb_motion_wind_cost)
-    if (g_fill_cs) ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_mvcam, (ID3D11Resource *)g_mv); }
+    if (fill_wanted()) ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_mvcam, (ID3D11Resource *)g_mv); }
 
 void fgb_fill_end(UINT rw, UINT rh) {
-    if (!g_fill_cs) return;
+    if (!fill_wanted()) return;
     ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)g_mvobj, (ID3D11Resource *)g_mv);
     struct { UINT w, h; float tol, unitk; } k = {rw, rh, 0.03f, g_react_uav && fgb_sr_backend() == 2 ? g_fill_unitk : 0};
     ID3D11DeviceContext_UpdateSubresource(g_ctx, (ID3D11Resource *)g_fill_cb, 0, NULL, &k, 0, 0);
@@ -690,7 +694,10 @@ static int react_copy(ID3D11Texture2D **t, ID3D11ShaderResourceView **srv, ID3D1
         if (FAILED(ID3D11Device_CreateTexture2D(g_dev, &d, NULL, t))) { *t = NULL; return 0; }
         if (FAILED(ID3D11Device_CreateShaderResourceView(g_dev, (ID3D11Resource *)*t, NULL, srv))) { ID3D11Texture2D_Release(*t); *t = NULL; return 0; }
     }
-    ID3D11DeviceContext_CopySubresourceRegion(g_ctx, (ID3D11Resource *)*t, 0, 0, 0, 0, src, 0, NULL);
+    // the part the scene is drawn in (the render size below native: the shader reads no pixel past it; Attila audit 2026-11-20)
+    UINT rw = g_sr ? g_rw : g_w, rh = g_sr ? g_rh : g_h;
+    D3D11_BOX box = {0, 0, 0, rw < d.Width ? rw : d.Width, rh < d.Height ? rh : d.Height, 1};
+    ID3D11DeviceContext_CopySubresourceRegion(g_ctx, (ID3D11Resource *)*t, 0, 0, 0, 0, src, 0, &box);
     return 1;
 }
 void fgb_react_begin(ID3D11Resource *hdr) {

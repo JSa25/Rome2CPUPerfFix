@@ -27,8 +27,13 @@ extern int g_crash_logging;                                                     
 void update_check(HMODULE self, void (*log)(const char *fmt, ...));                             // update.c
 int install_fileio(HMODULE m, void (*log)(const char *fmt, ...));                              // fileio.c
 int install_strfix(HMODULE m, void (*log)(const char *fmt, ...));                              // strfix.c
+int install_soundguard(HMODULE m, void (*log)(const char *fmt, ...));                          // soundguard.c
+int install_parsort(HMODULE m, int ab, void (*log)(const char *fmt, ...));                     // parsort.c
+int install_uicache(HMODULE m, const char *names, void *test_draw, void (*log)(const char *fmt, ...));  // uicache.c
 int install_attrcache(HMODULE m, int verify, void (*log)(const char *fmt, ...));               // attrcache.c
 int install_bridgeprobe(HMODULE m, const wchar_t *dir, void (*log)(const char *fmt, ...));     // bridgeprobe.c (the DLSS add-on)
+int install_overlay(HMODULE m, void (*log)(const char *fmt, ...));                             // overlay.c: F8 without the add-on
+int install_menuver(HMODULE m, void (*log)(const char *fmt, ...));                             // menuver.c
 #ifdef PROFILING
 // the menu-picture fix is profiling-only: it halves the reloads but made no measurable difference (AGENT_LOG 2026-10-27)
 int install_uikeep(HMODULE m, int loadnames, void (*log)(const char *fmt, ...));               // uikeep.c
@@ -136,15 +141,16 @@ HRESULT WINAPI stub_DllUnregisterServer(void) {
 // The plain-language summary after the install lines (those stay as the details for bug reports).
 enum { FIX_SWITCHED_OFF = -1, FIX_INACTIVE = 0, FIX_ON = 1, FIX_PARTLY = 2 };
 #ifdef PROFILING
-#define NFIX 7
+#define NFIX 9
 #else
-#define NFIX 6  // without "Menus" (profiling-only)
+#define NFIX 8  // without "Menus" (profiling-only)
 #endif
-static const char *const g_fix_names[7] = {"FPS: tile feedback scan", "FPS: x87 rounding", "FPS: render-list sorts",
+static const char *const g_fix_names[9] = {"FPS: tile feedback scan", "FPS: x87 rounding", "FPS: render-list sorts",
                                            "Loading: file reading", "Loading: string functions", "Loading: missing-file cache",
+                                           "Stability: sound crash guard (huge battles)", "FPS: battle UI (unit cards drawn from a cache)",
                                            "Menus: pictures stay loaded"};
 
-static void log_status(const int st[7]) {
+static void log_status(const int st[9]) {
     int on = 0;
     for (int i = 0; i < NFIX; i++) on += st[i] == FIX_ON;
     if (on == NFIX)
@@ -158,10 +164,12 @@ static void log_status(const int st[7]) {
              : st[i] == FIX_INACTIVE ? " (does not fit this game version, so it stays off; details above)" : "");
 }
 
-// rome2fix.ini in the game folder: written once with the defaults when missing, never changed by the mod after that.
+// rome2fix.ini in the game folder: written once with the defaults when missing; after that the mod changes only
+// [tuning] culling= (the F8 panel's pick).
 static const char g_ini_defaults[] =
     "; Rome 2 Engine Performance Fix settings. 1 = on, 0 = off. Restart the game after a change.\r\n"
-    "; The mod writes this file once with the defaults and never changes it. Delete it to get the defaults back.\r\n"
+    "; The mod writes this file once with the defaults; after that it changes only culling= (your pick in the F8 panel).\r\n"
+    "; Delete it to get the defaults back.\r\n"
     "; (The older way still works too: an empty <name>_off.txt file in the game folder switches that fix off.)\r\n"
     "\r\n"
     "[fixes]\r\n"
@@ -169,10 +177,15 @@ static const char g_ini_defaults[] =
     "tile_feedback_scan=1\r\n"
     "x87_rounding=1\r\n"
     "render_list_sorts=1\r\n"
+    "parallel_sort=1\r\n"
     "; loading\r\n"
     "file_reading=1\r\n"
     "string_functions=1\r\n"
     "missing_file_cache=1\r\n"
+    "; stability\r\n"
+    "sound_crash_guard=1\r\n"
+    "; FPS in battles: the unit cards shown from a cache, redrawn a few times a second and on input\r\n"
+    "battle_ui_cache=1\r\n"
     "\r\n"
     "[mod]\r\n"
     "; copy a newer version from the Steam Workshop into the game folder at startup\r\n"
@@ -181,6 +194,11 @@ static const char g_ini_defaults[] =
     "crash_logging=1\r\n"
     "; load other mods' DLLs from the plugins folder in the game folder (any name, e.g. plugins\\smoke.dll)\r\n"
     "plugins=1\r\n"
+    "\r\n"
+    "[tuning]\r\n"
+    "; Culling: small parts of far-away soldiers (belts, quivers, bridles) are not drawn, for more fps in big battles:\r\n"
+    "; off, light, normal or strong (also in the F8 panel, which saves its pick here)\r\n"
+    "culling=light\r\n"
     "\r\n"
     "; The DLSS add-on has its own settings: FrameBridge\\settings.txt (F11 in game).\r\n";
 
@@ -200,9 +218,44 @@ int ini_on(const wchar_t *sec, const wchar_t *key, const wchar_t *ini) {
     return _wcsicmp(v, L"0") && _wcsicmp(v, L"off") && _wcsicmp(v, L"false") && _wcsicmp(v, L"no");
 }
 
+// Culling (partcull.c, from Attila 7.1): Off / Light / Normal / Strong, from rome2fix.ini [tuning] culling=; the F8
+// panel's pick is saved there. The threshold per choice is the panel's (fgpanel.c g_fgp_cull_px). Light by default
+// (user, 2026-11-25), as Attila ships it; the part box offset is read from the code, not yet checked in game.
+int install_partcull(HMODULE m, void (*log)(const char *fmt, ...));                            // partcull.c
+void partcull_counts(unsigned *parts, unsigned *skipped);
+unsigned partcull_forced(void);
+extern volatile LONG g_partcull_on;
+extern float g_partcull_px;
+extern const float g_fgp_cull_px[4];
+void fgp_set_cull(int choice), fgp_set_cull_available(int ok);
+void fgp_set_cull_source(void (*counts)(unsigned *, unsigned *, unsigned *), void (*apply)(int));
+static const wchar_t *const CULL_KEYS[4] = {L"off", L"light", L"normal", L"strong"};
+static int g_culling, g_culling_ok;
+static wchar_t g_ini[MAX_PATH];
+static void culling_choose(int c) {
+    g_culling = c >= 0 && c < 4 ? c : 0;
+    if (g_culling) g_partcull_px = g_fgp_cull_px[g_culling];
+    InterlockedExchange(&g_partcull_on, g_culling > 0);
+}
+static void culling_pick(int c) {   // from the F8 panel: applied now and saved
+    culling_choose(c);
+    if (g_ini[0]) WritePrivateProfileStringW(L"tuning", L"culling", CULL_KEYS[g_culling], g_ini);
+    wlog("culling: %ls (picked in the F8 panel, saved in rome2fix.ini)", CULL_KEYS[g_culling]);
+}
+static void culling_counts(unsigned *parts, unsigned *skipped, unsigned *forced) {
+    partcull_counts(parts, skipped);
+    *forced = partcull_forced();
+}
+// the [tuning] culling= value: off / light / normal / strong or 0..3; anything else is off
+static int culling_from_ini(const wchar_t *v) {
+    int c = v[0] >= L'0' && v[0] <= L'3' && !v[1] ? v[0] - L'0' : 0;
+    for (int i = 1; i < 4; i++) if (!_wcsicmp(v, CULL_KEYS[i])) c = i;
+    return c;
+}
+
 // Installs everything into the game DLL m (mapped and relocated, its own startup code not run yet).
 static void install_all(HMODULE m) {
-    int st[7] = {0};
+    int st[9] = {0};
     // Switches: rome2fix.ini, or (older) empty <name>_off.txt files in the game folder.
     wchar_t f[MAX_PATH], ini[MAX_PATH];
     wchar_t *name = wcsrchr(g_log_path, L'\\') - g_log_path + f + 1;
@@ -211,6 +264,7 @@ static void install_all(HMODULE m) {
     wcscpy(ini, f);
     wcscpy(ini + (name - f), L"rome2fix.ini");
     ini_write_defaults(ini);
+    wcscpy(g_ini, ini);
 #define INI(sec, key) ini_on(sec, key, ini)
 #define OFF(key, file) (!INI(L"fixes", key) || PRESENT(file))
     g_crash_logging = INI(L"mod", L"crash_logging");
@@ -220,6 +274,19 @@ static void install_all(HMODULE m) {
         update_check(g_self, wlog);     // a newer Workshop copy replaces this DLL for the next launch
     else
         wlog("self-update off (self_update=0 in rome2fix.ini)");  // also for off / false / no
+    {   // the pop-ups after the game starts (fgpanel.c, with the DLSS add-on): a newer version installed, and What's new on
+        // the first start of this one (the last version started is in rome2fix_seen.txt)
+        extern int g_update_state;   // update.c
+        void fgp_set_update(int state), fgp_show_whatsnew(void);
+        fgp_set_update(g_update_state);
+        char t[16] = {0};
+        FILE *sf = (wcscpy(name, L"rome2fix_seen.txt"), _wfopen(f, L"rb"));
+        if (sf) { fread(t, 1, sizeof t - 1, sf); fclose(sf); }
+        if (atoi(t) != MOD_VERSION_NUM) {
+            fgp_show_whatsnew();
+            if ((sf = _wfopen(f, L"wb"))) { fprintf(sf, "%d\n", MOD_VERSION_NUM); fclose(sf); }
+        }
+    }
 #ifdef PROFILING
     // Heap test (opt-in, heapfix_on.txt): must go in before the game's first allocation, which is still to come here.
     // mimalloc frees a thread's state when the thread ends, so thread notifications stay on while it is installed.
@@ -239,6 +306,29 @@ static void install_all(HMODULE m) {
     // script extender: only with a lua_ext folder in the game folder (scriptext.c); runs from the frame hook
     if (ts) g_scriptext_on = install_scriptext(m, dir, wlog);
     st[0] = !ts ? FIX_INACTIVE : tile_mode ? FIX_ON : FIX_SWITCHED_OFF;
+    // Battles: a soldier's small parts are not drawn once they would be a few pixels tall (partcull.c); the choice is
+    // rome2fix.ini [tuning] culling= or the F8 panel; partcull_off.txt leaves it out entirely.
+    // Before the x87 fix: that patches a rounding block inside add_instance, which partcull checks byte for byte.
+    if (PRESENT(L"partcull_off.txt")) wlog("culling not installed (partcull_off.txt)");
+    else g_culling_ok = install_partcull(m, wlog) > 0;
+    if (g_culling_ok) {
+        wchar_t v[16] = L"";
+        GetPrivateProfileStringW(L"tuning", L"culling", L"light", v, 16, ini);
+        culling_choose(culling_from_ini(v));
+    }
+    fgp_set_cull_source(culling_counts, culling_pick);
+    fgp_set_cull_available(g_culling_ok);
+    fgp_set_cull(g_culling);
+    // Battles: the unit cards are not walked and drawn every frame but shown from a cache that is redrawn a few times a
+    // second and on input (uicache.c, from Attila 7.1). It counts frames with g_frame_no: only with the frame hook in.
+    // Before the x87 fix too: that patches rounding blocks inside the UI's Draw, which this checks byte for byte.
+    if (OFF(L"battle_ui_cache", L"uicache_off.txt")) {
+        wlog("battle UI cache switched off (rome2fix.ini or uicache_off.txt) - the unit cards are drawn every frame, as the game does");
+        st[7] = FIX_SWITCHED_OFF;
+    } else if (!ts)
+        wlog("battle UI cache not installed (needs the frame hook)");
+    else
+        st[7] = install_uicache(m, NULL, NULL, wlog) > 0;
     if (!ts)
         wlog("x87 fix not installed (needs the frame hook)");
     else if (OFF(L"x87_rounding", L"x87fix_off.txt")) {
@@ -267,13 +357,19 @@ static void install_all(HMODULE m) {
 #endif
         st[5] = install_attrcache(m, verify, wlog) > 0;
     }
+    // Huge battles: a sound the game's full sound pool gave no buffer is skipped instead of crashing (soundguard.c)
+    if (OFF(L"sound_crash_guard", L"soundguard_off.txt")) {
+        wlog("sound crash guard switched off (rome2fix.ini or soundguard_off.txt) - not installed");
+        st[6] = FIX_SWITCHED_OFF;
+    } else
+        st[6] = install_soundguard(m, wlog) > 0;
 #ifdef PROFILING
     int loadnames = PRESENT(L"loadnames_on.txt");  // count menu picture loads per name
     if (PRESENT(L"uikeep_off.txt")) {
         wlog("uikeep_off.txt found - menu pictures freed when closed, as the game does");
-        st[6] = FIX_SWITCHED_OFF;
+        st[8] = FIX_SWITCHED_OFF;
     } else
-        st[6] = install_uikeep(m, loadnames, wlog) > 0;
+        st[8] = install_uikeep(m, loadnames, wlog) > 0;
 #endif
     int sorts = 0;
     if (OFF(L"render_list_sorts", L"sortfix_off.txt")) {
@@ -281,15 +377,24 @@ static void install_all(HMODULE m) {
         st[2] = FIX_SWITCHED_OFF;
     } else
         sorts = install_sortfix(m, wlog);
+    // Battles: the soldiers' draw lists sorted on the main thread + 3 helpers (parsort.c, from Attila 7.4; Rome 2 has no
+    // list job, the main thread does that work itself). Part of the sorts: no status line of its own; needs sortfix's
+    // draw-list sort. parsort_ab.txt: 10 s windows on / off with the block's time in the log (the in-game A/B).
+    if (sorts && OFF(L"parallel_sort", L"parsort_off.txt"))
+        wlog("soldier draw lists on several threads switched off (rome2fix.ini or parsort_off.txt) - sorted on one thread, as before");
+    else if (sorts)
+        install_parsort(m, PRESENT(L"parsort_ab.txt"), wlog);
     if (st[2] != FIX_SWITCHED_OFF) st[2] = sorts == 2 ? FIX_ON : sorts ? FIX_PARTLY : FIX_INACTIVE;
     log_status(st);
+    wlog("  Culling: %ls%s", g_culling_ok ? CULL_KEYS[g_culling] : L"not available",
+         g_culling_ok ? " (optional; F8 panel or rome2fix.ini [tuning] culling=)" : "");
 #ifdef PROFILING
     if (sorts == 2 && PRESENT(L"sortfix_ab.txt")) {
         // A/B: the sorts flip on/off every 10 s at frame start, fps logged per window.
         g_ab_name = "sortfix";
         g_ab_flip = sortfix_enable;
         wlog("sortfix_ab.txt found - A/B mode for the sort fix");
-    } else if (st[6] == FIX_ON && PRESENT(L"uikeep_ab.txt")) {
+    } else if (st[8] == FIX_ON && PRESENT(L"uikeep_ab.txt")) {
         // A/B: menu pictures kept + menu stat opens cached, on/off every 10 s (off frees everything kept)
         g_ab_name = "menus";
         g_ab_flip = menus_enable;
@@ -316,7 +421,7 @@ static void install_all(HMODULE m) {
     // bridge capture probe, fgbridge_on.txt; dlss/DLSS_LOG.md)
     int addon = PRESENT(L"FrameBridge\\helper64.exe");
     if (addon) {
-        char text[1024] = {0};
+        char text[4096] = {0};   // the add-on's settings.txt is past 1 KB (addon= at byte 1486 in the installed one)
         FILE *sf = PRESENT(L"FrameBridge\\settings.txt") ? _wfopen(f, L"r") : NULL;
         if (sf) { fread(text, 1, sizeof text - 1, sf); fclose(sf); }
         if (strstr(text, "\naddon=off") || !strncmp(text, "addon=off", 9)) {
@@ -327,7 +432,12 @@ static void install_all(HMODULE m) {
 #ifdef PROFILING
     if (PRESENT(L"bridgeprobe.txt")) addon = 1;
 #endif
+    // without the add-on the F8 panel (Culling, What's new) and the pop-ups run on the game's own frames (overlay.c);
+    // with it the bridge draws them, so the overlay never goes in beside it (both wrap the same GetProcAddress import)
     if (addon) install_bridgeprobe(m, dir, wlog);
+    else install_overlay(m, wlog);
+    // main menu: this mod's version under the game's version number, drawn by the panel (menuver.c, fgpanel.c)
+    install_menuver(m, wlog);
     // other mods' DLLs from <game>\plugins (plugins.c), after every fix is in
     if (!INI(L"mod", L"plugins")) wlog("plugins off (plugins=0 in rome2fix.ini)");
     // from the load notification (another program loaded this DLL first) Windows refuses LoadLibrary (error 1168);
@@ -366,15 +476,33 @@ static int wait_for_game(void) {
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
     (void)r;
     if (reason != DLL_PROCESS_ATTACH) return TRUE;
+    // One engine fix per game (Attila 7.4): a second copy in the same process (another dinput8.dll, one in plugins\, one
+    // bundled under another name) would patch the game's code twice. The first copy holds Local\Rome2EngineFix_<pid> for
+    // the process's life (other mods may open it to see that the fix runs); a later copy finds it and stays out. Copies
+    // older than this one do not take it, so only they can still double up.
+    wchar_t mx[64];
+    _snwprintf(mx, 64, L"Local\\Rome2EngineFix_%lu", GetCurrentProcessId());
+    HANDLE mh = CreateMutexW(NULL, FALSE, mx);
+    int second = mh && GetLastError() == ERROR_ALREADY_EXISTS;
 #ifndef PROFILING
     DisableThreadLibraryCalls(h);  // profiling builds decide in install_all (the heap test needs thread notifications)
+#else
+    if (second) DisableThreadLibraryCalls(h);   // its heap test never starts
 #endif
     g_self = h;
     DWORD n = GetModuleFileNameW(h, g_log_path, MAX_PATH);
     wchar_t *sl = wcsrchr(g_log_path, L'\\');
     // room after the folder for the longest name built in it ("FrameBridge\settings.txt"); else no log path: do nothing
-    if (n == 0 || n >= MAX_PATH || !sl || sl - g_log_path > MAX_PATH - 40) return TRUE;
+    if (n == 0 || n >= MAX_PATH || !sl || sl - g_log_path > MAX_PATH - 40) { if (second) CloseHandle(mh); return TRUE; }
     wcscpy(sl + 1, L"rome2fix.log");
+    if (second) {
+        CloseHandle(mh);
+        wchar_t me[MAX_PATH] = L"";
+        GetModuleFileNameW(h, me, MAX_PATH);
+        wlog("Rome 2 Engine Performance Fix " MOD_VERSION_STR ": another copy is already running in this game (%ls) - this one "
+             "(%ls) stays out; only one engine fix should be installed", mx, me);
+        return TRUE;   // the dinput8 exports still forward to Windows' own DLL
+    }
     log_header();
     HMODULE m = GetModuleHandleW(L"empire.retail.dll");
     if (m)

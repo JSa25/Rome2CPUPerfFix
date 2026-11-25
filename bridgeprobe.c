@@ -3298,3 +3298,16 @@ int install_bridgeprobe(HMODULE m, const wchar_t *dir, void (*log)(const char *f
     if (!g_settings[0]) log("bridge probe on: D3D11 device / swapchain watched; bridge_go.txt in the game folder captures the next frame");
     return 1;
 }
+
+
+// For uicache.c: d3d11's own function behind the add-on's hook in a context vtable slot; NULL when the slot is not the add-on's
+void *__cdecl fgb_d3d11_original(unsigned slot) {
+    static const struct { unsigned slot; int s; void *ours; } h[] = {
+        {SLOT(OMSetRenderTargets), S_OMRT, (void *)w_omrt}, {SLOT(RSSetViewports), S_RSVP, (void *)w_rsvp}, {SLOT(Draw), S_D, (void *)w_d},
+        {SLOT(DrawIndexed), S_DIP, (void *)w_dip}, {SLOT(DrawInstanced), S_DI, (void *)w_di}, {SLOT(DrawIndexedInstanced), S_DII, (void *)w_dii}};
+    if (!g_ctx) return NULL;
+    void *fn = (*(void ***)g_ctx)[slot];
+    for (unsigned i = 0; i < sizeof h / sizeof *h; i++)
+        if (h[i].slot == slot && fn == h[i].ours) return orig_of(g_ctx, h[i].s);
+    return NULL;
+}

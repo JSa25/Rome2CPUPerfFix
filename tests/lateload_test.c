@@ -161,13 +161,28 @@ int main(int argc, char **argv) {
     if (heap) fclose(fopen(onp, "w"));
     // rome2fix.ini: read (self-update off, the fixes' missing keys default to on) and never overwritten by the mod
     char inip[MAX_PATH];
-    static const char ini_text[] = "[mod]\r\nself_update=no\r\ncrash_logging=Yes\r\n";  // words too (was: "Yes" read as 0 = off)
+    // words too (was: "Yes" read as 0 = off); culling's name in any case
+    static const char ini_text[] = "[mod]\r\nself_update=no\r\ncrash_logging=Yes\r\n[tuning]\r\nculling=Light\r\n";
     strcpy(inip, logp);
     strcpy(inip + (sl - logp) + 1, "rome2fix.ini");
     FILE *fi = fopen(inip, "wb");
     CHECK(fi);
     fputs(ini_text, fi);
     fclose(fi);
+    // the DLSS add-on installed but switched off, its settings.txt past 1 KB with addon=off at the end (the installed
+    // one has addon= at byte 1486; the old 1024-byte read missed it and started the add-on): only the overlay goes in
+    char fbd[MAX_PATH], fbp[MAX_PATH];
+    strcpy(fbd, logp);
+    strcpy(fbd + (sl - logp) + 1, "FrameBridge");
+    CreateDirectoryA(fbd, NULL);
+    snprintf(fbp, MAX_PATH, "%s\\helper64.exe", fbd);
+    fclose(fopen(fbp, "wb"));
+    snprintf(fbp, MAX_PATH, "%s\\settings.txt", fbd);
+    FILE *fs = fopen(fbp, "wb");
+    CHECK(fs);
+    for (int i = 0; i < 30; i++) fputs("# a comment line of the add-on's settings, fifty b\n", fs);
+    fputs("addon=off\n", fs);
+    fclose(fs);
 
     void *taken = VirtualAlloc((void *)0x10000000, 0x100000, MEM_RESERVE, PAGE_NOACCESS);
     CHECK(taken == (void *)0x10000000);
@@ -195,6 +210,13 @@ int main(int argc, char **argv) {
     CHECK(has("empire.retail.dll is loading now - installing the fixes"));
     CHECK(has("Rome 2 Engine Performance Fix v"));
     CHECK(has("self-update off (self_update=0 in rome2fix.ini)") && has("crash logging on") && !has("crash logging off"));
+    CHECK(has("switched off (addon=off in FrameBridge\\settings.txt)") && !has("DLSS add-on found:") && has("F8 panel without the DLSS add-on: set up"));
+    CHECK(has("main menu: \"Engine Fix "));   // the label found on this build
+    snprintf(fbp, MAX_PATH, "%s\\helper64.exe", fbd);
+    DeleteFileA(fbp);
+    snprintf(fbp, MAX_PATH, "%s\\settings.txt", fbd);
+    DeleteFileA(fbp);
+    RemoveDirectoryA(fbd);
     char inibuf[256] = {0};
     fi = fopen(inip, "rb");
     CHECK(fi);
@@ -206,6 +228,9 @@ int main(int argc, char **argv) {
     CHECK(has("x87 fix: 1196 of 1196") || has("x87 fix: 1213 of 1213"));  // 2026-09-17 build / pantheon beta
     CHECK(has("draw-list sort replaced") && has("render-list sort (+0x44/+0x40) replaced"));
     CHECK(has("string fix installed"));
+    CHECK(has("unit detail cull installed") && has("  Culling: light (optional;"));   // read from [tuning] culling=Light
+    CHECK(has("sound crash guard: a sound without a buffer"));
+    CHECK(has("soldier draw lists sorted on ") || has("(fewer than 8 logical processors)"));
     int uk = has("menu textures: the last");  // the menu-picture fix is in the profiling build only
     CHECK(!has("does not match") && !has("skipped") && !has("not installed"));
 
@@ -234,7 +259,7 @@ int main(int argc, char **argv) {
         CHECK(call[0] == 0xE8 && target(call) >= lo && target(call) < hi);
     } else
         CHECK(pin[0] != 0xE9 && call[0] == 0xE8 && !(target(call) >= lo && target(call) < hi));  // left as the game's
-    CHECK(has(uk ? "STATUS: all 7 fixes are on" : "STATUS: all 6 fixes are on"));
+    CHECK(has(uk ? "STATUS: all 9 fixes are on" : "STATUS: all 8 fixes are on"));
     printf("late install: game DLL relocated to %p, all fixes installed from the load notification (build %d)\n", (void *)game, found);
     CHECK(heap == has("game heap replaced"));
     CHECK(!heap || found == 0);  // the heap test (profiling build only) knows the first build only

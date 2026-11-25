@@ -102,11 +102,20 @@ int main(void) {
     make_(g_ws, 5, NULL, 1);
     CHECK(update_from(g_self, g_ws, 4, say) == 0);   // newer but cut short: left for the next start
     CHECK(g_logged == 1 && strstr(g_last, "not complete yet") && file_version(g_self) == 4);
+    CHECK(g_update_state == 0);                       // nothing for the pop-up yet
     g_logged = 0;
 
     make(g_ws, 5, NULL);
+    // held without delete sharing: it cannot be renamed, so the newer version is not installed (the pop-up says run install.bat)
+    HANDLE pinned = CreateFileW(g_self, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    CHECK(pinned != INVALID_HANDLE_VALUE);
+    CHECK(update_from(g_self, g_ws, 4, say) == 0 && g_update_state == 2 && file_version(g_self) == 4);
+    CloseHandle(pinned);
+    g_update_state = 0;
+    g_logged = 0;
     CHECK(update_from(g_self, g_ws, 4, say) == 1);   // newer: installed while the old file is in use
     CHECK(file_version(g_self) == 5 && exists(old_) && file_version(old_) == 4);
+    CHECK(g_update_state == 1);                       // the pop-up: a newer version is installed for the next start
     WIN32_FIND_DATAW fd;
     HANDLE fh = FindFirstFileW(g_self, &fd);
     CHECK(fh != INVALID_HANDLE_VALUE && wcscmp(fd.cFileName, L"dinput8.dll") == 0);  // saved lowercase

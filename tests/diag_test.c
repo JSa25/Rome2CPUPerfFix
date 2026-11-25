@@ -65,8 +65,40 @@ static void bad_headers(void) {
     printf("module header checks passed (no-access header, garbage e_lfanew)\n");
 }
 
-int main(void) {
+// A fault whose ESP is wild (committed but no-access, then a guard page, both outside this thread's stack): the stack
+// scan must not read there. The old scan faulted inside the handler (Attila audit 2026-11-20): the record was lost and
+// this process dies here. Run as "diag_test.exe wildesp".
+static int wild_esp(void) {
+    wcscpy(wcsrchr(g_path, L'\\') + 1, L"diag_wildesp.log");
+    DeleteFileW(g_path);
+    diag_startup(GetModuleHandleW(NULL), g_path, say);
+    g_dumped = 1;   // no minidump of a made-up context
+    BYTE *na = VirtualAlloc(NULL, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+    BYTE *gd = VirtualAlloc(NULL, 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD);
+    CHECK(na && gd);
+    BYTE *at[2] = {na + 256, gd + 256};
+    for (int i = 0; i < 2; i++) {
+        EXCEPTION_RECORD er = {EXCEPTION_ACCESS_VIOLATION, 0, NULL, (void *)fault, 2, {0, 0}};
+        CONTEXT cx = {0};
+        cx.Esp = (DWORD)(UINT_PTR)at[i];
+        EXCEPTION_POINTERS ep = {&er, &cx};
+        record(&ep, 0);
+    }
+    static char text[65536];
+    FILE *f = _wfopen(g_path, L"rb");
+    size_t n = fread(text, 1, sizeof text - 1, f);
+    fclose(f);
+    text[n] = 0;
+    char *r1 = strstr(text, "] EXCEPTION 1:"), *r2 = strstr(text, "] EXCEPTION 2:");
+    CHECK(r1 && r2 && strstr(r1, "  stack:\n") && strstr(r2, "  stack:\n"));
+    DeleteFileW(g_path);
+    printf("wild ESP (no-access, guard page): both records written, no stack read\n");
+    return 0;
+}
+
+int main(int argc, char **argv) {
     GetModuleFileNameW(NULL, g_path, MAX_PATH);
+    if (argc > 1 && !strcmp(argv[1], "wildesp")) return wild_esp();
     if (wcsstr(GetCommandLineW(), L"diag_mods.txt;") || wcsstr(GetCommandLineW(), L"diag mods.txt;")) {   // the children below: started like the launcher / a mod manager start the game
         wcscpy(wcsrchr(g_path, L'\\') + 1, L"diag_mods.log");
         diag_startup(GetModuleHandleW(NULL), g_path, say);

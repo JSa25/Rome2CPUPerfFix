@@ -6,6 +6,7 @@
 #pragma once
 #include <windows.h>
 #include <tlhelp32.h>
+#include <string.h>
 
 #define NBUILDS 3
 
@@ -29,6 +30,31 @@ static inline DWORD fnv1a(const void *p, size_t n) {
 static inline int in_image(const void *m, DWORD rva, DWORD n) {
     const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)((const char *)m + ((const IMAGE_DOS_HEADER *)m)->e_lfanew);
     return rva < nt->OptionalHeader.SizeOfImage && n <= nt->OptionalHeader.SizeOfImage - rva;
+}
+
+// FNV-1a of n bytes of game code as on disk (uikeep.c, soundguard.c): these functions hold absolute addresses, which the loader moves with the DLL
+// (it is never at its preferred base 0x10000000 in game). The relocation table says where they are.
+static inline DWORD fnv1a_unreloc(const unsigned char *b, DWORD rva, DWORD n) {
+    unsigned char buf[0x300];
+    if (n + 8 > sizeof buf || !in_image(b, rva - 4, n + 8)) return 0;
+    memcpy(buf, b + rva - 4, n + 8);  // 4 bytes either side: an address can straddle the start or end
+    DWORD delta = (DWORD)(UINT_PTR)b - 0x10000000u;
+    const IMAGE_NT_HEADERS32 *nt = (const IMAGE_NT_HEADERS32 *)(b + ((const IMAGE_DOS_HEADER *)b)->e_lfanew);
+    const IMAGE_DATA_DIRECTORY *dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    for (DWORD off = 0; delta && off + 8 <= dir->Size;) {
+        const IMAGE_BASE_RELOCATION *r = (const IMAGE_BASE_RELOCATION *)(b + dir->VirtualAddress + off);
+        if (r->SizeOfBlock < 8) break;
+        const WORD *e = (const WORD *)(r + 1);
+        for (DWORD i = 0; i < (r->SizeOfBlock - 8) / 2; i++) {
+            DWORD at = r->VirtualAddress + (e[i] & 0xFFF);
+            if (e[i] >> 12 == IMAGE_REL_BASED_HIGHLOW && at >= rva - 4 && at + 4 <= rva + n + 4)
+                *(DWORD *)(buf + at - (rva - 4)) -= delta;
+        }
+        off += r->SizeOfBlock;
+    }
+    DWORD h = 0x811C9DC5u;
+    for (DWORD i = 4; i < n + 4; i++) h = (h ^ buf[i]) * 0x01000193u;
+    return h;
 }
 
 // 1 if the thread was started inside the game's own code (the game module or the exe): only those run the game's code.

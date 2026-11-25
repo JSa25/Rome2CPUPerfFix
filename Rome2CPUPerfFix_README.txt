@@ -40,6 +40,21 @@ Frame rate:
 - Render-list sorts: two sorts of the draw lists are about 11 times faster,
   with the same order. This is about 2% of the main thread in big battles.
 
+Battles (new in 2.2, from the Attila Engine Performance Fix):
+- Unit cards: the battle's unit card panel is no longer built and drawn every
+  frame. It is drawn into a picture a few times a second and whenever you press
+  a key or click, and that picture is shown in between, so the cards look the
+  same while the main thread does less.
+- Soldier draw lists: the soldiers' per-pass draw lists are sorted on four
+  threads instead of one, with the same order.
+- Culling: small parts of far-away soldiers (belts, quivers, gauntlets,
+  bridles) are not drawn once they would be only a few pixels tall. Helmets,
+  heads and anything with real bulk are always kept. It is on Light by default;
+  F8 > Culling picks Off, Light, Normal or Strong (see "Turning single fixes
+  off").
+- Sound: in very big battles the game's sound memory can run full; a sound that
+  then gets no buffer is skipped for a moment instead of crashing the game.
+
 Loading (new in 1.1):
 - Loose-file checks: before using a file from the .pack files, the game checks
   every mod folder for a loose copy that would override it. With a big mod list
@@ -125,8 +140,9 @@ Turning single fixes off
 ------------------------
 Since 1.5 the mod writes rome2fix.ini into the game folder at the first start.
 Set a line to 0 to switch that part off (useful if you suspect one of them),
-then restart the game; 1 switches it back on. The mod never changes the file
-after writing it; delete it to get the defaults back.
+then restart the game; 1 switches it back on. After writing it, the mod only
+ever changes the culling= line (when you pick it in F8); delete the file to
+get the defaults back.
 
   [fixes]
   tile_feedback_scan   tile streaming scan
@@ -135,13 +151,19 @@ after writing it; delete it to get the defaults back.
   file_reading         save and .pack file reading (loading)
   string_functions     string comparisons (loading)
   missing_file_cache   loose-file check cache (loading)
+  sound_crash_guard    sound crash guard (2.2)
+  battle_ui_cache      unit cards shown from a cache (2.2)
+  parallel_sort        soldier draw lists sorted on four threads (2.2)
   [mod]
   self_update          copy a newer version from the Steam Workshop at startup
   crash_logging        record crashes in rome2fix.log (and a crash_*.dmp file)
   plugins              load other mods' DLLs from the plugins folder (2.1)
+  [tuning]
+  culling              off, light (the default), normal or strong (2.2)
 
 The older way still works too: an empty tilescan_off.txt, x87fix_off.txt,
-sortfix_off.txt, attrcache_off.txt, fileio_off.txt or strfix_off.txt in the
+sortfix_off.txt, attrcache_off.txt, fileio_off.txt, strfix_off.txt,
+soundguard_off.txt, uicache_off.txt, parsort_off.txt or partcull_off.txt in the
 game folder switches that fix off. The STATUS lines in rome2fix.log show which
 fixes are on.
 
@@ -182,11 +204,23 @@ For modders (new in 2.1)
   and a summary when you delete fps_on.txt.
 
 
+The F8 panel (new in 2.2)
+-------------------------
+F8 opens a small panel in game, also without the DLSS add-on: Culling, and
+What's new (everything in this version). The first start of a new version
+shows a short What's new card at the top of the screen, and a card says when
+Steam has a newer version of the mod (restart the game to use it). With the
+add-on, F8 is its settings panel, with Culling and What's new buttons at the
+top. The main menu shows this mod's version in the top right.
+
+
 Compatibility and notes
 -----------------------
 - Needs a CPU with SSE4.1 (any CPU from roughly 2008 onward). Without it, the
   x87 fix only replaces the conversions that don't need it.
 - NOT compatible with other dinput8.dll mods. Only one dinput8.dll can be loaded.
+  Since 2.2 a second copy of this mod in the same game (for example one under
+  another name in the plugins folder) stays out and says so in rome2fix.log.
 - Works with pack mods (tested with Divide et Impera and a large mod list) and
   UI mods.
 - Does not show up in the launcher's mod list (see the note at the top).
@@ -250,6 +284,29 @@ is published for review at github.com/JSa25/Rome2CPUPerfFix.
 
 Changelog
 ---------
+Version 2.2:
+           - battles: the unit card panel is drawn from a cache, and the
+           soldiers' draw lists are sorted on four threads (both ported
+           from the Attila Engine Performance Fix).
+           - Culling, on Light by default: small parts of far-away
+           soldiers are not drawn (F8 > Culling, or culling= in
+           rome2fix.ini).
+           - huge battles: a sound the full sound memory gives no buffer
+           is skipped instead of crashing the game.
+           - F8 panel without the DLSS add-on too (Culling, What's new),
+           What's new and "newer version" cards, the mod's version on the
+           main menu.
+           - addon=off in FrameBridge\settings.txt really turns the DLSS
+           add-on off (the line sat past the part of the file that was
+           read, so the add-on started anyway).
+           - with the add-on: the F8 panel stays under the mouse after a
+           resolution change, its cards close by themselves after 20 s,
+           and with NVIDIA DLSS the add-on skips work only AMD FSR uses.
+           - only one copy of the mod runs in a game; the crash logger no
+           longer loses a record when the crashed thread's stack is
+           broken; lua_ext.log keeps earlier lines.
+           SHA-256 of dinput8.dll:
+           b26454e599a4862cf8b4f666c205338a1970253b26340512b6b06ffeac2b0366
 Version 2.1:
            - with the DLSS add-on (version 7): the settings panel opens
            with F8 (was F11, which other mods use); panel_key= in

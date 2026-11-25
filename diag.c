@@ -315,8 +315,14 @@ static LONG record(EXCEPTION_POINTERS *e, int last_chance) {
         NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
         DWORD *sp = (DWORD *)(UINT_PTR)c->Esp, *top = (DWORD *)tib->StackBase;
         MEMORY_BASIC_INFORMATION sm;   // ESP outside the TIB's stack (game workers on their own stacks): the committed region's end
-        if ((sp >= top || sp < (DWORD *)tib->StackLimit) && VirtualQuery(sp, &sm, sizeof sm) && sm.State == MEM_COMMIT)
-            top = (DWORD *)((BYTE *)sm.BaseAddress + sm.RegionSize);
+        if (sp >= top || sp < (DWORD *)tib->StackLimit) {
+            // readable memory at ESP, or no scan: with ESP wild (not committed, or a guard page) the scan itself faulted
+            // inside this handler, the record was lost and so was every later one (Attila audit 2026-11-20)
+            if (VirtualQuery(sp, &sm, sizeof sm) && sm.State == MEM_COMMIT && !(sm.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+                top = (DWORD *)((BYTE *)sm.BaseAddress + sm.RegionSize);
+            else
+                top = sp;
+        }
         int found = 0;
         DWORD last = 0;
         p = put(p, end, "  stack:");

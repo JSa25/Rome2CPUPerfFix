@@ -71,6 +71,60 @@ void fgp_set_fg(int fg) { p_fg = fg; p_dirty = 1; }   // after an F11 switch: wh
 static int p_tsr, p_tfg;   // the picked upscaler / frame generation (rows 9 / 10): 0 NVIDIA DLSS, 1 AMD FSR; from the next start
 void fgp_set_tech(int sr, int fg) { p_tsr = sr; p_tfg = fg; p_dirty = 1; }
 static int p_drop = -1;   // the open drop-down list (its row), -1 none
+// What's new in this version (Attila AGENT_LOG 227): its own page (the header button), the first lines in a pop-up on
+// the first start of a new version. Edit the lines for each release.
+#include "version.h"
+#define WN_POPUP 3   // lines of it in the pop-up
+static const wchar_t *const WHATS_NEW[] = {
+    L"Better performance in big battles: the unit cards are drawn from a cache, soldier lists sorted on several threads.",
+    L"Culling (F8): small parts of far-away soldiers are left out for more fps (Light; change it in F8).",
+    L"F8 works without the DLSS add-on too; the main menu shows the mod's version.",
+    L"A huge battle's sound no longer crashes the game when the sound memory is full.",
+    L"addon=off in FrameBridge\\settings.txt now really turns the DLSS add-on off.",
+    L"The F8 panel stays in place when you change resolution; pop-ups close by themselves.",
+    L"A pop-up says when Steam has a newer version of the mod.",
+    L"Only one copy of the mod runs at a time.",
+};
+#define WN_N (int)(sizeof WHATS_NEW / sizeof WHATS_NEW[0])
+static int p_page;        // 0 the upscaling page, 1 Culling, 2 What's new (Attila's numbers)
+static int p_back;        // the page What's new's Back returns to
+// Culling (partcull.c, Attila AGENT_LOG 227): its own page, reached by the header button on the upscaling page; without
+// the add-on (overlay.c) F8 opens it directly and the upscaling page does not exist. 0 off, 1 light, 2 normal, 3 strong
+// -> the part threshold in 4K pixels below. The counts and the pick go through pointers proxy.c sets
+// (fgp_set_cull_source), so the panel links without the culling code (its tests).
+static int p_cull, p_cull_ok, p_cullonly;
+static const wchar_t *const cull_names[4] = {L"Off", L"Light", L"Normal", L"Strong"};
+const float g_fgp_cull_px[4] = {0, 16, 22, 28};
+static void (*p_cull_counts)(unsigned *parts, unsigned *skipped, unsigned *forced);
+static void (*p_cull_apply)(int choice);
+void fgp_set_cull(int choice) { p_cull = choice >= 0 && choice < 4 ? choice : 0; p_dirty = 1; }
+void fgp_set_cull_available(int ok) { p_cull_ok = ok; p_dirty = 1; }
+void fgp_set_cull_only(void) { p_cullonly = 1; p_page = 1; p_dirty = 1; }   // no upscaling add-on: F8 is Culling
+void fgp_set_cull_source(void (*counts)(unsigned *, unsigned *, unsigned *), void (*apply)(int)) { p_cull_counts = counts; p_cull_apply = apply; }
+// what the cull is doing right now, not since the game started (that average barely moves when a setting changes)
+static int cull_share(float *pct, float *forced_pct) {
+    static unsigned lp, ls, lf;
+    static DWORD lt;
+    static float last = -1, last_f;
+    unsigned p = 0, sk = 0, f = 0;
+    if (p_cull_counts) p_cull_counts(&p, &sk, &f);
+    DWORD now = GetTickCount();
+    if (!lt || now - lt >= 500) {
+        if (lt && p > lp) {
+            last = 100.0f * (sk - ls) / (p - lp);
+            last_f = 100.0f * (f - lf) / (p - lp);
+        }
+        lp = p; ls = sk; lf = f; lt = now;
+    }
+    *pct = last < 0 ? 0 : last;
+    *forced_pct = last_f;
+    return last >= 0;
+}
+static int p_update;      // update.c's g_update_state: 1 a newer version installed for the next start, 2 one not installed
+// Pop-ups waiting (bits): 1 a note (fgp_set_note), 2 a newer version (fgp_set_update), 4 What's new after an update
+static int t_queue, t_kind;
+void fgp_set_update(int state) { p_update = state; if (state) t_queue |= 2; p_dirty = 1; }
+void fgp_show_whatsnew(void) { t_queue |= 4; }
 void fgb_gpu_caps(int *dlss_sr, int *dlss_fg);   // fgbridge.c
 const wchar_t *fgb_gpu_name(void);
 static unsigned p_hz;   // the refresh rate of the game's screen (read once, fgp_frame)
@@ -285,7 +339,9 @@ static Rec recommended(void) {
 }
 static void redraw(void) {
     float u = p_u;
-    float cy1 = p_cy1_full - (SR_AMD ? 58 * u : 0);   // the DLSS preset row is not shown while AMD FSR upscales
+    // the DLSS preset row is not shown while AMD FSR upscales; What's new is short: the card shrinks to it
+    float cy1 = p_page == 1 ? p_cy0 + 268 * u : p_page == 2 ? p_cy0 + (150 + WN_N * 26 + (p_update ? 30 : 0)) * u
+                                                            : p_cy1_full - (SR_AMD ? 58 * u : 0);
     if (cy1 != p_cy1) { p_cy1 = cy1; make_mask(); }
     // the panel: vertical gradient (the shadow area outside it is cut by the alpha below)
     for (int y = 0; y < p_h; y++) {
@@ -301,9 +357,19 @@ static void redraw(void) {
     p_nbtn = 0;
     float x0 = p_cx0 + 26 * u, x1 = p_cx1 - 26 * u, y = p_cy0 + 16 * u;
     // heading, and how to close it
-    text(SR_AMD ? L"AMD FSR" : FG_AMD ? L"DLSS + AMD FSR" : L"DLSS", p_title, C_TEXT, (int)x0, (int)y, (int)(x0 + (FG_AMD ? 300 : 200) * u), (int)(y + 36 * u), DT_LEFT);
+    text(p_page == 1 ? L"Culling" : p_page == 2 ? L"What's new" : SR_AMD ? L"AMD FSR" : FG_AMD ? L"DLSS + AMD FSR" : L"DLSS", p_title, C_TEXT, (int)x0, (int)y,
+         (int)(x0 + (FG_AMD ? 300 : 200) * u), (int)(y + 36 * u), DT_LEFT);
     text(p_keyhint, p_tiny, C_DIM, (int)(x1 - 98 * u), (int)y, (int)x1, (int)(y + 36 * u), DT_RIGHT);
-    {   // Defaults: everything back to the recommendation below (the frame-rate counter stays as it is)
+    // header buttons, right to left before Defaults: What's new (row 24), Culling (row 22, upscaling page only)
+    for (int k = 0; k < 2 && p_page < 2; k++) {
+        if (k == 1 && p_page) break;
+        float bx1 = x1 - (210 + 110 * k) * u, bx0 = bx1 - 100 * u, by0 = y + 5 * u, by1 = y + 31 * u;
+        int hot = p_nbtn == p_hover;
+        fill_rr(bx0, by0, bx1, by1, 3 * u, hot ? C_HOVER : C_TRACK, 1);
+        text(k ? L"Culling" : L"What's new", p_small, hot ? C_TEXT : C_DIM, (int)bx0, (int)by0, (int)bx1, (int)by1, DT_CENTER);
+        add_btn(bx0, by0, bx1, by1, k ? 22 : 24, 0, 1);
+    }
+    if (p_page < 2) {   // Defaults: everything back to the recommendation below (the frame-rate counter stays as it is)
         float bx0 = x1 - 200 * u, bx1 = x1 - 100 * u, by0 = y + 5 * u, by1 = y + 31 * u;
         int hot = p_nbtn == p_hover;
         fill_rr(bx0, by0, bx1, by1, 3 * u, hot ? C_HOVER : C_TRACK, 1);
@@ -313,6 +379,62 @@ static void redraw(void) {
     y += 44 * u;
     fill_rr(x0, y, x1, y + 1 * u, 0, C_RULE, 1);
     y += 18 * u;
+    if (p_page == 2) {   // ---- What's new ----
+        wchar_t c[160];
+        if (p_update) {
+            text(p_update == 1 ? L"A newer version is installed: you can keep playing, restart the game to use it."
+                               : L"Steam has a newer version that could not be installed: run install.bat in its Workshop folder.",
+                 p_small, C_BRONZE, (int)x0, (int)y, (int)x1, (int)(y + 22 * u), DT_LEFT | DT_END_ELLIPSIS);
+            y += 30 * u;
+        }
+        _snwprintf(c, 160, L"Rome 2 Engine Performance Fix %hs", MOD_VERSION_STR);
+        text(c, p_label, C_TEXT, (int)x0, (int)y, (int)x1, (int)(y + 24 * u), DT_LEFT);
+        y += 32 * u;
+        for (int i = 0; i < WN_N; i++, y += 26 * u) {
+            text(L"\x2022", p_small, C_BRONZE, (int)x0, (int)y, (int)(x0 + 14 * u), (int)(y + 22 * u), DT_LEFT);
+            text(WHATS_NEW[i], p_tiny, C_TEXT, (int)(x0 + 16 * u), (int)y, (int)x1, (int)(y + 22 * u), DT_LEFT | DT_END_ELLIPSIS);
+        }
+        y += 10 * u;
+        float bx0 = x0, bx1 = x0 + 120 * u, by0 = y, by1 = y + 28 * u;   // Back (row 23) to the upscaling page
+        int hot = p_nbtn == p_hover;
+        fill_rr(bx0, by0, bx1, by1, 3 * u, hot ? C_HOVER : C_TRACK, 1);
+        text(L"Back", p_small, hot ? C_TEXT : C_DIM, (int)bx0, (int)by0, (int)bx1, (int)by1, DT_CENTER);
+        add_btn(bx0, by0, bx1, by1, 23, 0, 1);
+        goto composite;
+    }
+    if (p_page == 1) {   // ---- Culling ----
+        float lab = x0 + 196 * u, rh = 38 * u, share = 0, forced = 0;
+        int have_share = p_cull_ok && cull_share(&share, &forced);
+        text(L"Culling", p_label, C_TEXT, (int)x0, (int)(y - 3 * u), (int)lab, (int)(y + rh * 0.55f), DT_LEFT);
+        wchar_t c[96];
+        if (!p_cull_ok) wcscpy(c, L"Not available on this game version");
+        else if (!p_cull) wcscpy(c, L"Every part of every soldier is drawn");
+        else _snwprintf(c, 96, L"Parts under %.0f px tall are not drawn", (double)g_fgp_cull_px[p_cull]);
+        text(c, p_tiny, C_DIM, (int)x0, (int)(y + rh * 0.5f), (int)(lab - 10 * u), (int)(y + rh + 3 * u), DT_LEFT | DT_END_ELLIPSIS);
+        choices(21, lab, y, x1, y + rh, cull_names, 4, p_cull, p_cull_ok ? 4 : 0);
+        y += rh + 14 * u;
+        text(L"Small pieces of a distant soldier - belts, quivers, gauntlets, bridles - cost as much to draw as the"
+             L" soldier himself. This leaves them out once they are only a few pixels across.",
+             p_tiny, C_DIM, (int)x0, (int)y, (int)x1, (int)(y + 20 * u), DT_LEFT | DT_END_ELLIPSIS);
+        y += 22 * u;
+        text(L"Helmets, heads and anything with real bulk are kept at every distance.",
+             p_tiny, C_DIM, (int)x0, (int)y, (int)x1, (int)(y + 20 * u), DT_LEFT | DT_END_ELLIPSIS);
+        y += 26 * u;
+        if (have_share) {
+            _snwprintf(c, 96, L"Skipping %.0f %% of soldier parts right now; %.0f %% placed by the engine, left alone",
+                       (double)share, (double)forced);
+            text(c, p_tiny, C_BRONZE, (int)x0, (int)y, (int)x1, (int)(y + 18 * u), DT_LEFT);
+        }
+        y += 26 * u;
+        if (!p_cullonly) {   // back to the upscaling page (none without the add-on)
+            float bx0 = x0, bx1 = x0 + 120 * u, by0 = y, by1 = y + 28 * u;
+            int hot = p_nbtn == p_hover;
+            fill_rr(bx0, by0, bx1, by1, 3 * u, hot ? C_HOVER : C_TRACK, 1);
+            text(L"Back", p_small, hot ? C_TEXT : C_DIM, (int)bx0, (int)by0, (int)bx1, (int)by1, DT_CENTER);
+            add_btn(bx0, by0, bx1, by1, 23, 0, 1);
+        }
+        goto composite;
+    }
     // the settings: name and what it does now on the left, the choices on the right
     wchar_t cap[12][64];
     _snwprintf(cap[0], 64, SR_AMD ? L"AMD FSR, render %u \x00d7 %u" : L"Render %u \x00d7 %u", fgb_render_w(), fgb_render_h());
@@ -417,6 +539,7 @@ static void redraw(void) {
     if (fgmax && !p_note && !FG_AMD) text(L"Frame generation needs the game window in focus", p_tiny, C_DIM, (int)(x0 + 300 * u), (int)y, (int)x1, (int)(y + 26 * u),
          DT_RIGHT | DT_END_ELLIPSIS);
     drop_list();   // over the rows below it
+composite:
     GdiFlush();
     // the colours through the fixed mask: premultiplied by the card's alpha, the edge highlight, the shadow's alpha
     for (size_t i = 0, n = (size_t)p_w * p_h; i < n; i++) {
@@ -524,8 +647,57 @@ static void counter_redraw(void) {
     ID3D11DeviceContext_UpdateSubresource(p_ctx, (ID3D11Resource *)c_tex, 0, NULL, c_rgba, c_w * 4, 0);
 }
 
-// ---- the pop-up (top middle, Attila AGENT_LOG 203): a new note (fgp_set_note: the add-on did not start, DLSS turned off)
-// shown by itself for 30 s in front, so a player sees what broke without opening the panel; it goes when the panel opens ----
+// ---- the main menu label (top right): menuver.c says when the menus are up (Attila 7.4: the game's own text box was
+// too narrow and its font too soft at 4K, so it is drawn here).
+// shortcut: a copy of the counter's text strip; fold the two into one helper if a third text strip is added.
+#define LABEL_Y (int)(46 * p_u)   // Attila's: below its two version lines at 4K; Rome 2's spot not checked in game
+int (*g_fgp_menu_label)(void);   // menuver.c: 1 while the game's front end (its menus) is up
+static HDC l_dc;
+static HBITMAP l_bmp;
+static unsigned char *l_bits, *l_rgba;
+static ID3D11Texture2D *l_tex;
+static ID3D11ShaderResourceView *l_srv;
+static int l_w, l_h, l_bad;
+static void label_redraw(void) {
+    if (!l_dc) {
+        l_w = (int)(220 * p_u); l_h = (int)(40 * p_u);   // two lines: the version, the author
+        BITMAPINFO bi = {{sizeof(BITMAPINFOHEADER), l_w, -l_h, 1, 32, BI_RGB, 0, 0, 0, 0, 0}, {{0, 0, 0, 0}}};
+        l_dc = CreateCompatibleDC(NULL);
+        l_bmp = l_dc ? CreateDIBSection(l_dc, &bi, DIB_RGB_COLORS, (void **)&l_bits, NULL, 0) : NULL;
+        l_rgba = malloc((size_t)l_w * l_h * 4);
+        if (!l_bmp || !l_rgba) { l_bad = 1; return; }
+        SelectObject(l_dc, l_bmp);
+        SelectObject(l_dc, CreateFontW(-(int)(13 * p_u), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI"));
+        SetBkMode(l_dc, TRANSPARENT);
+        SetTextColor(l_dc, RGB(255, 255, 255));
+        RECT r = {0, 0, l_w - (int)(2 * p_u), l_h / 2}, r2 = {0, l_h / 2, l_w - (int)(2 * p_u), l_h};
+        DrawTextW(l_dc, L"Engine Fix " MOD_VERSION_STR, -1, &r, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        DrawTextW(l_dc, L"by JGdaCaesar", -1, &r2, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        GdiFlush();
+        for (int i = 0; i < l_w * l_h; i++) {   // white text with a soft dark outline, premultiplied (as the counter)
+            int x = i % l_w, y = i / l_w;
+            float t = l_bits[i * 4 + 1] / 255.0f, ol = 0;
+            for (int dy = -2; dy <= 2; dy++)
+                for (int dx = -2; dx <= 2; dx++) {
+                    int xx = x + dx, yy = y + dy;
+                    if (xx >= 0 && yy >= 0 && xx < l_w && yy < l_h) { float v = l_bits[((size_t)yy * l_w + xx) * 4 + 1] / 255.0f; if (v > ol) ol = v; }
+                }
+            float a = t > ol * 0.8f ? t : ol * 0.8f;
+            l_rgba[i * 4] = l_rgba[i * 4 + 1] = l_rgba[i * 4 + 2] = (unsigned char)(t * 230 + 0.5f);   // a little under white, as the game's text
+            l_rgba[i * 4 + 3] = (unsigned char)(a * 255 + 0.5f);
+        }
+    }
+    if (!l_tex) {   // on the panel's device (made again after fgp_move_device)
+        D3D11_TEXTURE2D_DESC td = {(UINT)l_w, (UINT)l_h, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+        D3D11_SUBRESOURCE_DATA sd = {l_rgba, (UINT)l_w * 4, 0};
+        if (FAILED(ID3D11Device_CreateTexture2D(p_dev, &td, &sd, &l_tex)) ||
+            FAILED(ID3D11Device_CreateShaderResourceView(p_dev, (ID3D11Resource *)l_tex, NULL, &l_srv))) l_bad = 1;
+    }
+}
+
+// ---- the pop-up (top middle, Attila AGENT_LOG 203 / 227), one at a time, 20 s each, all of them gone once the panel
+// opens: a newer version (fgp_set_update), What's new after an update (fgp_show_whatsnew), a note (fgp_set_note: the
+// add-on did not start, DLSS turned off) ----
 static HDC t_dc;
 static HBITMAP t_bmp;
 static unsigned char *t_bits, *t_rgba;
@@ -533,9 +705,38 @@ static ID3D11Texture2D *t_tex;
 static ID3D11ShaderResourceView *t_srv;
 static int t_w, t_h, t_show;   // t_show: 1 waiting for its first frame, 2 on screen
 static ULONGLONG t_end;
+static void toast_free(void) {   // its height changes with what it says
+    if (t_srv) { ID3D11ShaderResourceView_Release(t_srv); t_srv = NULL; }
+    if (t_tex) { ID3D11Texture2D_Release(t_tex); t_tex = NULL; }
+    if (t_dc) { DeleteDC(t_dc); t_dc = NULL; }
+    if (t_bmp) { DeleteObject(t_bmp); t_bmp = NULL; }
+    free(t_rgba); t_rgba = NULL;
+}
 static void toast_redraw(void) {
-    if (!t_dc) {
-        t_w = (int)(760 * p_u); t_h = (int)(62 * p_u);
+    // its lines: a heading, the body (up to WN_POPUP lines), the key hint
+    const wchar_t *body[WN_POPUP];
+    int nb = 0;
+    wchar_t head[200], hint[96];
+    if (t_kind == 2) {
+        wcscpy(head, p_update == 1 ? L"Outdated version: a newer Rome 2 Engine Performance Fix is installed"
+                                   : L"Outdated version: Steam has a newer Rome 2 Engine Performance Fix");
+        body[nb++] = p_update == 1 ? L"You can keep playing with no issues. Restart the game to apply the update."
+                                   : L"It could not be installed by itself: close the game and run install.bat in the mod's Workshop folder.";
+        _snwprintf(hint, 96, L"%ls opens the panel", p_keyname);
+    } else if (t_kind == 4) {
+        _snwprintf(head, 200, L"Rome 2 Engine Performance Fix %hs - What's new", MOD_VERSION_STR);
+        for (int i = 0; i < WN_N && nb < WN_POPUP; i++) body[nb++] = WHATS_NEW[i];
+        _snwprintf(hint, 96, L"%ls, then What's new: everything in this version", p_keyname);
+    } else {   // the note, without "Choices made here are saved", which is about the panel
+        _snwprintf(head, 200, L"%ls", p_note ? p_note : L"");
+        wchar_t *cut = wcsstr(head, L" Choices made here");
+        if (cut) *cut = 0;
+        _snwprintf(hint, 96, L"%ls opens the upscaling panel", p_keyname);
+    }
+    int h = (int)((10 + 26 + nb * 21 + 24 + 8) * p_u);
+    if (!t_dc || h != t_h) {
+        toast_free();
+        t_w = (int)(760 * p_u); t_h = h;
         BITMAPINFO bi = {{sizeof(BITMAPINFOHEADER), t_w, -t_h, 1, 32, BI_RGB, 0, 0, 0, 0, 0}, {{0, 0, 0, 0}}};
         t_dc = CreateCompatibleDC(NULL);
         t_bmp = t_dc ? CreateDIBSection(t_dc, &bi, DIB_RGB_COLORS, (void **)&t_bits, NULL, 0) : NULL;
@@ -548,27 +749,28 @@ static void toast_redraw(void) {
         if (FAILED(ID3D11Device_CreateTexture2D(p_dev, &td, NULL, &t_tex)) ||
             FAILED(ID3D11Device_CreateShaderResourceView(p_dev, (ID3D11Resource *)t_tex, NULL, &t_srv))) { t_show = 0; return; }
     }
-    // the card: dark, a bronze edge on the left; the note (without "Choices made here are saved", which is about the panel)
-    // and under it which key opens the panel
-    int u2 = (int)(2 * p_u + 0.5f), x0 = (int)(18 * p_u);
+    // the card: dark, a bronze edge on the left
+    int x0 = (int)(18 * p_u), y = (int)(10 * p_u);
     RECT all = {0, 0, t_w, t_h}, edge = {0, 0, (int)(4 * p_u + 0.5f), t_h};
     HBRUSH bg = CreateSolidBrush(RGB(24, 22, 20)), br = CreateSolidBrush(RGB(C_BRONZE >> 16 & 255, C_BRONZE >> 8 & 255, C_BRONZE & 255));
     FillRect(t_dc, &all, bg);
     FillRect(t_dc, &edge, br);
     DeleteObject(bg); DeleteObject(br);
-    wchar_t note[160], hint[64];
-    _snwprintf(note, 160, L"%ls", p_note ? p_note : L"");
-    wchar_t *cut = wcsstr(note, L" Choices made here");
-    if (cut) *cut = 0;
-    _snwprintf(hint, 64, L"%ls opens the upscaling panel", p_keyname);
     SetBkMode(t_dc, TRANSPARENT);
-    RECT r1 = {x0, u2 * 4, t_w - x0, t_h / 2 + u2}, r2 = {x0, t_h / 2 + u2, t_w - x0, t_h - u2 * 4};
+    const UINT fl = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS;
+    RECT r = {x0, y, t_w - x0, y + (int)(26 * p_u)};
     SelectObject(t_dc, p_small);
     SetTextColor(t_dc, RGB(C_TEXT >> 16 & 255, C_TEXT >> 8 & 255, C_TEXT & 255));
-    DrawTextW(t_dc, note, -1, &r1, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    DrawTextW(t_dc, head, -1, &r, fl);
     SelectObject(t_dc, p_tiny);
+    SetTextColor(t_dc, RGB(C_DIM >> 16 & 255, C_DIM >> 8 & 255, C_DIM & 255));
+    for (int i = 0; i < nb; i++) {
+        r.top = r.bottom; r.bottom = r.top + (int)(21 * p_u);
+        DrawTextW(t_dc, body[i], -1, &r, fl);
+    }
+    r.top = r.bottom; r.bottom = r.top + (int)(24 * p_u);
     SetTextColor(t_dc, RGB(C_BRONZE >> 16 & 255, C_BRONZE >> 8 & 255, C_BRONZE & 255));
-    DrawTextW(t_dc, hint, -1, &r2, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    DrawTextW(t_dc, hint, -1, &r, fl);
     GdiFlush();
     // BGRA to RGBA, the whole card slightly see-through (premultiplied, as the panel)
     for (size_t i = 0, n = (size_t)t_w * t_h; i < n; i++) {
@@ -695,7 +897,7 @@ static void make_mask(void) {
 }
 
 void fgp_set_note(const wchar_t *note) {
-    if (note && note != p_note) t_show = 1;   // something new broke: the pop-up says so
+    if (note && note != p_note) t_queue |= 1;   // something new broke: the pop-up says so
     p_note = note; p_dirty = t_dirty = 1;
 }
 
@@ -706,6 +908,7 @@ int fgp_move_device(ID3D11Device *dev, ID3D11DeviceContext *ctx, UINT bw, UINT b
     if (!p_dc) return 0;   // never set up
 #define DROP(x) if (x) { (x)->lpVtbl->Release(x); (x) = NULL; }
     DROP(p_rtv); DROP(p_srv); DROP(p_tex); DROP(p_vs); DROP(p_ps); DROP(p_blend); DROP(p_rs); DROP(p_dss);
+    DROP(l_srv); DROP(l_tex);   // the main menu label's (label_redraw makes them on the new device)
     DROP(c_srv); DROP(c_tex);   // the FPS counter's too: counter_redraw makes them on the new device (Attila's ultrareview)
     DROP(t_srv); DROP(t_tex);   // and the pop-up's
 #undef DROP
@@ -744,6 +947,13 @@ static void fgp_defaults(void) {
 // each Present (main thread), before the frame is handed to the helper: input, then the panel over the back buffer
 void fgp_frame(ID3D11Resource *backbuffer, HWND hwnd) {
     if (!p_ok) return;
+    {   // The back buffer's size as it is now. It was only taken when the device changed, so after a resolution change
+        // on the same device the mouse was scaled by old / new and clicks landed beside the cursor (Attila audit
+        // 2026-11-20); the FPS counter and the pop-up were placed for the old size too.
+        D3D11_TEXTURE2D_DESC bd;
+        ID3D11Texture2D_GetDesc((ID3D11Texture2D *)backbuffer, &bd);
+        if (bd.Width && bd.Height && (bd.Width != p_bw || bd.Height != p_bh)) { p_bw = bd.Width; p_bh = bd.Height; }
+    }
     static int hz_read;
     if (!hz_read) {   // the screen's refresh rate, for the recommendation
         hz_read = 1;
@@ -781,7 +991,14 @@ void fgp_frame(ID3D11Resource *backbuffer, HWND hwnd) {
                 p_drop = -1;
             }
             if (b->row == 8 && b->value != p_fpson) { p_fpson = b->value; p_cdirty = 1; if (p_apply.fps) p_apply.fps(p_fpson); }   // a corner, or off
-            if (b->row == 20) fgp_defaults();
+            if (b->row == 20) {
+                if (!p_page) fgp_defaults();
+                else if (p_page == 1 && p_cull != 1) { p_cull = 1; if (p_cull_apply) p_cull_apply(p_cull); }   // Light, the default
+            }
+            if (b->row == 22) { p_page = 1; p_drop = -1; }
+            if (b->row == 24) { p_back = p_page; p_page = 2; p_drop = -1; }   // What's new, and Back from it or Culling
+            if (b->row == 23) { p_page = p_page == 2 ? p_back : 0; p_drop = -1; }
+            if (b->row == 21 && b->value != p_cull) { p_cull = b->value; if (p_cull_apply) p_cull_apply(p_cull); }
             if (b->row == 0 && b->value != p_sr) { p_sr = b->value; if (p_apply.sr) p_apply.sr(p_sr); }
             if (b->row == 1 && b->value != p_fg) { p_fg = b->value; if (p_apply.fg) p_apply.fg(p_fg); }
             if (b->row == 2 && 1 - b->value != p_motion) { p_motion = 1 - b->value; if (p_apply.motion) p_apply.motion(p_motion); }
@@ -802,12 +1019,21 @@ void fgp_frame(ID3D11Resource *backbuffer, HWND hwnd) {
         int left = p_fpson == 1 || p_fpson == 3, top = p_fpson <= 2, mg = (int)(12 * p_u);
         if (c_srv) blend_panel(backbuffer, c_srv, left ? mg : (int)p_bw - c_w - mg, top ? mg : (int)p_bh - c_h - mg, c_w, c_h);
     }
-    if (t_show) {   // the pop-up, until the panel opens or its 30 s are up
-        static ULONGLONG t_last;
+    if (g_fgp_menu_label && !l_bad && g_fgp_menu_label()) {   // top right, under the game's version text
+        if (!l_srv) label_redraw();
+        int ly = p_fpson == 2 && p_shown_fps > 0 ? LABEL_Y + c_h + (int)(2 * p_u) : LABEL_Y;   // under a top-right FPS counter too
+        if (l_srv) blend_panel(backbuffer, l_srv, (int)p_bw - l_w - (int)(10 * p_u), ly, l_w, l_h);
+    }
+    if (p_open) t_queue = 0;   // the panel says all of it
+    if (!t_show && t_queue) {   // the next pop-up: a newer version first, then What's new, then a note
+        t_kind = t_queue & 2 ? 2 : t_queue & 4 ? 4 : 1;
+        t_queue &= ~t_kind;
+        t_show = t_dirty = 1;
+    }
+    if (t_show) {   // the pop-up, until the panel opens or its 20 s are up (wall clock: counting only while the game
+                    // window was in front kept Attila's up for good on the user's PC, Attila AGENT_LOG 227; all of it is in F8 too)
         ULONGLONG now = GetTickCount64();
-        if (t_show == 1) { t_show = 2; t_end = now + 30000; }
-        else if (!focus) t_end += now - t_last;   // counts only while the game is in front
-        t_last = now;
+        if (t_show == 1) { t_show = 2; t_end = now + 20000; }
         if (p_open || now >= t_end) t_show = 0;
         else {
             if (t_dirty || !t_tex) { toast_redraw(); t_dirty = 0; }

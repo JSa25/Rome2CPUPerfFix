@@ -26,6 +26,10 @@ virtual-texture page requests and shadow maps below native size, supports the GO
 for switching parts off. Version 1.6 links the add-on into ReShade (`rslink.cpp`): ReShade wraps the game's swapchain,
 so the bridge now hands frames over from under ReShade's wrapper, runs ReShade's effects at its HUD-less point (after
 DLSS, before the UI) and gives ReShade the scene depth with the camera's direction and near / far distances.
+Version 2.2 ports the Attila Engine Performance Fix's battle work: the unit card panel drawn from a cache, the soldiers'
+draw lists sorted on four threads, Culling (small parts of distant soldiers not drawn; Light by default), a guard
+against the sound engine's null-buffer crash in huge battles, the F8 panel without the add-on, and one engine fix per
+game.
 
 ## What each file does
 
@@ -45,13 +49,19 @@ DLSS, before the UI) and gives ReShade the scene depth with the camera's directi
 | `scriptext.c` | Lua script extender: `lua_ext\*.lua` run in each of the game's script environments, and a Lua console (Ctrl+\`), through the game's own Lua 5.1 (only with a `lua_ext` folder; byte-checked addresses, Steam build only) |
 | `update.c` | Self-update from the Steam Workshop copy (item 3826423359): a newer version there replaces the DLL in the game folder for the next start; never downgrades, no network. Also updates the DLSS add-on: from the one Workshop item its `install.bat` recorded (`FrameBridge\source.txt`), only when that item's `FrameBridge\version.txt` is higher; `settings.txt` and logs are kept |
 | `logtrim.c`, `logtrim.h` | Past 1 MB, `rome2fix.log` drops its oldest whole game sessions (about 256 KB stay), so players can still post it |
+| `soundguard.c` | The 5 calls of Wwise's gain-ramp mix go through a check that skips a mix whose source or destination is a null pointer (a full sound pool leaves one); the same function as Attila's, byte-checked per build |
+| `uicache.c` | Battle UI cache: the unit card panel (`card_panel_docker`) is drawn into two textures a few times a second and on input, and shown from them in between; hooks the UI component draw and the sprite batch's flush, and hot-patches six of d3d11's context functions (behind the add-on's hooks when it runs) |
+| `parsort.c` | The soldiers' per-pass draw lists of the first mesh node sorted on the main thread and up to 3 helper threads with `sortfix.c`'s radix sort (same order as one thread) |
+| `partcull.c` | Culling: in the scene node's `add_instance` part loops, a part of an animated model whose box is under 1 m and whose size on screen is under the threshold (4K pixels) is not turned into a draw item |
+| `overlay.c` | Without the DLSS add-on: the F8 panel and its cards on the game's own frames (the game's `GetProcAddress` -> `CreateDXGIFactory1` -> `CreateSwapChain` -> `Present`) |
+| `menuver.c` | The mod's version on the main menu: the front end's own pointer, read from the main menu's code |
 | `bridgeprobe.c` | DLSS add-on, game side (only with `<game>\FrameBridge\helper64.exe`): finds the frame without the HUD, the camera and the scene depth in the game's Direct3D 11 calls, moves the game's swapchain to a hidden window, jitters the viewport for DLSS, reads `FrameBridge\settings.txt` |
 | `fgbridge.c` | Hands each frame (picture, depth, camera motion) to the 64-bit helper through shared textures and fences, and paces the game to it; stops the helper and falls back to the game's own frames if it stops answering |
 | `fgb_proto.h` | The shared-memory layout and fences between `fgbridge.c` and the helper (the same file in the helper's repository) |
-| `fgpanel.c` | The settings panel (F8, `panel_key=` in `settings.txt`) drawn over the frame, and a pop-up when the add-on cannot start or turns off |
+| `fgpanel.c` | The settings panel (F8, `panel_key=` in `settings.txt`) drawn over the frame: the add-on's settings, Culling, What's new; cards for a newer version, What's new and when the add-on cannot start; the main menu label |
 | `r2motion.c`, `r2motionvs.h` | Per-object motion vectors for moving soldiers and horses: the animated models drawn again on the GPU with the game's own skinning, matched to the previous frame by position |
 | `rslink.cpp`, `reshade/` | The bridge's ReShade link (C++, no C++ runtime linked): the mod registers itself as a ReShade add-on and runs ReShade's effects at the HUD-less point with the scene depth; `reshade/` holds ReShade's add-on API headers (v6.8.0, unchanged) |
-| `builds.h` | The game builds the fixes know (normal Steam version 2026-09-17, "pantheon" beta 2026-10-01); each fix keeps its addresses and byte hashes per build |
+| `builds.h` | The game builds the fixes know (normal Steam version 2026-09-17, "pantheon" beta 2026-10-01, GOG); each fix keeps its addresses and byte hashes per build |
 | `version.h` | Mod version |
 | `dinput8.def` | The exports a `dinput8.dll` must have |
 
@@ -103,7 +113,11 @@ of differences, so it would catch a stale cache. `diag_test` checks
 the crash records on deliberate faults, `selfupd_test` the update rules (the DLL and the DLSS add-on) on throwaway
 files, `bridgelive_test` the DLSS add-on's game side against a stand-in game on your graphics card (`addon`: its
 settings), `r2motion_test` the per-object motion vectors against values worked out on the CPU, and
-`lateload_test` loads the built DLL before the game DLL (as an overlay can) and checks every fix
+`soundguard_test`, `partcull_test`, `uicache_test`, `parsort_test` and `menuver_test` run on the game's DLL (the
+mix byte-identical to the game's, the culling stubs on a stack frame shaped like the game's, the cache against a
+stand-in UI on your graphics card, the threaded sort against the one-thread order), `fgpanel_test`, `fgfill_test` and
+`overlay_test` the panel and the add-on's per-frame work on a software device, `dupload_test` two copies in one
+process, and `lateload_test` loads the built DLL before the game DLL (as an overlay can) and checks every fix
 still installs from Windows' load notification. They read your copy of the game's
 `empire.retail.dll` (it is not included here):
 

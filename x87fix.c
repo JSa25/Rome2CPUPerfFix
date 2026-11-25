@@ -232,7 +232,7 @@ int install_x87fix(HMODULE m, void (*log)(const char *fmt, ...)) {
     }
     FlushInstructionCache(GetCurrentProcess(), NULL, 0);
     if (n > fast) {
-        HANDLE w = CreateThread(NULL, 0, x87_watch, NULL, 0, NULL);
+        HANDLE w = CreateThread(NULL, 256 << 10, x87_watch, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);   // 256 KB, not the exe's 1 MB
         if (w) CloseHandle(w);
     }
     log("x87 fix: %d of %d rounding-mode blocks replaced (%d truncating via fisttp, %d via SSE4.1 roundss)%s", n, found,
