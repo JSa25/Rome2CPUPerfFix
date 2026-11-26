@@ -26,8 +26,8 @@ virtual-texture page requests and shadow maps below native size, supports the GO
 for switching parts off. Version 1.6 links the add-on into ReShade (`rslink.cpp`): ReShade wraps the game's swapchain,
 so the bridge now hands frames over from under ReShade's wrapper, runs ReShade's effects at its HUD-less point (after
 DLSS, before the UI) and gives ReShade the scene depth with the camera's direction and near / far distances.
-Version 2.2 ports the Attila Engine Performance Fix's battle work: the unit card panel drawn from a cache, the soldiers'
-draw lists sorted on four threads, Culling (small parts of distant soldiers not drawn; Light by default), a guard
+Version 2.2 ports the Attila Engine Performance Fix's battle work: the unit card panel drawn from a cache (2.3: its
+place on screen comes from the game's own draw records; in 2.2 the cards were not shown), the soldiers' draw lists sorted on four threads, Culling (small parts of distant soldiers not drawn; Light by default), a guard
 against the sound engine's null-buffer crash in huge battles, the F8 panel without the add-on, and one engine fix per
 game.
 
@@ -50,7 +50,7 @@ game.
 | `update.c` | Self-update from the Steam Workshop copy (item 3826423359): a newer version there replaces the DLL in the game folder for the next start; never downgrades, no network. Also updates the DLSS add-on: from the one Workshop item its `install.bat` recorded (`FrameBridge\source.txt`), only when that item's `FrameBridge\version.txt` is higher; `settings.txt` and logs are kept |
 | `logtrim.c`, `logtrim.h` | Past 1 MB, `rome2fix.log` drops its oldest whole game sessions (about 256 KB stay), so players can still post it |
 | `soundguard.c` | The 5 calls of Wwise's gain-ramp mix go through a check that skips a mix whose source or destination is a null pointer (a full sound pool leaves one); the same function as Attila's, byte-checked per build |
-| `uicache.c` | Battle UI cache: the unit card panel (`card_panel_docker`) is drawn into two textures a few times a second and on input, and shown from them in between; hooks the UI component draw and the sprite batch's flush, and hot-patches six of d3d11's context functions (behind the add-on's hooks when it runs) |
+| `uicache.c` | Battle UI cache: the unit card panel (`cards_panel` under `battle_orders`) is drawn into two target-sized textures a few times a second and on input, and pasted over the box of the draw records it flushed (read at the batch flush) in between; hooks the UI component draw and the sprite batch's flush, and hot-patches six of d3d11's context functions (behind the add-on's hooks when it runs) |
 | `parsort.c` | The soldiers' per-pass draw lists of the first mesh node sorted on the main thread and up to 3 helper threads with `sortfix.c`'s radix sort (same order as one thread) |
 | `partcull.c` | Culling: in the scene node's `add_instance` part loops, a part of an animated model whose box is under 1 m and whose size on screen is under the threshold (4K pixels) is not turned into a draw item |
 | `overlay.c` | Without the DLSS add-on: the F8 panel and its cards on the game's own frames (the game's `GetProcAddress` -> `CreateDXGIFactory1` -> `CreateSwapChain` -> `Present`) |

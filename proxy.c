@@ -168,7 +168,8 @@ static void log_status(const int st[9]) {
 // [tuning] culling= (the F8 panel's pick).
 static const char g_ini_defaults[] =
     "; Rome 2 Engine Performance Fix settings. 1 = on, 0 = off. Restart the game after a change.\r\n"
-    "; The mod writes this file once with the defaults; after that it changes only culling= (your pick in the F8 panel).\r\n"
+    "; The mod writes this file with the defaults and adds the lines a newer version brings; otherwise it changes only\r\n"
+    "; culling= (your pick in the F8 panel).\r\n"
     "; Delete it to get the defaults back.\r\n"
     "; (The older way still works too: an empty <name>_off.txt file in the game folder switches that fix off.)\r\n"
     "\r\n"
@@ -208,6 +209,109 @@ static void ini_write_defaults(const wchar_t *path) {
     DWORD w;
     WriteFile(h, g_ini_defaults, sizeof g_ini_defaults - 1, &w, NULL);
     CloseHandle(h);
+}
+
+// The defaults' lines an existing rome2fix.ini does not have are added to it, each with the comment lines right above
+// it in the defaults, at the end of its section (a missing section at the end of the file). The user's own lines and
+// values stay. The older header lines, which say the file is never changed, are replaced.
+// shortcut: the replacements match Windows line ends only (as the mod and Notepad write them); a file with bare \n
+// ones still gets its missing lines
+static const char *const g_ini_replace[][2] = {
+    {"; The mod writes this file once with the defaults and never changes it. Delete it to get the defaults back.\r\n",
+     "; The mod writes this file with the defaults and adds the lines a newer version brings; otherwise it changes only\r\n"
+     "; culling= (your pick in the F8 panel). Delete it to get the defaults back.\r\n"},
+    {"; The mod writes this file once with the defaults; after that it changes only culling= (your pick in the F8 panel).\r\n",
+     "; The mod writes this file with the defaults and adds the lines a newer version brings; otherwise it changes only\r\n"
+     "; culling= (your pick in the F8 panel).\r\n"}};
+enum { INI_MAX = 65536 };
+static const char *ini_next(const char *p) {
+    while (*p && *p != '\n') p++;
+    return *p ? p + 1 : p;
+}
+// the line at p is "[sec]" / "key =..." (case ignored)
+static int ini_is_sec(const char *p, const char *sec, size_t n) { return p[0] == '[' && !_strnicmp(p + 1, sec, n) && p[n + 1] == ']'; }
+static int ini_is_key(const char *p, const char *key, size_t n) {
+    if (_strnicmp(p, key, n)) return 0;
+    for (p += n; *p == ' ' || *p == '\t'; p++) {}
+    return *p == '=';
+}
+// n bytes at buf + at, the rest moved up; 0 when it does not fit
+static int ini_insert(char *buf, size_t *len, size_t at, const char *add, size_t n) {
+    if (*len + n >= INI_MAX) return 0;
+    memmove(buf + at + n, buf + at, *len - at + 1);
+    memcpy(buf + at, add, n);
+    *len += n;
+    return 1;
+}
+static void ini_update(const wchar_t *path) {
+    static char buf[INI_MAX];
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD n = 0;
+    BOOL ok = ReadFile(h, buf, INI_MAX - 1, &n, NULL) && n < INI_MAX - 1;   // a file this big is left alone
+    CloseHandle(h);
+    if (!ok) return;
+    buf[n] = 0;
+    size_t len = n;
+    int changed = 0;
+    for (unsigned r = 0; r < sizeof g_ini_replace / sizeof g_ini_replace[0]; r++) {
+        char *at = strstr(buf, g_ini_replace[r][0]);
+        size_t a = strlen(g_ini_replace[r][0]), b = strlen(g_ini_replace[r][1]);
+        if (!at || len - a + b >= INI_MAX) continue;
+        memmove(at + b, at + a, len - (size_t)(at - buf) - a + 1);
+        memcpy(at, g_ini_replace[r][1], b);
+        len = len - a + b;
+        changed = 1;
+    }
+    char sec[32] = "";
+    const char *cmt = NULL;   // the first of the comment lines right above the current line of the defaults
+    for (const char *d = g_ini_defaults; *d; d = ini_next(d)) {
+        const char *e = ini_next(d), *eq = memchr(d, '=', (size_t)(e - d));
+        if (*d == ';') {
+            if (!cmt) cmt = d;
+            continue;
+        }
+        if (*d == '[') {
+            const char *c = memchr(d, ']', (size_t)(e - d));
+            size_t sn = c ? (size_t)(c - d - 1) : 0;
+            if (sn < sizeof sec) { memcpy(sec, d + 1, sn); sec[sn] = 0; }
+        } else if (eq && sec[0]) {
+            size_t sn = strlen(sec), kn = (size_t)(eq - d);
+            const char *s0 = NULL, *s1 = buf + len, *last = NULL;   // the section in the file: after its header, the next header
+            for (const char *p = buf; *p; p = ini_next(p)) {
+                if (s0 && *p == '[') { s1 = p; break; }
+                if (!s0 && ini_is_sec(p, sec, sn)) s0 = ini_next(p);
+            }
+            int have = 0;
+            for (const char *p = s0; p && p < s1 && !have; p = ini_next(p)) have = ini_is_key(p, d, kn);
+            if (!have) {
+                for (const char *p = s0; p && p < s1; p = ini_next(p))
+                    if (*p != '\r' && *p != '\n' && *p != ';') last = ini_next(p);   // after the section's last key line
+                const char *from = cmt ? cmt : d;
+                size_t at = s0 ? (size_t)((last ? last : s0) - buf) : len;
+                if (at && buf[at - 1] != '\n' && ini_insert(buf, &len, at, "\r\n", 2)) at += 2, changed = 1;   // a last line without its line end
+                if (!s0) {
+                    char head[40];
+                    int hn = snprintf(head, sizeof head, "%s[%s]\r\n", len ? "\r\n" : "", sec);
+                    if (!ini_insert(buf, &len, at, head, (size_t)hn)) break;
+                    at += (size_t)hn;
+                    changed = 1;
+                }
+                changed |= ini_insert(buf, &len, at, from, (size_t)(e - from));
+            }
+        }
+        cmt = NULL;
+    }
+    if (!changed) return;
+    // written beside it first, then put in its place: the old file stays whole if writing fails
+    wchar_t tmp[MAX_PATH + 8];
+    swprintf(tmp, MAX_PATH + 8, L"%ls.new", path);
+    h = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    ok = WriteFile(h, buf, (DWORD)len, &w, NULL) && w == len;
+    CloseHandle(h);
+    if (!ok || !MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING)) DeleteFileW(tmp);
 }
 
 // An ini switch: off only for 0 / off / false / no (GetPrivateProfileInt read "on", "yes", "true" as 0 = off); missing,
@@ -264,6 +368,7 @@ static void install_all(HMODULE m) {
     wcscpy(ini, f);
     wcscpy(ini + (name - f), L"rome2fix.ini");
     ini_write_defaults(ini);
+    ini_update(ini);
     wcscpy(g_ini, ini);
 #define INI(sec, key) ini_on(sec, key, ini)
 #define OFF(key, file) (!INI(L"fixes", key) || PRESENT(file))

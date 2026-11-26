@@ -11,6 +11,11 @@
 //   - every frame one draw puts that over the scene: scene x (white - black) + black, with dual-source blending.
 // Blending that reads the target's alpha, or takes a minimum / maximum, cannot be stood in for: a panel that uses it is
 // drawn the game's way from then on (said in the log).
+// The textures are the size of the target, so each draw lands in them where it would have landed on the target; the
+// paste covers only the panel's box, which is taken from what it draws: the records it flushes (see uic_flush). Not from
+// the component's position and size fields: in game (2026-11-25, ui_scale 1.7 at 4K) those are layout units the game
+// scales again in its projection (x 1.69 there), and a cache placed by them held nothing - the unit cards were missing
+// in 2.2 and in two 2.3 test builds; two probe battles measured it (AGENT_LOG).
 // Redrawn: when there is nothing yet; every INTERVAL ms; while the cursor is over it; for 250 ms after a mouse button or
 // a non-camera key goes down or comes up (held, it does not count: Attila 7.1); when the game hands it other draw
 // details, or it has moved or changed size.
@@ -19,10 +24,8 @@
 // starts with "mov eax, [abs]" (5 bytes), ret 0x10, returns 1, Draw(DrawDetails &, unsigned, bool, bool) as in Attila.
 // The component's fields are Attila's minus 0xC (name, parent, visible, state) - its position is read from +0x94 (the
 // absolute one: Draw culls the children against the clip rect with it, and +0x1057C70 (Steam) sets it to the parent's
-// plus the relative position at +0x8C). The game's UI size is not one global here as Attila's notes have it: the 4
-// floats at the clip address are the clip rect, set to (0, 0, UI width, UI height) by the root's Draw and pushed / popped
-// around every component that clips its children (Attila's code does the same). So the size is taken from it when the
-// root's Draw is entered (what the last frame left there is the root's rect again).
+// plus the relative position at +0x8C). Position and size only tell whether the panel moved (a redraw); they are not its
+// pixels (above).
 //
 // Nothing stands between the game and its Draw: it is entered with the stack and every register as the game set them;
 // only when the panel is to be redrawn is its return address swapped for ours, and when it is shown from the textures
@@ -42,6 +45,7 @@
 #include <d3dcompiler.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include "builds.h"
 
@@ -56,9 +60,7 @@ void *__cdecl fgb_d3d11_original(unsigned slot) __attribute__((weak));   // brid
 #define R_DEVICE 0x138  // the D3D11 renderer's ID3D11Device (its D3D11CreateDevice call writes it there)
 #define DETAILS 0x38    // bytes of the DrawDetails compared (Draw copies +0..+0x34 into the children's)
 #define LEN_FLUSH 0x80
-// shortcut: MARGIN is all the room children get outside the panel's own rectangle (Attila: 7 units at most), a child
-// drawn further out is cut off - walk the children's rectangles if that ever shows
-enum { NTARGET = 4, NBLEND = 32, NFN = 16, INTERVAL = 66, MARGIN = 48 };
+enum { NTARGET = 4, NBLEND = 32, NFN = 16, INTERVAL = 66 };
 
 // per known build (builds.h order). All hashes are FNV-1a of the code as on disk (relocations undone), in 0x2F0 pieces.
 //   draw, its length, hash; where in it the clip rect's address is (the root's "mov [clip x], 0");
@@ -79,14 +81,16 @@ typedef struct {
     ID3D11Texture2D *tex[2];       // drawn over black, drawn over white
     ID3D11RenderTargetView *rtv[2];
     ID3D11ShaderResourceView *srv[2];
-    unsigned tw, th;               // the textures' size
-    int x, y;                      // where their corner is on the target
+    unsigned tw, th;               // the textures' size (the target's, in steps of 64)
+    unsigned tgt_w, tgt_h;         // the target's size
+    int box[4];                    // the panel's pixels on the target: x0, y0, x1, y1 (x1 <= x0: it drew nothing there)
     float rect[4];                 // the component's x, y, width, height when it was last drawn
     int valid, off;                // off: something in it cannot be cached, it is drawn the game's way from then on
     DWORD drawn;                   // GetTickCount of the last redraw
     LONG seen;                     // frame it was last drawn in
     unsigned char details[DETAILS];
     unsigned why[6], reuse;        // redraws by reason (1 first, 2 moved / details, 3 a key or button, 4 interval, 5 the cursor over it), frames shown from the textures
+    int said;                      // its first redraw has been written to the log
 } Target;
 static Target g_t[NTARGET];
 static int g_nt;
@@ -94,9 +98,6 @@ static int g_nt;
 static void (*g_log)(const char *fmt, ...);
 static unsigned char *g_base;      // the game module; NULL in tests
 static const DWORD *g_build;       // its table entry
-static const float *g_clip;        // the clip rect: x, y, width, height
-static float g_ui_wh[2];           // the UI's width and height, from the clip rect at the root's Draw
-static const float *g_root_wh;     // g_ui_wh in game; the test's own in tests
 static unsigned char **g_renderer; // the global holding the renderer
 static int g_on = 1;
 static unsigned char *g_stubs;     // the entry stub, at +0x28 the one a redrawn panel's Draw returns into, at +0x40 the flush's
@@ -151,7 +152,7 @@ static const char *hlsl =
     "V vs(uint i : SV_VertexID) { V o; o.uv = float2((i << 1) & 2, i & 2); o.p = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
     "Texture2D black : register(t0); Texture2D white : register(t1);\n"
     "struct O { float4 add : SV_Target0; float4 keep : SV_Target1; };\n"
-    "O ps(V i) { float w, h; black.GetDimensions(w, h); int3 at = int3(i.uv * float2(w, h), 0);\n"
+    "O ps(V i) { int3 at = int3(i.p.xy, 0);\n"
     "  float3 b = black.Load(at).rgb, wh = white.Load(at).rgb; O o; o.add = float4(b, 1); o.keep = float4(max(wh - b, 0), 1); return o; }\n";
 
 // Everything made on the device is let go (the game made a new one, or there is none yet).
@@ -218,25 +219,189 @@ static int blend_ok(ID3D11BlendState *bs) {
     return ok;
 }
 
-// The viewport the game asked for, as it has to be while our textures stand for its target (moved by their corner).
-static void set_viewport(ID3D11DeviceContext *c, int ours) {
-    D3D11_VIEWPORT v = g_game_vp;
-    if (ours) { v.TopLeftX -= (FLOAT)g_red->x; v.TopLeftY -= (FLOAT)g_red->y; }
-    g_own = 1;
-    g_set_vp(c, 1, &v);
-    g_own = 0;
+// The panel's box while it is redrawn: the extent of the records it flushes onto its target, in the target's pixels.
+static float g_bx0, g_by0, g_bx1, g_by1;
+static unsigned g_brec;
+
+#ifdef PROFILING
+// The probe (profiling build, 2026-11-25: the unit cards were not shown in game with the cache, and what the game does
+// had to be recorded, not reasoned out). At the panel's first redraw: the raw DrawDetails of the root and of the panel
+// and the clip rect. For its first 3 redraws: every target and viewport the game sets, the scissor state at each draw,
+// the draws that went into the textures and elsewhere. After the 3rd: the two textures and the target as BMP files in
+// the game folder; on the next frame the panel drawn the game's way and the target saved again.
+static int g_pr_state;             // 0 waiting, 1 recording redraws, 3 the game's-way frame next, 4 done
+static int g_pr_redraws, g_pr_after;
+static unsigned char g_pr_root[DETAILS];
+static struct {
+    unsigned in, out, rts, vps, sc_on, sc_off;
+    int nvp, nsc, nrt;
+    D3D11_VIEWPORT vp[8];
+    D3D11_RECT sc[8];
+    void *rt[8];
+} g_pr;
+static float pr_half(unsigned short h) {
+    unsigned e = (h >> 10) & 31, m = h & 1023;
+    float v = e ? (float)(m | 1024) * (float)(1u << e) / (float)(1u << 25) : (float)m / (float)(1u << 24);
+    return h & 0x8000 ? -v : v;
 }
+static unsigned char pr_byte(float v) { return v <= 0 ? 0 : v >= 1 ? 255 : (unsigned char)(v * 255 + 0.5f); }
+// A texture of the context's device as a 24-bit BMP beside rome2.exe (RGBA8 / BGRA8 or RGBA16F).
+static void pr_save(ID3D11DeviceContext *c, ID3D11Resource *res, const char *name) {
+    D3D11_TEXTURE2D_DESC d;
+    ID3D11Texture2D *s = NULL;
+    D3D11_MAPPED_SUBRESOURCE m;
+    ID3D11Texture2D_GetDesc((ID3D11Texture2D *)res, &d);
+    DXGI_FORMAT fmt = d.Format;
+    d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0; d.MipLevels = 1; d.ArraySize = 1;
+    if (d.SampleDesc.Count != 1 || FAILED(ID3D11Device_CreateTexture2D(g_dev, &d, NULL, &s))) { if (g_log) g_log("probe: %s not saved (format %d, %u samples)", name, fmt, d.SampleDesc.Count); return; }
+    ID3D11DeviceContext_CopySubresourceRegion(c, (ID3D11Resource *)s, 0, 0, 0, 0, res, 0, NULL);
+    char path[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+    char *sl = n ? strrchr(path, '\\') : NULL;
+    if (!sl || (size_t)(sl - path) + 1 + strlen(name) >= MAX_PATH) { REL(s); return; }
+    strcpy(sl + 1, name);
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE && SUCCEEDED(ID3D11DeviceContext_Map(c, (ID3D11Resource *)s, 0, D3D11_MAP_READ, 0, &m))) {
+        unsigned row = (d.Width * 3 + 3) & ~3u;
+        unsigned char hd[54] = {'B', 'M'};
+        *(DWORD *)(hd + 2) = 54 + row * d.Height; *(DWORD *)(hd + 10) = 54; *(DWORD *)(hd + 14) = 40;
+        *(LONG *)(hd + 18) = (LONG)d.Width; *(LONG *)(hd + 22) = -(LONG)d.Height; *(WORD *)(hd + 26) = 1; *(WORD *)(hd + 28) = 24;
+        DWORD w;
+        WriteFile(h, hd, 54, &w, NULL);
+        unsigned char *line = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, row);
+        for (unsigned y = 0; line && y < d.Height; y++) {
+            const unsigned char *p = (const unsigned char *)m.pData + (size_t)y * m.RowPitch;
+            for (unsigned x = 0; x < d.Width; x++) {
+                unsigned char r, g, b;
+                if (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                    const unsigned short *q = (const unsigned short *)p + x * 4;
+                    r = pr_byte(pr_half(q[0])); g = pr_byte(pr_half(q[1])); b = pr_byte(pr_half(q[2]));
+                } else if (fmt == DXGI_FORMAT_B8G8R8A8_UNORM || fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || fmt == DXGI_FORMAT_B8G8R8X8_UNORM) {
+                    b = p[x * 4]; g = p[x * 4 + 1]; r = p[x * 4 + 2];
+                } else { r = p[x * 4]; g = p[x * 4 + 1]; b = p[x * 4 + 2]; }
+                line[x * 3] = b; line[x * 3 + 1] = g; line[x * 3 + 2] = r;
+            }
+            WriteFile(h, line, row, &w, NULL);
+        }
+        if (line) HeapFree(GetProcessHeap(), 0, line);
+        ID3D11DeviceContext_Unmap(c, (ID3D11Resource *)s, 0);
+        if (g_log) g_log("probe: %s saved (%ux%u, format %d)", name, d.Width, d.Height, fmt);
+    }
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    REL(s);
+}
+// the target bound now, saved
+static void pr_save_target(ID3D11DeviceContext *c, const char *name) {
+    ID3D11RenderTargetView *rtv = NULL;
+    ID3D11Resource *res = NULL;
+    ID3D11DeviceContext_OMGetRenderTargets(c, 1, &rtv, NULL);
+    if (rtv) ID3D11RenderTargetView_GetResource(rtv, &res);
+    if (res) pr_save(c, res, name);
+    else if (g_log) g_log("probe: %s not saved (no target bound)", name);
+    REL(res); REL(rtv);
+}
+static void pr_details(const char *what, const void *d) {
+    const float *f = d;
+    const unsigned *u = d;
+    if (!g_log) return;
+    g_log("probe: %s DrawDetails as floats: %g %g %g %g %g %g %g %g %g %g %g %g %g %g", what, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13]);
+    g_log("probe: %s DrawDetails as hex: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", what, u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10],
+          u[11], u[12], u[13]);
+}
+// a call of the game's while the panel is redrawn, as it came (before the cache changes anything)
+static void pr_event(int kind, void **sp) {
+    ID3D11DeviceContext *c = sp[1];
+    if (kind == F_RT) {
+        ID3D11RenderTargetView **v = sp[3];
+        void *rt = (unsigned)(uintptr_t)sp[2] && v ? (void *)v[0] : NULL;
+        g_pr.rts++;
+        if (g_pr.nrt < 8) g_pr.rt[g_pr.nrt++] = rt;
+    } else if (kind == F_VP) {
+        const D3D11_VIEWPORT *v = sp[3];
+        g_pr.vps++;
+        if ((unsigned)(uintptr_t)sp[2] && v) {
+            int i = 0;
+            while (i < g_pr.nvp && memcmp(&g_pr.vp[i], v, sizeof *v)) i++;
+            if (i == g_pr.nvp && g_pr.nvp < 8) g_pr.vp[g_pr.nvp++] = v[0];
+        }
+    } else {
+        if (g_game_rt == g_bb) g_pr.in++; else g_pr.out++;
+        ID3D11RasterizerState *rs = NULL;
+        D3D11_RASTERIZER_DESC rd = {0};
+        ID3D11DeviceContext_RSGetState(c, &rs);
+        if (rs) ID3D11RasterizerState_GetDesc(rs, &rd);
+        REL(rs);
+        if (!rd.ScissorEnable) { g_pr.sc_off++; return; }
+        g_pr.sc_on++;
+        D3D11_RECT r[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+        UINT n = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+        ID3D11DeviceContext_RSGetScissorRects(c, &n, r);
+        if (n) {
+            int i = 0;
+            while (i < g_pr.nsc && memcmp(&g_pr.sc[i], r, sizeof *r)) i++;
+            if (i == g_pr.nsc && g_pr.nsc < 8) g_pr.sc[g_pr.nsc++] = r[0];
+        }
+    }
+}
+// The game's batch flush starts (from the flush stub): the batch is noted, and while the probe's frame draws the panel
+// the game's way, the records about to be sent (count at +0x714E4, 0x74 bytes each from +0x64: the flush's own copy)
+// are scanned: each of their 29 dwords' lowest and highest value as a float, and the first two records whole.
+#define PR_REC 0x74
+#define PR_FIELDS (PR_REC / 4)
+static int g_pr_rec;               // 1 while the panel is drawn the game's way in the probe's frame
+static unsigned g_pr_nrec, g_pr_nflush;
+static float g_pr_lo[PR_FIELDS], g_pr_hi[PR_FIELDS];
+static DWORD g_pr_first[2][PR_FIELDS];
+static void __cdecl pr_flush(void *batch) {
+    if (!g_pr_rec) return;
+    unsigned n = *(const unsigned *)((const char *)batch + 0x714E4);
+    const float *r = (const float *)((const char *)batch + 0x64);
+    if (n > 4000) n = 4000;
+    g_pr_nflush++;
+    for (unsigned i = 0; i < n; i++, r += PR_FIELDS) {
+        if (g_pr_nrec < 2) memcpy(g_pr_first[g_pr_nrec], r, PR_REC);
+        for (int k = 0; k < PR_FIELDS; k++) {
+            if (!g_pr_nrec || r[k] < g_pr_lo[k]) g_pr_lo[k] = r[k];
+            if (!g_pr_nrec || r[k] > g_pr_hi[k]) g_pr_hi[k] = r[k];
+        }
+        g_pr_nrec++;
+    }
+}
+static void pr_flush_report(void) {
+    if (!g_log) return;
+    g_log("probe: the panel drawn the game's way: %u records in %u flushes", g_pr_nrec, g_pr_nflush);
+    for (int k = 0; k < PR_FIELDS; k++)
+        g_log("probe:   field +0x%02X: lowest %g, highest %g; record 1 %08lx (%g), record 2 %08lx (%g)", k * 4, g_pr_lo[k], g_pr_hi[k], g_pr_first[0][k],
+              ((float *)g_pr_first[0])[k], g_pr_first[1][k], ((float *)g_pr_first[1])[k]);
+}
+
+static void pr_redraw_done(void) {
+    char vp[8 * 48] = "", sc[8 * 40] = "", rt[8 * 24] = "";
+    for (int i = 0; i < g_pr.nvp; i++)
+        snprintf(vp + strlen(vp), sizeof vp - strlen(vp), " (%.0f,%.0f %.0fx%.0f)", g_pr.vp[i].TopLeftX, g_pr.vp[i].TopLeftY, g_pr.vp[i].Width, g_pr.vp[i].Height);
+    for (int i = 0; i < g_pr.nsc; i++)
+        snprintf(sc + strlen(sc), sizeof sc - strlen(sc), " (%ld,%ld-%ld,%ld)", g_pr.sc[i].left, g_pr.sc[i].top, g_pr.sc[i].right, g_pr.sc[i].bottom);
+    for (int i = 0; i < g_pr.nrt; i++) snprintf(rt + strlen(rt), sizeof rt - strlen(rt), " %p%s", g_pr.rt[i], g_pr.rt[i] == (void *)g_bb ? "(its target)" : "");
+    if (g_log)
+        g_log("probe: redraw %d: draws into the textures %u, elsewhere %u; targets set %u:%s; viewports set %u, distinct:%s; scissor on in %u draws, off in %u, rects:%s",
+              g_pr_redraws + 1, g_pr.in, g_pr.out, g_pr.rts, rt, g_pr.vps, vp, g_pr.sc_on, g_pr.sc_off, sc);
+    memset(&g_pr, 0, sizeof g_pr);
+    g_pr_redraws++;
+}
+#endif
 
 // The game's calls while a panel is drawn into its textures, before d3d11 gets them: sp[1] is the context, sp[2] on
 // the arguments, which may be changed.
 static __attribute__((noinline)) void uic_event(int kind, void **sp) {
     Target *t = g_red;
     ID3D11DeviceContext *c = sp[1];
+#ifdef PROFILING
+    if (g_pr_state == 1) pr_event(kind, sp);
+#endif
     if (kind == F_RT) {          // OMSetRenderTargets(count, views, depth): the old target stands for the black texture
         static ID3D11RenderTargetView *mine[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
         ID3D11RenderTargetView **v = sp[3];
         unsigned n = (unsigned)(uintptr_t)sp[2];
-        int was = g_game_rt == g_bb;
         g_game_rt = n && v ? v[0] : NULL;
         int is = g_game_rt == g_bb && n <= D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT;
         if (is) {
@@ -245,17 +410,9 @@ static __attribute__((noinline)) void uic_event(int kind, void **sp) {
             sp[3] = mine;
             sp[4] = NULL;   // no depth buffer: ours are another size (the UI does not test depth)
         } else if (g_game_rt == g_bb) g_red_bad = 1;
-        if (is != was) set_viewport(c, is);   // its own render to texture and back
-    } else if (kind == F_VP) {   // RSSetViewports(count, viewports)
-        static D3D11_VIEWPORT mine[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    } else if (kind == F_VP) {   // RSSetViewports(count, viewports): noted, the records' positions are in it
         const D3D11_VIEWPORT *v = sp[3];
-        unsigned n = (unsigned)(uintptr_t)sp[2];
-        if (!n || !v) return;
-        g_game_vp = v[0];
-        if (g_game_rt != g_bb || n > D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) return;
-        memcpy(mine, v, n * sizeof *v);
-        for (unsigned i = 0; i < n; i++) { mine[i].TopLeftX -= (FLOAT)t->x; mine[i].TopLeftY -= (FLOAT)t->y; }
-        sp[3] = mine;
+        if ((unsigned)(uintptr_t)sp[2] && v) g_game_vp = v[0];
     } else if (g_game_rt == g_bb) {   // a draw into the panel: once more, into the white texture
         const unsigned *a = (const unsigned *)(sp + 2);
         ID3D11BlendState *bs = NULL;
@@ -366,14 +523,6 @@ static int watch_slots(ID3D11DeviceContext *c) {
     return ok;
 }
 
-// The panel's rectangle on the target, MARGIN around it, cut to the target.
-static void panel_rect(const float rect[4], unsigned tw, unsigned th, int out[4]) {
-    float sx = g_root_wh && g_root_wh[0] > 0 ? (float)tw / g_root_wh[0] : 1, sy = g_root_wh && g_root_wh[1] > 0 ? (float)th / g_root_wh[1] : 1;
-    float x0 = (rect[0] - MARGIN) * sx, y0 = (rect[1] - MARGIN) * sy, x1 = (rect[0] + rect[2] + MARGIN) * sx, y1 = (rect[1] + rect[3] + MARGIN) * sy;
-    out[0] = x0 > 0 ? (int)x0 : 0; out[1] = y0 > 0 ? (int)y0 : 0;
-    out[2] = x1 < (float)tw ? (int)x1 + 1 : (int)tw; out[3] = y1 < (float)th ? (int)y1 + 1 : (int)th;
-}
-
 // The panel's two textures: at least w x h, grown in steps of 64 and never shrunk. Half floats whatever the target
 // is: an additive draw must not clip in the white one (an 8-bit pair was up to 26 of 255 off in Attila's test).
 static int make_textures(Target *t, unsigned w, unsigned h) {
@@ -401,12 +550,11 @@ static int make_textures(Target *t, unsigned w, unsigned h) {
 }
 
 // From here the game's draws go into the panel's textures. 0: not possible now, it is drawn the game's way.
-static int redraw_begin(Target *t, ID3D11DeviceContext *c, const float rect[4]) {
+static int redraw_begin(Target *t, ID3D11DeviceContext *c) {
     static const FLOAT black[4] = {0, 0, 0, 0}, white[4] = {1, 1, 1, 1};
     ID3D11Resource *res = NULL;
     D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
     D3D11_TEXTURE2D_DESC td = {0};
-    int r[4];
     UINT nvp = 1;
     if (!watch_slots(c)) return 0;
     g_bb = NULL; g_dsv = NULL;
@@ -415,20 +563,19 @@ static int redraw_begin(Target *t, ID3D11DeviceContext *c, const float rect[4]) 
     if (res) ID3D11Resource_GetType(res, &dim);
     if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) ID3D11Texture2D_GetDesc((ID3D11Texture2D *)res, &td);
     REL(res);
-    panel_rect(rect, td.Width, td.Height, r);
     ID3D11DeviceContext_RSGetViewports(c, &nvp, &g_game_vp);
-    if (!td.Width || td.SampleDesc.Count != 1 || !nvp || r[2] <= r[0] || r[3] <= r[1] || !make_textures(t, (unsigned)(r[2] - r[0]), (unsigned)(r[3] - r[1]))) {
+    if (!td.Width || !td.Height || td.SampleDesc.Count != 1 || !nvp || !make_textures(t, td.Width, td.Height)) {
         REL(g_bb); REL(g_dsv);
         return 0;
     }
-    t->x = r[0]; t->y = r[1];
+    t->tgt_w = td.Width; t->tgt_h = td.Height;
+    g_brec = 0;
     g_red_bad = 0;
     ID3D11DeviceContext_ClearRenderTargetView(c, t->rtv[0], black);
     ID3D11DeviceContext_ClearRenderTargetView(c, t->rtv[1], white);
     g_set_rt(c, 1, &t->rtv[0], NULL);
     g_game_rt = g_bb;
     g_red = t;
-    set_viewport(c, 1);
     for (int i = 0; i < g_nfn; i++) g_uic_go[i] = g_thunks + 48 * i + 8;
     return 1;
 }
@@ -436,13 +583,26 @@ static int redraw_begin(Target *t, ID3D11DeviceContext *c, const float rect[4]) 
 // The game has drawn the panel: the device gets its target and its viewport again.
 static void redraw_end(ID3D11DeviceContext *c) {
     Target *t = g_red;
+#ifdef PROFILING
+    if (g_pr_state == 1) pr_redraw_done();
+#endif
     for (int i = 0; i < g_nfn; i++) g_uic_go[i] = g_next[i];
-    if (g_game_rt == g_bb) {
-        ID3D11DeviceContext_OMSetRenderTargets(c, 1, &g_bb, g_dsv);
-        ID3D11DeviceContext_RSSetViewports(c, 1, &g_game_vp);
-    } else g_red_bad = 1;   // it left another target bound: that one stays, and this panel is not cached again
+    if (g_game_rt == g_bb) ID3D11DeviceContext_OMSetRenderTargets(c, 1, &g_bb, g_dsv);
+    else g_red_bad = 1;   // it left another target bound: that one stays, and this panel is not cached again
     g_red = NULL;
     REL(g_bb); REL(g_dsv);
+    // the box: whole pixels around the records' extent and 2 more (a quad's edge pixel, filtering), cut to the target
+    int b[4] = {0, 0, 0, 0};
+    if (g_brec) {
+        float f[4] = {g_bx0 - 2, g_by0 - 2, g_bx1 + 3, g_by1 + 3}, lim[4] = {0, 0, (float)t->tgt_w, (float)t->tgt_h};
+        for (int i = 0; i < 4; i++) b[i] = f[i] < 0 ? 0 : f[i] > lim[i & 1 ? 3 : 2] ? (int)lim[i & 1 ? 3 : 2] : (int)f[i];
+    }
+    memcpy(t->box, b, sizeof b);
+    if (!t->said && g_log) {   // what the cache measured, for a bug report
+        t->said = 1;
+        g_log("battle UI cache: %s drawn at %d,%d to %d,%d on the %u x %u target (%u draw records; its layout fields %.0f,%.0f %.0f x %.0f)", t->name, b[0], b[1], b[2],
+              b[3], t->tgt_w, t->tgt_h, g_brec, t->rect[0], t->rect[1], t->rect[2], t->rect[3]);
+    }
     t->valid = !g_red_bad;
     if (g_red_bad) {
         t->off = 1;   // what is in the textures is shown this once
@@ -456,7 +616,8 @@ static void composite(Target *t, ID3D11DeviceContext *c) {
     ID3D11InputLayout *il = NULL; ID3D11ShaderResourceView *srv[2] = {NULL, NULL}; ID3D11BlendState *bs = NULL;
     ID3D11DepthStencilState *dss = NULL; ID3D11RasterizerState *rs = NULL;
     D3D11_PRIMITIVE_TOPOLOGY topo; FLOAT bf[4]; UINT mask, sref, nvp = 1;
-    D3D11_VIEWPORT vp = {0}, mine = {(FLOAT)t->x, (FLOAT)t->y, (FLOAT)t->tw, (FLOAT)t->th, 0, 1};
+    D3D11_VIEWPORT vp = {0}, mine = {(FLOAT)t->box[0], (FLOAT)t->box[1], (FLOAT)(t->box[2] - t->box[0]), (FLOAT)(t->box[3] - t->box[1]), 0, 1};
+    if (t->box[2] <= t->box[0] || t->box[3] <= t->box[1]) return;   // it drew nothing on the target
     ID3D11DeviceContext_VSGetShader(c, &vs, NULL, NULL);
     ID3D11DeviceContext_PSGetShader(c, &ps, NULL, NULL);
     ID3D11DeviceContext_GSGetShader(c, &gs, NULL, NULL);
@@ -526,16 +687,16 @@ static int input_live(DWORD now) {
     return (LONG)(until - now) > 0;
 }
 
-// The cursor over the component (its rectangle in the UI's units, the window taken as the whole root), 16 px around.
-static int cursor_over(const float rect[4]) {
-    if (!g_base || !g_root_wh || g_root_wh[0] <= 0 || g_root_wh[1] <= 0) return 0;
+// The cursor over the panel's box (the window taken as the whole target), 16 window pixels around.
+static int cursor_over(const Target *t) {
+    if (!g_base || t->box[2] <= t->box[0] || !t->tgt_w || !t->tgt_h) return 0;
     RECT r;
     HWND w = GetForegroundWindow();
     POINT p = g_cursor;
     if (!w || !GetClientRect(w, &r) || r.right <= 0 || r.bottom <= 0 || !ScreenToClient(w, &p)) return 0;
-    float x = (float)p.x * g_root_wh[0] / (float)r.right, y = (float)p.y * g_root_wh[1] / (float)r.bottom;
-    float m = 16 * g_root_wh[0] / (float)r.right;
-    return x >= rect[0] - m && y >= rect[1] - m && x <= rect[0] + rect[2] + m && y <= rect[1] + rect[3] + m;
+    float x = (float)p.x * (float)t->tgt_w / (float)r.right, y = (float)p.y * (float)t->tgt_h / (float)r.bottom;
+    float m = 16.0f * (float)t->tgt_w / (float)r.right;
+    return x >= t->box[0] - m && y >= t->box[1] - m && x <= t->box[2] + m && y <= t->box[3] + m;
 }
 
 // Once a frame. Profiling build: a line to the log every 5 s.
@@ -571,13 +732,44 @@ static int is_under(void *self, const char *name) {
     return 0;
 }
 
+// The game's batch flush starts (the stub at its start calls this with the batch): the batch is noted, and while a
+// panel is redrawn onto its target the box grows by the records about to be sent. The batch holds count at +0x714E4
+// records of 0x74 bytes from +0x64, which the flush copies into the vertex buffer as they are (+0x1457FC0 Steam). A
+// record starts with its position in clip space, x and y from -1 to 1 in the viewport (probe battle 2, 2026-11-25: the
+// unit cards' 7,060 records spanned 794..3046 x 1869.. on the 4K target, the game's own frame 794..3045 x 1869..).
+#define REC_SIZE 0x74
+static void __cdecl uic_flush(void *batch) {
+    g_uic_batch = batch;
+#ifdef PROFILING
+    pr_flush(batch);
+#endif
+    if (!g_red || g_game_rt != g_bb) return;
+    unsigned n = *(const unsigned *)((const char *)batch + 0x714E4);
+    const unsigned char *r = (const unsigned char *)batch + 0x64;
+    const D3D11_VIEWPORT *v = &g_game_vp;
+    if (n > 4000) n = 4000;   // the batch's size
+    for (unsigned i = 0; i < n; i++, r += REC_SIZE) {
+        float x = ((const float *)r)[0], y = ((const float *)r)[1];
+        if (!(x >= -4 && x <= 4 && y >= -4 && y <= 4)) continue;   // not a position (NaN, garbage): left out
+        x = v->TopLeftX + (x + 1) * 0.5f * v->Width;
+        y = v->TopLeftY + (1 - y) * 0.5f * v->Height;
+        if (!g_brec++) { g_bx0 = g_bx1 = x; g_by0 = g_by1 = y; continue; }
+        if (x < g_bx0) g_bx0 = x;
+        if (x > g_bx1) g_bx1 = x;
+        if (y < g_by0) g_by0 = y;
+        if (y > g_by1) g_by1 = y;
+    }
+}
+
 // Before the game's Draw of a component (from the entry stub; sp[0] is its return address, sp[1] the DrawDetails).
 // 0: the game's Draw runs, untouched - or, for a panel to be redrawn, with its return address swapped for the stub
 // that calls uic_post. 1: the panel was shown from its textures, Draw is not run.
 static int __cdecl uic_pre(void *self, void **sp) {
     if (g_red) return 0;   // inside a panel that is being drawn into its textures
     frame_tick();
-    if (g_clip && !*(void **)((char *)self + C_PARENT)) memcpy(g_ui_wh, g_clip + 2, sizeof g_ui_wh);   // a root: the clip rect is its rect again
+#ifdef PROFILING
+    if (!*(void **)((char *)self + C_PARENT)) memcpy(g_pr_root, sp[1], DETAILS);
+#endif
     const char *name = *(const char **)((char *)self + C_NAME);
     Target *t = NULL;
     if (name)
@@ -594,11 +786,26 @@ static int __cdecl uic_pre(void *self, void **sp) {
     t->seen = g_frame_no;
     ID3D11DeviceContext *c = g_on && !t->off && *((unsigned char *)self + C_VISIBLE) ? device() : NULL;
     if (!c) { t->valid = 0; return 0; }
+#ifdef PROFILING
+    if (g_pr_state == 3) {   // this frame the game's way, the target saved after its Draw (uic_post)
+        flush_pending();
+        g_pr_state = 4;
+        g_pr_after = 1;
+        g_pr_rec = 1;   // from here to the flush after its Draw: the panel's records
+        const float *cf = (const float *)self, *df = (const float *)sp[1], *sf = *(const float **)((char *)self + C_STATE);
+        if (g_log)
+            g_log("probe: that frame: %s relative +0x8C %g,%g, +0x94 %g,%g, state %g x %g; DrawDetails +0x8 %g,%g, +0x14 %g", t->name, cf[0x8C / 4], cf[0x90 / 4],
+                  cf[0x94 / 4], cf[0x98 / 4], sf ? sf[0x28 / 4] : 0, sf ? sf[0x2C / 4] : 0, df[2], df[3], df[5]);
+        g_uic_ret = sp[0];
+        sp[0] = g_stubs + 0x28;
+        return 0;
+    }
+#endif
     const float *pos = (const float *)((char *)self + C_POS), *st = *(const float **)((char *)self + C_STATE);
     float rect[4] = {pos[0], pos[1], st ? st[0x28 / 4] : 0, st ? st[0x2C / 4] : 0};
     DWORD now = GetTickCount();
     int live = input_live(now);
-    int why = !t->valid ? 1 : memcmp(sp[1], t->details, DETAILS) || memcmp(rect, t->rect, sizeof rect) ? 2 : live ? 3 : cursor_over(rect) ? 5 :
+    int why = !t->valid ? 1 : memcmp(sp[1], t->details, DETAILS) || memcmp(rect, t->rect, sizeof rect) ? 2 : live ? 3 : cursor_over(t) ? 5 :
               now - t->drawn >= INTERVAL ? 4 : 0;
     flush_pending();   // what was gathered before the panel is drawn now, where it belongs
     if (!why) {
@@ -606,7 +813,15 @@ static int __cdecl uic_pre(void *self, void **sp) {
         composite(t, c);
         return 1;
     }
-    if (!redraw_begin(t, c, rect)) { t->valid = 0; return 0; }
+    if (!redraw_begin(t, c)) { t->valid = 0; return 0; }
+#ifdef PROFILING
+    if (g_pr_state == 0) {
+        g_pr_state = 1;
+        pr_details("the root's", g_pr_root);
+        pr_details(t->name, sp[1]);
+        if (g_log) g_log("probe: the game's viewport at %s's Draw: %.0f,%.0f %.0f x %.0f", t->name, g_game_vp.TopLeftX, g_game_vp.TopLeftY, g_game_vp.Width, g_game_vp.Height);
+    }
+#endif
     memcpy(t->details, sp[1], DETAILS);
     memcpy(t->rect, rect, sizeof rect);
     t->drawn = now;
@@ -619,10 +834,30 @@ static int __cdecl uic_pre(void *self, void **sp) {
 // The game's Draw of a redrawn panel has returned (from the second stub).
 static void __cdecl uic_post(void) {
     Target *t = g_red;
+#ifdef PROFILING
+    if (!t && g_pr_after) {   // the probe's frame drawn the game's way
+        g_pr_after = 0;
+        flush_pending();
+        g_pr_rec = 0;
+        pr_flush_report();
+        pr_save_target(g_ctx, "uicache_probe_game.bmp");
+        if (g_log) g_log("probe: done - the game folder has uicache_probe_black.bmp, _white.bmp, _cached.bmp and _game.bmp");
+        return;
+    }
+#endif
     if (!t) return;
     flush_pending();   // the panel's last quads: into the textures
     redraw_end(g_ctx);
     composite(t, g_ctx);
+#ifdef PROFILING
+    if (g_pr_state == 1 && g_pr_redraws >= 3) {
+        g_pr_state = 3;
+        pr_save(g_ctx, (ID3D11Resource *)t->tex[0], "uicache_probe_black.bmp");
+        pr_save(g_ctx, (ID3D11Resource *)t->tex[1], "uicache_probe_white.bmp");
+        pr_save_target(g_ctx, "uicache_probe_cached.bmp");
+        if (g_log) g_log("probe: the panel's box %d,%d to %d,%d, textures %ux%u", t->box[0], t->box[1], t->box[2], t->box[3], t->tw, t->th);
+    }
+#endif
 }
 
 // A 5-byte jump at f to `to` (and NOPs to n bytes). Written before the game draws any UI (install time).
@@ -670,15 +905,17 @@ static int hook_at(unsigned char *f) {
     return put_jump(f, 5, s);
 }
 
-// A stub at the start of the game's flush notes which batch it is for (ecx), touching nothing else.
+// A stub at the start of the game's flush hands the batch (ecx) to uic_flush, every register and the stack as they were.
 static int hook_flush(unsigned char *f) {
     static const unsigned char head[6] = {0x83, 0xEC, 0x4C, 0x56, 0x8B, 0xF1};   // sub esp, 0x4C; push esi; mov esi, ecx
     if (memcmp(f, head, sizeof head)) return 0;
     unsigned char *s = g_stubs + 0x40;
-    s[0] = 0x89; s[1] = 0x0D; *(void **)(s + 2) = &g_uic_batch;   // 40 mov [g_uic_batch], ecx
-    memcpy(s + 6, head, sizeof head);                             // 46 the three instructions the jump replaces
-    s[12] = 0xE9; *(int *)(s + 13) = (int)(f + 6 - (s + 17));     // 4C jmp f + 6
-    if (!put_jump(f, 6, s)) return 0;
+    s[0] = 0x60; s[1] = 0x51;                                     // 40 pushad; push ecx
+    s[2] = 0xE8; *(int *)(s + 3) = (int)((unsigned char *)(void *)uic_flush - (s + 7));   // 42 call uic_flush
+    s[7] = 0x83; s[8] = 0xC4; s[9] = 0x04; s[10] = 0x61;          // 47 add esp, 4; popad
+    memcpy(s + 11, head, sizeof head);                            // 4B the three instructions the jump replaces
+    s[17] = 0xE9; *(int *)(s + 18) = (int)(f + 6 - (s + 22));     // 51 jmp f + 6 (ends at 0x56, the stubs have 96)
+    if (!put_jump(f, 6, g_stubs + 0x40)) return 0;
     g_flush = (void(__fastcall *)(void *, void *))(void *)f;
     return 1;
 }
@@ -707,6 +944,13 @@ static const DWORD *uc_find(const unsigned char *b) {
 static void add_target(const char *name, const char *under) {
     if (g_nt < NTARGET && *name) { strncat(g_t[g_nt].name, name, sizeof g_t[g_nt].name - 1); g_t[g_nt].under = under; g_nt++; }
 }
+// The battle's unit cards: cards_panel, under battle_orders, as Attila caches them. Rome 2's own layout (data.pack
+// ui\battle ui\layout, read 2026-11-25) has Attila's tree: battle_orders > battle_orders_pane > card_panel_docker >
+// cards_panel, the docker 660 x 192 and cards_panel 660 x 189 as laid out, cards_panel widened to fit the cards.
+// 2.2 cached the docker (its name was found in the DLL, cards_panel is only in the layout): textures for the docker's
+// box (768 x 320 in the game's log), and the unit cards were not shown in game. uicache_test case 9 has that tree: the
+// docker cached, the cards drawn past its box are missing; cards_panel cached, the picture is the game's.
+static void add_default_targets(void) { add_target("cards_panel", "battle_orders"); }
 
 // m: the game module; NULL in tests, which pass a function of their own that starts with the same instruction and
 // set the context, the sizes and the root themselves. names: one per line (NULL: the battle's unit cards).
@@ -719,9 +963,7 @@ int install_uicache(HMODULE m, const char *names, void *test_draw, void (*log)(c
     char buf[256] = "";
     strncat(buf, names ? names : "", sizeof buf - 1);
     for (char *p = strtok(buf, "\r\n\t ,"); p; p = strtok(NULL, "\r\n\t ,")) add_target(p, NULL);
-    // The unit cards' docker: the name Rome 2's battle HUD code uses for it (its "hide" event, the card toggle's
-    // layout code); in Attila's layout it holds cards_panel. Battle UI only, by its name.
-    if (!g_nt) add_target("card_panel_docker", NULL);
+    if (!g_nt) add_default_targets();
     if (!m) return hook_at(test_draw);
 
     unsigned char *base = (unsigned char *)m;
@@ -731,9 +973,7 @@ int install_uicache(HMODULE m, const char *names, void *test_draw, void (*log)(c
         return 0;
     }
     g_build = e;
-    g_clip = *(const float **)(base + e[B_DRAW] + e[B_CLIP_AT]);
     g_renderer = *(unsigned char ***)(base + e[B_FLUSH] + 0x30);   // the flush's "mov ecx, [renderer]"
-    g_root_wh = g_ui_wh;
     g_base = base;
     if (log) log("battle UI cache: the unit cards (%s) are shown from a cache, redrawn about 15 times a second and on input", g_t[0].name);
     return 1;

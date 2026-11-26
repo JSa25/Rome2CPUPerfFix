@@ -159,10 +159,17 @@ int main(int argc, char **argv) {
     strcpy(onp + (sl - logp) + 1, "heapfix_on.txt");
     DeleteFileA(onp);
     if (heap) fclose(fopen(onp, "w"));
-    // rome2fix.ini: read (self-update off, the fixes' missing keys default to on) and never overwritten by the mod
+    // rome2fix.ini as 2.2 wrote it, cut down: read (self-update off), words too (was: "Yes" read as 0 = off), culling's
+    // name in any case. The mod adds the defaults' missing lines with their comments and replaces 2.2's header (it said
+    // the file is never changed); the user's own lines stay. [mod] last, without a line end.
     char inip[MAX_PATH];
-    // words too (was: "Yes" read as 0 = off); culling's name in any case
-    static const char ini_text[] = "[mod]\r\nself_update=no\r\ncrash_logging=Yes\r\n[tuning]\r\nculling=Light\r\n";
+    static const char ini_text[] =
+        "; my own note\r\n"
+        "; The mod writes this file once with the defaults; after that it changes only culling= (your pick in the F8 panel).\r\n"
+        "\r\n[fixes]\r\n"
+        "; FPS in battles: the unit cards shown from a cache, redrawn a few times a second and on input\r\nbattle_ui_cache=1\r\n"
+        "\r\n[tuning]\r\nculling=Light\r\n"
+        "[mod]\r\nself_update=no\r\ncrash_logging=Yes";
     strcpy(inip, logp);
     strcpy(inip + (sl - logp) + 1, "rome2fix.ini");
     FILE *fi = fopen(inip, "wb");
@@ -217,12 +224,20 @@ int main(int argc, char **argv) {
     snprintf(fbp, MAX_PATH, "%s\\settings.txt", fbd);
     DeleteFileA(fbp);
     RemoveDirectoryA(fbd);
-    char inibuf[256] = {0};
+    char inibuf[4096] = {0};
     fi = fopen(inip, "rb");
     CHECK(fi);
     fread(inibuf, 1, sizeof inibuf - 1, fi);
     fclose(fi);
-    CHECK(!strcmp(inibuf, ini_text));
+    printf("rome2fix.ini after the start:\n%s\n", inibuf);
+    CHECK(!strncmp(inibuf, "; my own note\r\n; The mod writes this file with the defaults and adds the lines a newer version brings;", 102));
+    CHECK(!strstr(inibuf, "after that it changes only"));
+    CHECK(strstr(inibuf, "\r\n[fixes]\r\n; FPS in battles: the unit cards shown from a cache, redrawn a few times a second and on input\r\n"
+                         "battle_ui_cache=1\r\n; FPS\r\ntile_feedback_scan=1\r\nx87_rounding=1\r\n"));
+    CHECK(strstr(inibuf, "\r\n; stability\r\nsound_crash_guard=1\r\n\r\n[tuning]\r\nculling=Light\r\n[mod]\r\nself_update=no\r\ncrash_logging=Yes\r\n"
+                         "; load other mods' DLLs from the plugins folder in the game folder (any name, e.g. plugins\\smoke.dll)\r\nplugins=1\r\n"));
+    CHECK(!strstr(strstr(inibuf, "battle_ui_cache=1") + 1, "battle_ui_cache"));   // once
+    CHECK(has("the unit cards (cards_panel) are shown from a cache"));
     DeleteFileA(inip);
     CHECK(has("tile feedback scan replaced"));
     CHECK(has("x87 fix: 1196 of 1196") || has("x87 fix: 1213 of 1213"));  // 2026-09-17 build / pantheon beta

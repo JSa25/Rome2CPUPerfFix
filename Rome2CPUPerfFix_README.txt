@@ -140,9 +140,10 @@ Turning single fixes off
 ------------------------
 Since 1.5 the mod writes rome2fix.ini into the game folder at the first start.
 Set a line to 0 to switch that part off (useful if you suspect one of them),
-then restart the game; 1 switches it back on. After writing it, the mod only
-ever changes the culling= line (when you pick it in F8); delete the file to
-get the defaults back.
+then restart the game; 1 switches it back on. Since 2.3 a newer version adds
+its new lines to the file (your own values stay as they are); otherwise the
+mod only changes the culling= line (when you pick it in F8). Delete the file
+to get the defaults back.
 
   [fixes]
   tile_feedback_scan   tile streaming scan
@@ -284,6 +285,19 @@ is published for review at github.com/JSa25/Rome2CPUPerfFix.
 
 Changelog
 ---------
+Version 2.3:
+           - the unit cards show again in battles. 2.2's card cache put
+           its picture where the card panel's layout position said, but
+           the game draws its UI scaled again (1.69 times that position on
+           the test PC, UI scale 1.7 at 4K), so the picture held nothing
+           and the cards were not shown. The cache now takes the cards'
+           place on screen from what the game actually draws. It caches
+           the cards panel itself (cards_panel), as the Attila fix does.
+           - rome2fix.ini: a newer version adds its new lines to the file,
+           your own values kept (a file from before 2.2 had no
+           battle_ui_cache line to switch the cache off with).
+           SHA-256 of dinput8.dll:
+           7344f8c73b8f9dbaf767f49002c07f3fc9d884c02432c0e17c1e2f426d795d54
 Version 2.2:
            - battles: the unit card panel is drawn from a cache, and the
            soldiers' draw lists are sorted on four threads (both ported

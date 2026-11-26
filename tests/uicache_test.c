@@ -7,9 +7,9 @@
 //       with the same instruction (mov eax, [abs]), so the real stubs and the real patches on d3d11 are what runs. A panel
 //       of blended quads (over, additive, multiply, each with a viewport of its own, and a render to another texture in
 //       the middle) must look the same drawn into the cache and shown from it as drawn straight onto the target - over
-//       two different backgrounds, the second without the panel being drawn again - with the cache's textures only as
-//       large as the panel. The UI's size comes from the clip rect at the root's Draw, not at the panel's (a clipping
-//       ancestor narrows it there). Also: other mods' hooks already on d3d11's Draw (a hot patch) and RSSetViewports (a
+//       two different backgrounds, the second without the panel being drawn again. Each quad goes through the game's
+//       batch as records (the first two floats its corners in clip space, as in game): the paste covers the box of the
+//       records the panel flushed, not its position fields (in game those are layout units the game scales again). Also: other mods' hooks already on d3d11's Draw (a hot patch) and RSSetViewports (a
 //       5-byte jump) keep seeing every call; the DLSS add-on's hooks in the context's vtable (unless "plain") see the
 //       game's calls only; an uncached component's draw is entered with the stack and the arguments as its caller set
 //       them; the redraw rules (a held button counts when it goes down and comes up only); the state the game finds
@@ -52,21 +52,22 @@ static int real_dll(const char *path) {
     unsigned char *f = b + e[B_DRAW], *fl = b + e[B_FLUSH], first[5];
     memcpy(first, f, 5);
     CHECK(first[0] == 0xA1 && f[5] == 0x81 && f[6] == 0xEC);   // mov eax, [abs]; sub esp, ...
-    CHECK(install_uicache((HMODULE)b, NULL, NULL, tlog) == 1 && g_nt == 1 && !strcmp(g_t[0].name, "card_panel_docker"));
+    CHECK(install_uicache((HMODULE)b, NULL, NULL, tlog) == 1 && g_nt == 1 && !strcmp(g_t[0].name, "cards_panel") && g_t[0].under && !strcmp(g_t[0].under, "battle_orders"));
     CHECK(f[0] == 0xE9 && f + 5 + *(LONG *)(f + 1) == g_stubs);
     CHECK(!memcmp(g_stubs + 0x14, first, 5) && g_stubs + 0x1E + *(LONG *)(g_stubs + 0x1A) == f + 5);   // the moved instruction, then back past it
     CHECK(fl[0] == 0xE9 && fl + 5 + *(LONG *)(fl + 1) == g_stubs + 0x40 && fl[5] == 0x90);
-    CHECK(g_stubs[0x4C] == 0xE9 && g_stubs + 0x51 + *(LONG *)(g_stubs + 0x4D) == fl + 6 && !memcmp(g_stubs + 0x46, "\x83\xEC\x4C\x56\x8B\xF1", 6));
-    // the clip rect and the renderer global, from the code: inside the DLL's data, the clip rect where the root writes it
+    // the flush's stub: pushad; push ecx; call uic_flush; add esp, 4; popad; the moved instructions; back past them
+    CHECK(g_stubs[0x40] == 0x60 && g_stubs[0x41] == 0x51 && g_stubs[0x42] == 0xE8 && g_stubs + 0x47 + *(LONG *)(g_stubs + 0x43) == (unsigned char *)(void *)uic_flush);
+    CHECK(g_stubs[0x51] == 0xE9 && g_stubs + 0x56 + *(LONG *)(g_stubs + 0x52) == fl + 6 && !memcmp(g_stubs + 0x4B, "\x83\xEC\x4C\x56\x8B\xF1", 6));
+    // the renderer global, from the code: inside the DLL's data
     const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(b + ((const IMAGE_DOS_HEADER *)b)->e_lfanew);
     DWORD size = nt->OptionalHeader.SizeOfImage;
-    CHECK((UINT_PTR)g_clip - (UINT_PTR)b < size && (UINT_PTR)g_renderer - (UINT_PTR)b < size && g_root_wh == g_ui_wh);
-    CHECK(*(const float *const *)(b + e[B_DRAW] + e[B_CLIP_AT]) == g_clip && b[e[B_DRAW] + e[B_CLIP_AT] - 2] == 0xC7);
+    CHECK((UINT_PTR)g_renderer - (UINT_PTR)b < size);
     CHECK(*g_renderer == NULL && device() == NULL);   // not run: no renderer, nothing cached
     CHECK(uc_find(b) == NULL);   // patched: no longer the known code
     int build = (int)(e - g_uc_builds[0]) / 10;
-    if (!fails) printf("uicache %s: OK (build %d, Draw +0x%lX, flush +0x%lX, clip rect +0x%lX, renderer +0x%lX)\n", path, build, e[B_DRAW], e[B_FLUSH],
-                       (unsigned long)((const unsigned char *)g_clip - b), (unsigned long)((unsigned char *)g_renderer - b));
+    if (!fails) printf("uicache %s: OK (build %d, Draw +0x%lX, flush +0x%lX, renderer +0x%lX)\n", path, build, e[B_DRAW], e[B_FLUSH],
+                       (unsigned long)((unsigned char *)g_renderer - b));
     return fails ? 1 : 0;
 }
 
@@ -130,12 +131,23 @@ void *__cdecl fgb_d3d11_original(unsigned slot) {
     return fn == (void *)aw_rt ? (void *)ad_rt : fn == (void *)aw_vp ? (void *)ad_vp : NULL;
 }
 
+// The game's batch as the flush finds it: count at +0x714E4, records of 0x74 bytes from +0x64, each starting with a
+// position in clip space. A quad here is its viewport with the corners (-1, 1) and (1, -1): those two records.
+static unsigned char t_batch[0x71600];
+static void records(void) {
+    float *r = (float *)(t_batch + 0x64);
+    *(unsigned *)(t_batch + 0x714E4) = 2;
+    r[0] = -1; r[1] = 1;
+    r[0x74 / 4] = 1; r[0x74 / 4 + 1] = -1;
+    uic_flush(t_batch);   // what the stub at the start of the game's flush does
+}
 static void quad(float x, float y, float w, float h, float r, float g, float b, float a, ID3D11BlendState *bs) {
     static const FLOAT one[4] = {1, 1, 1, 1};
     D3D11_VIEWPORT vp = {x, y, w, h, 0, 1};
     D3D11_MAPPED_SUBRESOURCE m;
     FLOAT col[4] = {r, g, b, a};
     game_vp(&vp);
+    records();
     if (SUCCEEDED(ID3D11DeviceContext_Map(c, (ID3D11Resource *)cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         memcpy(m.pData, col, sizeof col);
         ID3D11DeviceContext_Unmap(c, (ID3D11Resource *)cb, 0);
@@ -161,6 +173,12 @@ static void later(float x, float y, float w, float h, float r, float g, float b,
 }
 
 static unsigned char comp[0x200], comp2[0x200], plain[0x200], hud[0x200], det[0x40];
+typedef char(__fastcall *DrawFn)(void *self, void *edx, void *details, unsigned a, char b, char c);   // the game's thiscall
+// Rome 2's battle tree (its layout file): battle_orders > battle_orders_pane > card_panel_docker > cards_panel. The
+// docker's box is small; cards_panel is wider (the game widens it to fit the cards) and drawn as the docker's child.
+static unsigned char t_orders[0x200], t_pane[0x200], t_docker[0x200], t_cards[0x200];
+static float t_docker_state[16], t_cards_state[16];
+static DrawFn g_child;   // how the docker's Draw reaches its child: the game's function (hooked) or the stand-in straight
 // the game's component draw. "plain" is the one before the panel (a root here, far outside the panel): its quad is still
 // waiting when the panel begins. The panel, in the middle of the target: its first quad relies on the blend state bound
 // before it, after the render to the other texture the target is set before the viewport, and its last quad is still
@@ -171,6 +189,20 @@ static char __fastcall panel(void *self, void *edx, void *details, unsigned a, c
     seen_ret = __builtin_return_address(0);
     seen_self = self; seen_details = details; seen_a = a; seen_b = b; seen_c = cc;
     if (self == plain) { later(200, 10, 16, 16, 1, 1, 0, 1, over); return 1; }
+    if (self == t_docker) {
+        batch_flush(&pend, NULL);
+        quad(118, 200, 20, 12, 0.3f, 0.3f, 0.3f, 1, over);
+        g_child(t_cards, NULL, details, a, b, cc);
+        return 1;
+    }
+    if (self == t_cards) {
+        ndraws++;
+        batch_flush(&pend, NULL);
+        quad(10, 190, 24, 24, 1, 0, 0, 0.5f, over);       // the first card, far left of the docker's box
+        quad(120, 194, 16, 16, 0, 1, 0, 1, over);         // one inside it
+        quad(222, 190, 24, 24, 0, 0.5f, 1, 0.75f, over);  // the last, far right
+        return 1;
+    }
     ndraws++;
     batch_flush(&pend, NULL);   // its first quad has another state
     ID3D11DeviceContext_OMSetBlendState(c, over, one, 0xFFFFFFFF);
@@ -216,7 +248,6 @@ static void scene(float r, float g, float b) {
     ID3D11DeviceContext_OMSetBlendState(c, over, one, 0xFFFFFFFF);
 }
 
-typedef char(__fastcall *DrawFn)(void *self, void *edx, void *details, unsigned a, char b, char c);   // the game's thiscall
 // a frame: the scene, the root before the panel (the game's root sets the clip rect to the UI's size), a clipping
 // ancestor narrowing the clip rect, the panel (straight, or through the hook), the frame's end
 static void frame(float r, float g, float b, void *which, DrawFn draw) {
@@ -309,12 +340,11 @@ int main(int argc, char **argv) {
     code[0] = 0xA1; *(DWORD **)(code + 1) = &first_global;
     code[5] = 0xE9; *(int *)(code + 6) = (int)((unsigned char *)(void *)panel - (code + 10));
     DrawFn game = (DrawFn)(void *)code;
-    CHECK(install_uicache(NULL, "card_panel_docker\nother_panel", code, tlog) == 1 && g_nt == 2 && code[0] == 0xE9);
+    CHECK(install_uicache(NULL, "test_panel\nother_panel", code, tlog) == 1 && g_nt == 2 && code[0] == 0xE9);
     g_ctx = c; g_flush = batch_flush;
-    g_clip = clip; g_root_wh = g_ui_wh;   // as in game: the UI's size from the clip rect at the root's Draw
     static unsigned char ref1[W * W * 4], ref2[W * W * 4];
     state72[0x28 / 4] = state72[0x2C / 4] = 72;
-    *(const char **)(comp + C_NAME) = "card_panel_docker";
+    *(const char **)(comp + C_NAME) = "test_panel";
     *(const char **)(comp2 + C_NAME) = "other_panel";
     *(const char **)(plain + C_NAME) = "root";
     *(const char **)(hud + C_NAME) = "hud";
@@ -340,11 +370,10 @@ int main(int argc, char **argv) {
     HMODULE owner = NULL;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, here, &owner);
     CHECK(owner == GetModuleHandleW(NULL) && g_nfn == 0);   // it returns into this program, not into a stub
-    CHECK(g_ui_wh[0] == W && g_ui_wh[1] == W);   // the root's clip rect
     batch_flush(&pend, NULL);
 
-    // 3. through the cache: drawn into the textures once, the same picture; the textures are the panel's size (in the
-    // root's units, not the narrowed clip rect's); the other mods' hooks saw the panel's draws (each twice: black and
+    // 3. through the cache: drawn into the textures once, the same picture; the paste covers the box of the panel's
+    // records on the target (its quads 96..148 x 100..148, 2 pixels more round, 3 at the far edges); the other mods' hooks saw the panel's draws (each twice: black and
     // white) and viewports; what the game finds bound
     n0 = ndraws;
     LONG fw0 = fw_calls, mh0 = mh_calls;
@@ -352,10 +381,10 @@ int main(int argc, char **argv) {
     frame(0.2f, 0.4f, 0.6f, comp, game);
     CHECK(ndraws - n0 == 1 && seen_self == comp && seen_details == det && seen_a == 7 && seen_c == 1);
     worst = differs(ref1);
-    printf("drawn into the cache and shown: largest difference %d of 255; textures %ux%u at %d,%d; %d d3d11 functions patched\n", worst, g_t[0].tw, g_t[0].th, g_t[0].x,
-           g_t[0].y, g_nfn);
+    printf("drawn into the cache and shown: largest difference %d of 255; textures %ux%u, box %d,%d to %d,%d; %d d3d11 functions patched\n", worst, g_t[0].tw, g_t[0].th,
+           g_t[0].box[0], g_t[0].box[1], g_t[0].box[2], g_t[0].box[3], g_nfn);
     CHECK(worst <= 2 && g_t[0].valid && !g_t[0].off && g_t[0].why[1] == 1);
-    CHECK(g_t[0].tw == 192 && g_t[0].th == 192 && g_t[0].x == 48 && g_t[0].y == 48);   // 96 - MARGIN .. 168 + MARGIN, in steps of 64
+    CHECK(g_t[0].tw == W && g_t[0].th == W && g_t[0].box[0] == 94 && g_t[0].box[1] == 98 && g_t[0].box[2] == 151 && g_t[0].box[3] == 151);
     CHECK(fw_calls - fw0 == 1 + 5 + 4 + 1 && mh_calls - mh0 >= 7);   // Draw: the one before the panel, its 5 quads, 4 of them again, ours
     for (int i = 0; i < g_nfn; i++) CHECK(g_uic_go[i] == g_next[i]);   // the patches lead straight on again
     ID3D11BlendState *bs = NULL; ID3D11RenderTargetView *rt = NULL; ID3D11VertexShader *v = NULL; ID3D11PixelShader *p = NULL;
@@ -381,7 +410,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 300; i++) {
         g_frame_no++;
         ID3D11DeviceContext_Flush(c);
-        det[0x14] = (unsigned char)(i / 3);
+        det[0x20] = (unsigned char)(i / 3);
         frame(i & 1 ? 0.5f : 0.2f, i & 1 ? 0.1f : 0.4f, i & 1 ? 0.3f : 0.6f, comp, game);
         bad += differs(i & 1 ? ref2 : ref1) > 2;
     }
@@ -399,10 +428,10 @@ int main(int argc, char **argv) {
     g_frame_no++;
     frame(0.2f, 0.4f, 0.6f, comp, game);
     CHECK(ndraws - n0 == 1 && differs(ref1) <= 2);
-    ((float *)(comp + C_POS))[0] = 90;   // moved: drawn again, the textures' corner with it
+    ((float *)(comp + C_POS))[0] = 90;   // moved: drawn again (the stand-in draws where it did, so the same box)
     g_frame_no++;
     frame(0.2f, 0.4f, 0.6f, comp, game);
-    CHECK(ndraws - n0 == 2 && g_t[0].x == 42 && differs(ref1) <= 2);
+    CHECK(ndraws - n0 == 2 && g_t[0].box[0] == 94 && differs(ref1) <= 2);
     state72[0x28 / 4] = 70;              // another size: drawn again
     g_frame_no++;
     frame(0.2f, 0.4f, 0.6f, comp, game);
@@ -437,7 +466,7 @@ int main(int argc, char **argv) {
     // 7b. an ancestor asked for is looked for up the parents
     static unsigned char orders[0x200], card[0x200], lone[0x200];
     *(const char **)(orders + C_NAME) = "battle_orders";
-    *(const char **)(card + C_NAME) = *(const char **)(lone + C_NAME) = "card_panel_docker";
+    *(const char **)(card + C_NAME) = *(const char **)(lone + C_NAME) = "test_panel";
     *(void **)(card + C_PARENT) = orders;
     CHECK(is_under(card, "battle_orders") && !is_under(lone, "battle_orders") && !is_under(orders, "battle_orders"));
 
@@ -470,8 +499,9 @@ int main(int argc, char **argv) {
     CHECK(ndraws - n0 == 3 && differs(ref1) <= 2);   // it came up: drawn again
     g_key = GetAsyncKeyState; g_test_keys = 0;
 
-    // 8. what the flush is for: without it the two quads that are still waiting go wrong, in a redrawn frame (the one
-    // before the panel lands in the textures, outside them) or in the next (the panel's last is not in the textures)
+    // 8. what the flush is for: without it the panel's last quad, still waiting when its Draw returns, is not in the
+    // textures, and the next frame (shown from them) lacks it. (The quad waiting before the panel lands in the textures
+    // where it belongs, as they are the target's size, so the redrawn frame itself is right.)
     frame(0.2f, 0.4f, 0.6f, comp, panel); read_bb(); memcpy(ref1, shot, sizeof shot);
     g_flush = NULL;
     g_t[0].valid = 0;
@@ -482,8 +512,69 @@ int main(int argc, char **argv) {
     frame(0.2f, 0.4f, 0.6f, comp, game);
     int wrong2 = differs(ref1);
     printf("without the flush: %d and %d of 255 off in two frames\n", wrong1, wrong2);
-    CHECK(wrong1 > 50 && wrong2 > 50);
+    CHECK(wrong1 <= 2 && wrong2 > 50);
     g_flush = batch_flush;
+
+    // 9. the battle's unit cards, the default target: cards_panel under battle_orders is cached (as Attila does), drawn
+    // as the docker's child through the hooked Draw; the same picture.
+    add_default_targets();
+    CHECK(g_nt == 3);
+    *(const char **)(t_orders + C_NAME) = "battle_orders";
+    *(const char **)(t_pane + C_NAME) = "battle_orders_pane";
+    *(const char **)(t_docker + C_NAME) = "card_panel_docker";
+    *(const char **)(t_cards + C_NAME) = "cards_panel";
+    *(void **)(t_orders + C_PARENT) = hud;
+    *(void **)(t_pane + C_PARENT) = t_orders;
+    *(void **)(t_docker + C_PARENT) = t_pane;
+    *(void **)(t_cards + C_PARENT) = t_docker;
+    *(float **)(t_docker + C_STATE) = t_docker_state;
+    *(float **)(t_cards + C_STATE) = t_cards_state;
+    t_docker_state[0x28 / 4] = 16; t_docker_state[0x2C / 4] = 12;
+    t_cards_state[0x28 / 4] = 240; t_cards_state[0x2C / 4] = 28;
+    ((float *)(t_docker + C_POS))[0] = 120; ((float *)(t_docker + C_POS))[1] = 200;
+    ((float *)(t_cards + C_POS))[0] = 8; ((float *)(t_cards + C_POS))[1] = 188;
+    t_docker[C_VISIBLE] = t_cards[C_VISIBLE] = 1;
+    g_child = panel;
+    frame(0.2f, 0.4f, 0.6f, t_docker, panel); read_bb(); memcpy(ref1, shot, sizeof shot);
+    frame(0.5f, 0.1f, 0.3f, t_docker, panel); read_bb(); memcpy(ref2, shot, sizeof shot);
+    CHECK(ref1[(200 * W + 14) * 4] != ref1[(250 * W + 14) * 4] && ref1[(200 * W + 240) * 4] != ref1[(250 * W + 240) * 4]);   // both outer cards drawn
+    g_child = game;
+    n0 = ndraws;
+    g_frame_no++;
+    frame(0.2f, 0.4f, 0.6f, t_docker, game);
+    int w9a = differs(ref1);
+    g_frame_no++;
+    frame(0.5f, 0.1f, 0.3f, t_docker, game);   // from the textures over another background
+    int w9b = differs(ref2);
+    printf("the battle's cards (cached: %s, box %d,%d to %d,%d): largest difference %d and %d of 255\n", g_t[2].comp == t_cards ? "cards_panel" : g_t[2].comp == t_docker ? "card_panel_docker" : "none",
+           g_t[2].box[0], g_t[2].box[1], g_t[2].box[2], g_t[2].box[3], w9a, w9b);
+    CHECK(g_t[2].comp == t_cards && g_t[2].valid && ndraws - n0 >= 1);   // the second frame from the textures unless the machine took INTERVAL
+    CHECK(w9a <= 2 && w9b <= 2);
+    // the same name outside the battle's orders is not cached
+    *(void **)(t_cards + C_PARENT) = hud;
+    g_t[2].comp = NULL;
+    g_frame_no += 40;
+    frame(0.2f, 0.4f, 0.6f, t_cards, game);
+    CHECK(g_t[2].comp == NULL);
+    *(void **)(t_cards + C_PARENT) = t_docker;
+
+    // 10. what the game had in the probe battles: the panel's position and size fields are not where it draws (in game
+    // layout units the projection scales again: 470,1106 1332 x 316 against 794..3046 x 1869.. at 4K). Here the fields
+    // say half the numbers; the box comes from the records (10..246 x 190..214), the picture is the game's. Placed by
+    // the fields (2.2, 2.3's test builds) the textures sat above the cards and they were not shown.
+    ((float *)(t_docker + C_POS))[0] = 60; ((float *)(t_docker + C_POS))[1] = 100;
+    ((float *)(t_cards + C_POS))[0] = 4; ((float *)(t_cards + C_POS))[1] = 94;
+    t_docker_state[0x28 / 4] = 8; t_docker_state[0x2C / 4] = 6;
+    t_cards_state[0x28 / 4] = 120; t_cards_state[0x2C / 4] = 14;
+    g_child = panel;
+    frame(0.2f, 0.4f, 0.6f, t_docker, panel); read_bb(); memcpy(ref1, shot, sizeof shot);
+    g_child = game;
+    g_t[2].valid = 0;
+    g_frame_no++;
+    frame(0.2f, 0.4f, 0.6f, t_docker, game);
+    int w10 = differs(ref1);
+    printf("fields at half the drawn numbers: cards_panel's box %d,%d to %d,%d: largest difference %d of 255\n", g_t[2].box[0], g_t[2].box[1], g_t[2].box[2], g_t[2].box[3], w10);
+    CHECK(g_t[2].valid && w10 <= 2 && g_t[2].box[0] == 8 && g_t[2].box[1] == 188 && g_t[2].box[2] == 249 && g_t[2].box[3] == 217);
 
     ID3D11DeviceContext_Flush(c);
     // the add-on's hooks saw the game's calls, and nothing of the cache's own

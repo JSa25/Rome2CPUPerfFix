@@ -76,14 +76,14 @@ static int p_drop = -1;   // the open drop-down list (its row), -1 none
 #include "version.h"
 #define WN_POPUP 3   // lines of it in the pop-up
 static const wchar_t *const WHATS_NEW[] = {
-    L"Better performance in big battles: the unit cards are drawn from a cache, soldier lists sorted on several threads.",
+    L"2.3: the unit cards show again: the card cache now takes their place on screen from what the game draws.",
+    L"Big battles: the soldiers' draw lists are sorted on several threads.",
     L"Culling (F8): small parts of far-away soldiers are left out for more fps (Light; change it in F8).",
     L"F8 works without the DLSS add-on too; the main menu shows the mod's version.",
     L"A huge battle's sound no longer crashes the game when the sound memory is full.",
     L"addon=off in FrameBridge\\settings.txt now really turns the DLSS add-on off.",
     L"The F8 panel stays in place when you change resolution; pop-ups close by themselves.",
     L"A pop-up says when Steam has a newer version of the mod.",
-    L"Only one copy of the mod runs at a time.",
 };
 #define WN_N (int)(sizeof WHATS_NEW / sizeof WHATS_NEW[0])
 static int p_page;        // 0 the upscaling page, 1 Culling, 2 What's new (Attila's numbers)
