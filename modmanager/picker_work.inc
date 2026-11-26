@@ -5,6 +5,14 @@
 //   File thread:  small mod pictures, the file lists of the ticked packs (conflict hints), the engine fix's version.
 enum { WM_P_STEAM = WM_APP + 20, WM_P_THUMB, WM_P_CLASH, WM_P_INFO };
 static HWND g_win;
+// What each thread is doing, for the crash line (crashlog.inc)
+static const char *volatile g_step = "start", *volatile g_step_steam = "not started", *volatile g_step_files = "not started";
+static volatile UINT g_step_msg;
+static char g_step_path[MAX_PATH * 2];
+static void crash_catch(void);   // crashlog.inc
+static void quick_done(void);
+static volatile int g_test_crash_files;   // crashlog.inc (tests)
+static void crash_test_late(void);
 static volatile LONG g_quit_work;
 
 // ---- Steam
@@ -81,7 +89,10 @@ static DWORD WINAPI steam_thread(void *unused) {
     int fake_offline = g_fake_steam && strstr(g_fake_steam, "offline") != NULL;
     while (!g_quit_work) {
         if (g_fake_steam) { g_steam = 1; break; }
+        g_step_steam = "connecting to Steam";
         if (steam_connect_quiet()) {
+            crash_catch();   // Steam's overlay, loaded just now, sets its own crash handler: ours first again
+            g_step_steam = "connected, reading the Workshop items";
             *(void **)&get_ugc = steam_api_fn("SteamAPI_SteamUGC_v017");
             *(void **)&subscribe = steam_api_fn("SteamAPI_ISteamUGC_SubscribeItem");
             *(void **)&get_state = steam_api_fn("SteamAPI_ISteamUGC_GetItemState");
@@ -98,6 +109,7 @@ static DWORD WINAPI steam_thread(void *unused) {
             break;
         }
         g_steam = -1;
+        g_step_steam = "no Steam, waiting";
         PostMessageA(g_win, WM_P_STEAM, 0, 0);
         WaitForSingleObject(g_steam_wake, INFINITE);   // a Subscribe press tries again (Steam may have been started since)
         g_steam = 0;
@@ -255,12 +267,16 @@ static DWORD WINAPI io_thread(void *unused) {
             if (d) {
                 snprintf(d->name, sizeof d->name, "%s", job.name);
                 d->size = job.size;
+                snprintf(g_step_path, sizeof g_step_path, "%s", job.path);
+                g_step_files = "reading the picture";
+                if (g_test_crash_files && job.path[0]) *(volatile int *)(uintptr_t)4 = 1;
                 d->px = job.path[0] ? thumb_make(job.path, job.size) : NULL;
                 if (!PostMessageA(g_win, WM_P_THUMB, 0, (LPARAM)d)) { free(d->px); free(d); }
             }
         } else if (version) {
             char p[MAX_PATH * 2];
             int v = 0;
+            g_step_files = "reading the engine fix's version";
             for (int i = 0; i < 2 && !v; i++) { perffix_path(i, p, sizeof p); v = perffix_version(p); }
             PostMessageA(g_win, WM_P_INFO, 0, v);
         } else if (in) {
@@ -281,6 +297,8 @@ static DWORD WINAPI io_thread(void *unused) {
                     snprintf(e->path, sizeof e->path, "%s", in[i].path);
                     e->bytes = in[i].bytes;
                     e->time = in[i].time;
+                    snprintf(g_step_path, sizeof g_step_path, "%s", e->path);
+                    g_step_files = "reading the file list of";
                     e->n = pack_hashes(e->path, &e->h);
                 }
                 h[i] = cache[j].h;
@@ -296,7 +314,11 @@ static DWORD WINAPI io_thread(void *unused) {
                 }
             }
             free(h); free(n); free(c); free(in); free(names);
-        } else WaitForSingleObject(g_io.wake, INFINITE);
+        } else {
+            g_step_files = "waiting";
+            g_step_path[0] = 0;
+            WaitForSingleObject(g_io.wake, INFINITE);
+        }
     }
     for (int i = 0; i < ncache; i++) free(cache[i].h);
     free(cache);

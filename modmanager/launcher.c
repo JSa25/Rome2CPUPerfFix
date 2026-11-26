@@ -16,7 +16,7 @@
 #include <stdarg.h>
 
 #ifndef LAUNCHER_VERSION
-#define LAUNCHER_VERSION 100   // 1.00; the number only grows (tests build others with -DLAUNCHER_VERSION=n)
+#define LAUNCHER_VERSION 101   // 1.01 (crash log, quick-end question; 1.00 shipped in 2.4); the number only grows (tests build others with -DLAUNCHER_VERSION=n)
 #endif
 #define APP_VERSION_TEXT "1.0"
 #define STR_(x) #x
@@ -682,6 +682,10 @@ static void clean_exit_marker(void) {
 static int start_after_window(void) {
     char exe[MAX_PATH], dir[MAX_PATH];
     if (g_go == GO_CA) {
+        // Steam sets these for what it starts; a start by hand has none, and CA's launcher then cannot tell Steam which game
+        // it is (a player's report 2026-11-26: "no license")
+        SetEnvironmentVariableA("SteamAppId", APP_ID);
+        SetEnvironmentVariableA("SteamGameId", APP_ID);
         joinp(exe, sizeof exe, g_game, "launcher\\launcher_ca.exe");
         joinp(dir, sizeof dir, g_game, "launcher");
         return (int)run_and_wait(exe, g_args, dir, 1);
@@ -719,11 +723,17 @@ static int self_update(void) {
         return -1;
     }
     lg("self-update: %d -> %d", LAUNCHER_VERSION, theirs);
+    quick_done();   // the new version counts its own start
     return (int)run_and_wait(g_exe, g_args, NULL, 0);
 }
 
+#include "crashlog.inc"
+
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show) {
     DWORD t0 = GetTickCount();
+    g_main_tid = GetCurrentThreadId();
+    winver_read();
+    crash_catch();   // a crash from here on writes a CRASH line into launcher.log (once g_home is known)
     GetModuleFileNameA(NULL, g_exe, sizeof g_exe);
     g_args = cmdline ? cmdline : "";
     // install.bat / uninstall.bat (and the engine fix DLL): <this exe in the Workshop item> --install|--uninstall "<game>"
@@ -756,25 +766,32 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show) {
         for (char *e = env; e && *e; e += strlen(e) + 1)
             if (!_strnicmp(e, "Steam", 5) && strlen(names) + 48 < sizeof names) { strncat(names, e, strcspn(e, "=")); strcat(names, " "); }
         if (env) FreeEnvironmentStringsA(env);
-        lg("start: %s; Steam's variables: %s", by_steam ? "by Steam" : "by hand", names[0] ? names : "none");
+        lg("start: %s, version " STR(LAUNCHER_VERSION) ", Windows %s; Steam's variables: %s", by_steam ? "by Steam" : "by hand", g_winver, names[0] ? names : "none");
     }
+    { int q = quick_check(); if (q >= 0) return q; }   // the last starts ended by themselves: offer CA's launcher
     while (*g_args == ' ') g_args++;
     int shown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;   // Shift held while pressing Play: this window
     // rome2fix.ini launcher=2: Steam's Play opens CA's launcher. Started by hand (or with Shift), this window opens and
     // offers to switch back.
+    g_step = "reading which launcher to use";
     int choice = launcher_choice();
     launcher_choice_note();
     if (choice == 2 && by_steam && !shown && !getenv("ATTILA_PICKER_TEST")) {
         char ca[MAX_PATH];
         joinp(ca, sizeof ca, g_game, "launcher\\launcher_ca.exe");
-        if (exists(ca)) { lg("CA's launcher (rome2fix.ini: launcher=2)"); g_go = GO_CA; return start_after_window(); }
+        if (exists(ca)) { lg("CA's launcher (rome2fix.ini: launcher=2)"); g_go = GO_CA; quick_done(); return start_after_window(); }
     }
+    g_step = "looking for a newer Mod Manager on the Workshop";
     if (!getenv("ATTILA_LAUNCHER_NO_UPDATE")) { int r = self_update(); if (r >= 0) return r; }   // tests switch it off
 
     char v[96];
+    g_step = "reading the mod lists and the mods";
     load_all();
+    g_step = "starting GDI+ (pictures)";
     gdiplus_start();
+    g_step = "reading the presets";
     presets_scan();
+    g_step = "reading the settings";
     g_theme = TH_DARK;
     if (settings_get("theme", v, sizeof v)) for (int i = 0; i < N_THEMES; i++) if (!_stricmp(v, g_theme_keys[i])) g_theme = i;
     if (g_theme > TH_DARK) g_theme = TH_DARK;   // the picture themes are not in this launcher (no pictures shipped)
@@ -785,6 +802,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show) {
     }
     if (getenv("ATTILA_PICKER_SCALE")) g_force_scale = (float)atof(getenv("ATTILA_PICKER_SCALE")) / 100.0f;
 
+    g_step = "opening the window";
     HMODULE u32 = GetModuleHandleA("user32.dll");
     void *(WINAPI *set_ctx)(void *) = u32 ? (void *(WINAPI *)(void *))GetProcAddress(u32, "SetThreadDpiAwarenessContext") : NULL;
     void *old_ctx = set_ctx ? set_ctx((void *)(intptr_t)-4) : NULL;   // per monitor (v2): sharp at any scaling
@@ -823,6 +841,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show) {
     SetFocus(w);
     UpdateWindow(w);
     g_open_ms = GetTickCount() - t0;
+    lg("window open (%lu ms)", (unsigned long)g_open_ms);
+    g_step = "window open";
+    SetTimer(w, T_QUICK, 10000, NULL);   // up for 10 seconds: this start counts as a good one (crashlog.inc)
+    crash_test();
     if (choice == 2) ask_open(ASK_BACK);   // Steam's Play opens CA's launcher: offer to switch back
     else if (!settings_get("welcomed", v, sizeof v)) {   // the first start: what this is, and where CA's launcher is (once)
         ask_open(ASK_WELCOME);
@@ -830,6 +852,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show) {
     }
     MSG m;
     while (GetMessageW(&m, NULL, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageW(&m); }
+    g_step = "after the window";
     for (int i = 0; i < g_nmods; i++) free_thumb(&g_mods[i]);
     if (g_big.img) gp.dispose(g_big.img);
     free(g_big.px);

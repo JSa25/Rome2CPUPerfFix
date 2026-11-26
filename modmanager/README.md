@@ -41,3 +41,11 @@ VERSION_DIR=/path/to/folder_with_version.h ./build.sh
 Covered by the engine fix's [LICENSE](../LICENSE) at the top of its source (in this repository:
 `release/source/Rome2CPUPerfFix/LICENSE`), except the portions listed in
 [SOL_INVICTUS_MIT.txt](SOL_INVICTUS_MIT.txt), which come from Sol Invictus's 64-bit Attila and keep its MIT license.
+
+## 1.01 (engine fix 2.4.1)
+A crash writes one `CRASH` line into `TotalWarModManager\launcher.log` in the game folder (`crashlog.inc`, the same
+file as the Attila Mod Manager's): the exception, the module and offset, what each thread was doing, the Windows
+version, and this exe's return addresses on the stack; `build/TotalWarModManager_syms.exe` (the same build with debug
+info) turns the offsets into functions and lines (`llvm-addr2line -f -i -e build/TotalWarModManager_syms.exe
+0x<0x400000 + offset>`). After two starts in a row that ended by themselves in their first 10 seconds, the next start
+asks whether to go back to CA's launcher. CA's launcher started from here gets Steam's game number (SteamAppId).

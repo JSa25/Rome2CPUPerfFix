@@ -11,7 +11,7 @@ enum {   // what was clicked; arg tells which one
 };   // W_SETTING, W_FPS, W_MODE: Attila's 64-bit parts, unused here (kept so the act: numbers stay)
 enum { WM_P_AUTO = WM_APP + 30 };
 #define DISCORD_URL "https://discord.gg/cSAJeNUWZ3"   // JGdaCaesar's Discord: bug reports
-enum { T_TOAST = 1, T_DRAG, T_TIP, T_SCRIPT, T_STEAM_POLL };
+enum { T_TOAST = 1, T_DRAG, T_TIP, T_SCRIPT, T_STEAM_POLL, T_QUICK };
 
 typedef struct { RECT r; int id, arg, focus; const char *tip; } Hit;
 static Hit g_hits[1200];

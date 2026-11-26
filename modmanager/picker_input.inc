@@ -681,6 +681,7 @@ static LRESULT CALLBACK picker_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     static int scripted = -1;   // ATTILA_PICKER_TEST: the script moves the mouse, the person's own mouse is left out
     if (scripted < 0) scripted = getenv("ATTILA_PICKER_TEST") != NULL;
     if (scripted && ((msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) || msg == WM_MOUSELEAVE)) return 0;
+    g_step_msg = msg;   // for the crash line
     switch (msg) {
     case WM_CREATE: {
         g_win = w;
@@ -803,6 +804,7 @@ static LRESULT CALLBACK picker_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             drag_to(p.y);
             InvalidateRect(w, NULL, FALSE);
         } else if (wp == T_SCRIPT) test_step();
+        else if (wp == T_QUICK) { KillTimer(w, T_QUICK); crash_test_late(); quick_done(); }   // up for 10 seconds: this start went well
         return 0;
     case WM_ACTIVATE: if (LOWORD(wp) == WA_INACTIVE && g_menu.owner) menu_close(); break;
     case WM_SETFOCUS: InvalidateRect(w, NULL, FALSE); return 0;
@@ -822,6 +824,8 @@ static LRESULT CALLBACK picker_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_P_INFO: g_perf_version = (int)lp; InvalidateRect(w, NULL, FALSE); return 0;
     case WM_CLOSE: DestroyWindow(w); return 0;
     case WM_DESTROY: {
+        quick_done();   // closed or Play: a normal end
+        g_step = "closing the window";
         settings_put("theme", g_theme_keys[g_theme]);
         settings_put("preset", g_preset);
         WINDOWPLACEMENT wpl = {sizeof wpl};

@@ -156,6 +156,10 @@ launcher. It comes from the Attila Engine Performance Fix.
   back, hold Shift while pressing Play, or set launcher=1 in rome2fix.ini
   ([mod]; launcher=2 = CA's launcher).
 - uninstall.bat removes it and puts CA's launcher back.
+- If it closes by itself twice in a row, the next start asks whether to go
+  back to CA's launcher.
+- use_CA_launcher.bat (in this mod's folder) puts CA's launcher back on
+  Steam's Play button without starting the game.
 
 
 Turning single fixes off
@@ -212,6 +216,9 @@ the game folder (the newest 3 are kept): please attach it to a crash report.
 The log only records; it never changes how the game handles a crash. It shows
 your Windows user name in folder paths, so blank that out before posting it
 publicly if you like.
+If Total War Mod Manager closes by itself, please also send
+TotalWarModManager\launcher.log from the game folder: it notes where it
+crashed.
 
 
 For modders (new in 2.1)
@@ -312,6 +319,14 @@ is published for review at github.com/JSa25/Rome2CPUPerfFix.
 
 Changelog
 ---------
+Version 2.4.1:
+           - Total War Mod Manager: if it closes by itself twice in a
+           row, the next start asks whether to go back to CA's launcher.
+           - new use_CA_launcher.bat in this mod's folder: puts CA's
+           launcher back on Steam's Play button without starting the game.
+           - the Mod Manager notes in its log where a crash happened.
+           SHA-256 of TotalWarModManager.exe:
+           ade42ceeb91ade13025381b2bd7776777ea7c6aefbf2ba5032355671194fb19a
 Version 2.4:
            - new: Total War Mod Manager (from the Attila fix). Steam's Play
            button opens it: your mod list with presets, search and drag to
