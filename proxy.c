@@ -25,6 +25,7 @@ int install_sortfix(HMODULE m, void (*log)(const char *fmt, ...));              
 void diag_startup(HMODULE empire, const wchar_t *log_path, void (*log)(const char *fmt, ...));  // diag.c
 extern int g_crash_logging;                                                                      // diag.c
 void update_check(HMODULE self, void (*log)(const char *fmt, ...));                             // update.c
+void rome2_launcher_check(HMODULE self, void (*log)(const char *fmt, ...));                     // launcher_hook.c
 int install_fileio(HMODULE m, void (*log)(const char *fmt, ...));                              // fileio.c
 int install_strfix(HMODULE m, void (*log)(const char *fmt, ...));                              // strfix.c
 int install_soundguard(HMODULE m, void (*log)(const char *fmt, ...));                          // soundguard.c
@@ -189,6 +190,8 @@ static const char g_ini_defaults[] =
     "battle_ui_cache=1\r\n"
     "\r\n"
     "[mod]\r\n"
+    "; which launcher Steam's Play button opens: 1 = Total War Mod Manager, 2 = CA's launcher\r\n"
+    "launcher=1\r\n"
     "; copy a newer version from the Steam Workshop into the game folder at startup\r\n"
     "self_update=1\r\n"
     "; record crashes in rome2fix.log (EXCEPTION lines, a crash_*.dmp file for the first one)\r\n"
@@ -379,6 +382,7 @@ static void install_all(HMODULE m) {
         update_check(g_self, wlog);     // a newer Workshop copy replaces this DLL for the next launch
     else
         wlog("self-update off (self_update=0 in rome2fix.ini)");  // also for off / false / no
+    rome2_launcher_check(g_self, wlog);   // Steam's Play opens Total War Mod Manager; launcher=2 in rome2fix.ini: CA's, left alone
     {   // the pop-ups after the game starts (fgpanel.c, with the DLSS add-on): a newer version installed, and What's new on
         // the first start of this one (the last version started is in rome2fix_seen.txt)
         extern int g_update_state;   // update.c

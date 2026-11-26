@@ -76,8 +76,9 @@ static int p_drop = -1;   // the open drop-down list (its row), -1 none
 #include "version.h"
 #define WN_POPUP 3   // lines of it in the pop-up
 static const wchar_t *const WHATS_NEW[] = {
+    L"2.4: Total War Mod Manager opens on Steam's Play: mod lists, presets, sharing; CA's launcher one click away.",
+    L"Steam overlay: a crash seen in Attila with the same code is fixed here too.",
     L"2.3: the unit cards show again: the card cache now takes their place on screen from what the game draws.",
-    L"Big battles: the soldiers' draw lists are sorted on several threads.",
     L"Culling (F8): small parts of far-away soldiers are left out for more fps (Light; change it in F8).",
     L"F8 works without the DLSS add-on too; the main menu shows the mod's version.",
     L"A huge battle's sound no longer crashes the game when the sound memory is full.",

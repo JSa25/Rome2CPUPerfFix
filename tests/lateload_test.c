@@ -235,6 +235,7 @@ int main(int argc, char **argv) {
     CHECK(strstr(inibuf, "\r\n[fixes]\r\n; FPS in battles: the unit cards shown from a cache, redrawn a few times a second and on input\r\n"
                          "battle_ui_cache=1\r\n; FPS\r\ntile_feedback_scan=1\r\nx87_rounding=1\r\n"));
     CHECK(strstr(inibuf, "\r\n; stability\r\nsound_crash_guard=1\r\n\r\n[tuning]\r\nculling=Light\r\n[mod]\r\nself_update=no\r\ncrash_logging=Yes\r\n"
+                         "; which launcher Steam's Play button opens: 1 = Total War Mod Manager, 2 = CA's launcher\r\nlauncher=1\r\n"
                          "; load other mods' DLLs from the plugins folder in the game folder (any name, e.g. plugins\\smoke.dll)\r\nplugins=1\r\n"));
     CHECK(!strstr(strstr(inibuf, "battle_ui_cache=1") + 1, "battle_ui_cache"));   // once
     CHECK(has("the unit cards (cards_panel) are shown from a cache"));

@@ -19,8 +19,9 @@ The first lines of rome2fix.log say which game version you have and whether it i
 supported.
 
 NOTE: this mod does not show up in the game launcher's mod list. It is a DLL in
-the game folder, not a .pack mod, so the launcher doesn't know about it. It is
-active whenever dinput8.dll is in the game folder. To check, look at rome2fix.log
+the game folder, not a .pack mod, so CA's launcher doesn't know about it (Total
+War Mod Manager lists it under Add-ons). It is active whenever dinput8.dll is in
+the game folder. To check, look at rome2fix.log
 in the game folder after starting the game.
 
 
@@ -133,7 +134,28 @@ Steam Workshop: after subscribing, run install.bat in
 ...\steamapps\workshop\content\214950\3826423359\ once; later updates install
 themselves on the next game start. Run uninstall.bat before unsubscribing.
 
-Remember: the mod won't appear in the launcher's mod list. That's normal.
+Remember: the mod won't appear in CA's mod list. That's normal.
+
+
+Total War Mod Manager (new in 2.4)
+----------------------------------
+On Steam, install.bat sets it up, and players who already have this mod get
+it with the update. Steam's Play button then opens it instead of CA's
+launcher. It comes from the Attila Engine Performance Fix.
+- Your mod list, presets, search and drag to reorder, with a note when two
+  mods change the same files.
+- Export copies your mod list with Workshop links; Import subscribes to the
+  mods you don't have yet.
+- The list code: friends with the same code have the same mods, order and
+  versions.
+- Game files: your preferences file, scripts folder and save folder.
+- No out-of-date mods question after a crash: the game asks it at the next
+  start with mods whenever the last game did not end through its own Quit.
+  Started from Total War Mod Manager, it doesn't.
+- CA's launcher is one click away, for one start or from now on. To switch
+  back, hold Shift while pressing Play, or set launcher=1 in rome2fix.ini
+  ([mod]; launcher=2 = CA's launcher).
+- uninstall.bat removes it and puts CA's launcher back.
 
 
 Turning single fixes off
@@ -156,6 +178,8 @@ to get the defaults back.
   battle_ui_cache      unit cards shown from a cache (2.2)
   parallel_sort        soldier draw lists sorted on four threads (2.2)
   [mod]
+  launcher             1 = Steam's Play opens Total War Mod Manager, 2 = CA's
+                       launcher (2.4)
   self_update          copy a newer version from the Steam Workshop at startup
   crash_logging        record crashes in rome2fix.log (and a crash_*.dmp file)
   plugins              load other mods' DLLs from the plugins folder (2.1)
@@ -224,7 +248,7 @@ Compatibility and notes
   another name in the plugins folder) stays out and says so in rome2fix.log.
 - Works with pack mods (tested with Divide et Impera and a large mod list) and
   UI mods.
-- Does not show up in the launcher's mod list (see the note at the top).
+- Does not show up in CA's mod list (see the note at the top).
 - The x87 fix watches the game's floating-point mode at runtime. If the game
   ever switches it, the affected patches restore the original code
   automatically.
@@ -261,6 +285,9 @@ Third-party notices
 The ReShade link (in dinput8.dll) is built with ReShade's add-on API headers,
 Copyright (C) 2021 Patrick Mours, used under the MIT licence (the same text as
 below, with his name in place of AMD's).
+Parts of Total War Mod Manager (TotalWarModManager.exe) come from Sol Invictus's
+64-bit Attila, Copyright (c) 2026 Sol Invictus, used under the MIT licence (the
+same text as below, with his name in place of AMD's).
 
 The DLSS add-on's sharpening (in dinput8.dll) follows AMD FidelityFX Robust
 Contrast Adaptive Sharpening (RCAS), used under the MIT licence:
@@ -285,6 +312,22 @@ is published for review at github.com/JSa25/Rome2CPUPerfFix.
 
 Changelog
 ---------
+Version 2.4:
+           - new: Total War Mod Manager (from the Attila fix). Steam's Play
+           button opens it: your mod list with presets, search and drag to
+           reorder, sharing with Workshop links, a list code, and CA's
+           launcher one click away. install.bat sets it up; players who
+           already have the mod get it with the update.
+           - started from Total War Mod Manager, the game no longer asks
+           about out-of-date mods after a game that did not end through its
+           own Quit.
+           - fixed a crash with the Steam overlay on, seen in Attila with the
+           same code (a Present called again inside itself until the stack
+           ran out).
+           SHA-256 of dinput8.dll:
+           1bbaf0b2541490fbdf85561059da3038aabe78ac95da1891596322ea48f21d36
+           SHA-256 of TotalWarModManager.exe:
+           948cc8fc092c8dba2b93c6fb7e77b9f54a76c9d6cf1c2830ed1b120a46b54541
 Version 2.3:
            - the unit cards show again in battles. 2.2's card cache put
            its picture where the card panel's layout position said, but

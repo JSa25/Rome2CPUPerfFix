@@ -15,7 +15,7 @@ rem rslink.cpp: the bridge's ReShade link (C++, ReShade's add-on API headers in 
 rem dinput8.rc: the version resource (Properties > Details)
 "%WINDRES%" -O coff -o build\dinput8_res.o dinput8.rc || exit /b 1
 rem not stripped (-s): the stripped 2.0 DLL was flagged by Microsoft's cloud ML (Wacatac), unstripped passes (VirusTotal 2026-11-02)
-"%CC%" -O2 -Wall -Wextra -shared -static -Wl,--no-insert-timestamp -o build\dinput8.dll proxy.c tilescan.c x87fix.c sortfix.c diag.c update.c fileio.c strfix.c attrcache.c logtrim.c memwatch.c scriptext.c plugins.c fpslog.c soundguard.c overlay.c menuver.c partcull.c parsort.c uicache.c bridgeprobe.c fgbridge.c fgpanel.c r2motion.c build\rslink.o build\dinput8_res.o dinput8.def -lgdi32 -lpsapi -ld3d11 || exit /b 1
+"%CC%" -O2 -Wall -Wextra -shared -static -Wl,--no-insert-timestamp -o build\dinput8.dll proxy.c tilescan.c x87fix.c sortfix.c diag.c update.c fileio.c strfix.c attrcache.c logtrim.c memwatch.c scriptext.c plugins.c fpslog.c soundguard.c overlay.c menuver.c launcher_hook.c partcull.c parsort.c uicache.c bridgeprobe.c fgbridge.c fgpanel.c r2motion.c build\rslink.o build\dinput8_res.o dinput8.def -lgdi32 -lpsapi -ld3d11 || exit /b 1
 echo built build\dinput8.dll
 
 if /i not "%~1"=="test" exit /b 0
@@ -47,6 +47,8 @@ rem the frame bridge (needs a D3D11 GPU): the glue with fgbridge.c stubbed, the 
 "%CC%" -O2 -Wall -static -o build\fgpanel_test.exe tests\fgpanel_test.c -ld3d11 -lgdi32 || exit /b 1
 "%CC%" -O2 -Wall -static -o build\fgfill_test.exe tests\fgfill_test.c -ld3d11 -lgdi32 || exit /b 1
 "%CC%" -O2 -Wall -static -o build\overlay_test.exe tests\overlay_test.c -ld3d11 -lgdi32 || exit /b 1
+"%CC%" -O2 -Wall -static -o build\overlay_nest_test.exe tests\overlay_nest_test.c || exit /b 1
+"%CC%" -O2 -Wall -static -municode -o build\launcher_hook_test.exe tests\launcher_hook_test.c || exit /b 1
 "%CC%" -O2 -Wall -static -o build\uicache_test.exe tests\uicache_test.c -ld3d11 -lgdi32 || exit /b 1
 echo == bridgelive
 build\bridgelive_test.exe || (echo bridgelive test FAILED & exit /b 1)
@@ -63,6 +65,10 @@ echo == fgfill
 build\fgfill_test.exe || (echo fgfill test FAILED & exit /b 1)
 echo == overlay
 build\overlay_test.exe || (echo overlay test FAILED & exit /b 1)
+echo == overlay_nest
+build\overlay_nest_test.exe || (echo overlay_nest test FAILED & exit /b 1)
+echo == launcher_hook
+build\launcher_hook_test.exe || (echo launcher_hook test FAILED & exit /b 1)
 echo == uicache
 build\uicache_test.exe || (echo uicache test FAILED & exit /b 1)
 build\uicache_test.exe plain || (echo uicache no-add-on test FAILED & exit /b 1)

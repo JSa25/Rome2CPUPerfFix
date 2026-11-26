@@ -1,5 +1,5 @@
 // The mod version: shown in rome2fix.log (diag.c) and in the marker the Workshop self-update compares (update.c).
 // The marker number only has to grow: version x 10 (1.0 = 10, 1.1 = 11, ...).
-#define MOD_VERSION_NUM 23
-#define MOD_VERSION_STR "2.3"
-#define MOD_VERSION_RC 2, 3, 0, 0   // dinput8.rc (the resource compiler cannot divide MOD_VERSION_NUM)
+#define MOD_VERSION_NUM 24
+#define MOD_VERSION_STR "2.4"
+#define MOD_VERSION_RC 2, 4, 0, 0   // dinput8.rc (the resource compiler cannot divide MOD_VERSION_NUM)
